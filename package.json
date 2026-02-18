@@ -1,0 +1,19 @@
+{
+  "name": "vchat",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "pnpm -r --parallel dev",
+    "dev:web": "pnpm --filter @vchat/web dev",
+    "dev:signal": "pnpm --filter @vchat/signaling-server dev",
+    "build": "pnpm -r build",
+    "build:web": "pnpm --filter @vchat/web build",
+    "build:signal": "pnpm --filter @vchat/signaling-server build"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "pnpm": {
+    "onlyBuiltDependencies": ["esbuild"]
+  }
+}

@@ -1,0 +1,26 @@
+{
+  "name": "@vchat/web",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite dev",
+    "build": "vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "nanoid": "^5.0.4",
+    "simple-peer": "^9.11.1"
+  },
+  "devDependencies": {
+    "@sveltejs/adapter-auto": "^3.1.1",
+    "@sveltejs/adapter-static": "^3.0.1",
+    "@sveltejs/kit": "^2.5.0",
+    "@sveltejs/vite-plugin-svelte": "^3.0.1",
+    "@types/simple-peer": "^9.11.8",
+    "svelte": "^4.2.9",
+    "svelte-preprocess": "^6.0.3",
+    "typescript": "^5.3.3",
+    "vite": "^5.0.12"
+  }
+}
