@@ -17,9 +17,15 @@ export function getSignalServerUrl(): string {
   const saved = localStorage.getItem(SIGNAL_URL_KEY);
   if (saved) return saved;
 
-  // Default: same host, port 3001
+  // Dev server: direct connection to signaling on port 3001
+  if (window.location.port === '5173') {
+    const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+    return `${protocol}//${window.location.hostname}:3001`;
+  }
+
+  // Production: reverse-proxied through Caddy at /ws
   const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-  return `${protocol}//${window.location.hostname}:3001`;
+  return `${protocol}//${window.location.host}/ws`;
 }
 
 export function setSignalServerUrl(url: string): void {
@@ -47,13 +53,28 @@ export interface TurnConfig {
 
 export function getTurnConfig(): TurnConfig | null {
   if (typeof window === 'undefined') return null;
+
+  // localStorage override takes priority
   const url = localStorage.getItem(TURN_URL_KEY);
-  if (!url) return null;
-  return {
-    url,
-    username: localStorage.getItem(TURN_USERNAME_KEY) ?? '',
-    credential: localStorage.getItem(TURN_CREDENTIAL_KEY) ?? '',
-  };
+  if (url) {
+    return {
+      url,
+      username: localStorage.getItem(TURN_USERNAME_KEY) ?? '',
+      credential: localStorage.getItem(TURN_CREDENTIAL_KEY) ?? '',
+    };
+  }
+
+  // Fall back to build-time defaults (set via VITE_TURN_* env vars)
+  const defaultUrl = import.meta.env.VITE_TURN_URL;
+  if (defaultUrl) {
+    return {
+      url: defaultUrl,
+      username: import.meta.env.VITE_TURN_USER ?? '',
+      credential: import.meta.env.VITE_TURN_CREDENTIAL ?? '',
+    };
+  }
+
+  return null;
 }
 
 export function setTurnConfig(url: string, username: string, credential: string): void {

@@ -1,0 +1,24 @@
+FROM node:20-alpine AS builder
+WORKDIR /app
+
+RUN corepack enable && corepack prepare pnpm@latest --activate
+
+COPY package.json pnpm-workspace.yaml pnpm-lock.yaml ./
+COPY apps/web/package.json apps/web/
+COPY packages/signaling-server/package.json packages/signaling-server/
+RUN pnpm install --frozen-lockfile
+
+COPY apps/web/ apps/web/
+
+ARG VITE_TURN_URL
+ARG VITE_TURN_USER
+ARG VITE_TURN_CREDENTIAL
+ENV VITE_TURN_URL=$VITE_TURN_URL
+ENV VITE_TURN_USER=$VITE_TURN_USER
+ENV VITE_TURN_CREDENTIAL=$VITE_TURN_CREDENTIAL
+
+RUN pnpm build:web
+
+FROM caddy:2-alpine
+COPY Caddyfile /etc/caddy/Caddyfile
+COPY --from=builder /app/apps/web/build /srv/web

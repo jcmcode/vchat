@@ -1,0 +1,25 @@
+{$DOMAIN} {
+	tls {$ACME_EMAIL}
+
+	basicauth * {
+		vchat {$BASIC_AUTH_HASH}
+	}
+
+	header {
+		X-Frame-Options DENY
+		X-Content-Type-Options nosniff
+		Referrer-Policy strict-origin-when-cross-origin
+		Permissions-Policy "camera=(self), microphone=(self), display-capture=(self)"
+		Content-Security-Policy "default-src 'self'; connect-src 'self' wss://{$DOMAIN} turn:{$DOMAIN} turns:{$DOMAIN}; media-src 'self' blob:; img-src 'self' blob: data:; style-src 'self' 'unsafe-inline'; script-src 'self'"
+	}
+
+	handle /ws {
+		reverse_proxy signaling:3001
+	}
+
+	handle {
+		root * /srv/web
+		try_files {path} /index.html
+		file_server
+	}
+}

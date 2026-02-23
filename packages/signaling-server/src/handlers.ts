@@ -7,6 +7,8 @@ import {
   getPeersInRoom,
 } from './rooms.js';
 
+const MAX_MESSAGE_SIZE = 64 * 1024; // 64KB
+
 interface ClientState {
   peerId: string;
   roomId: string | null;
@@ -24,9 +26,16 @@ export type SignalingMessage =
 
 export function handleConnection(ws: WebSocket): void {
   ws.on('message', (raw) => {
+    const rawStr = raw.toString();
+
+    if (rawStr.length > MAX_MESSAGE_SIZE) {
+      ws.send(JSON.stringify({ type: 'error', message: 'Message too large' }));
+      return;
+    }
+
     let msg: SignalingMessage;
     try {
-      msg = JSON.parse(raw.toString());
+      msg = JSON.parse(rawStr);
     } catch {
       ws.send(JSON.stringify({ type: 'error', message: 'Invalid JSON' }));
       return;
@@ -63,13 +72,33 @@ function handleJoin(
   ws: WebSocket,
   msg: { roomId: string; peerId: string; displayName: string }
 ): void {
+  const { roomId, peerId, displayName: rawName } = msg;
+
+  // Validate roomId: 1-20 chars, alphanumeric only
+  if (typeof roomId !== 'string' || !/^[a-z0-9]{1,20}$/.test(roomId)) {
+    ws.send(JSON.stringify({ type: 'error', message: 'Invalid roomId: must be 1-20 lowercase alphanumeric characters' }));
+    return;
+  }
+
+  // Validate peerId: 1-30 chars, alphanumeric/underscore/hyphen
+  if (typeof peerId !== 'string' || !/^[a-zA-Z0-9_-]{1,30}$/.test(peerId)) {
+    ws.send(JSON.stringify({ type: 'error', message: 'Invalid peerId: must be 1-30 alphanumeric/underscore/hyphen characters' }));
+    return;
+  }
+
+  // Validate displayName: 1-30 chars after trim
+  if (typeof rawName !== 'string') {
+    ws.send(JSON.stringify({ type: 'error', message: 'Invalid displayName: must be a string' }));
+    return;
+  }
+  const displayName = rawName.trim();
+  if (displayName.length === 0 || displayName.length > 30) {
+    ws.send(JSON.stringify({ type: 'error', message: 'Invalid displayName: must be 1-30 characters after trimming' }));
+    return;
+  }
+
   // Leave existing room if any
   handleLeave(ws);
-
-  const { roomId, peerId, displayName } = msg;
-
-  const state: ClientState = { peerId, roomId, displayName };
-  clientStates.set(ws, state);
 
   // Get existing peers before adding this one
   const existingPeers = getPeersInRoom(roomId).map((p) => ({
@@ -77,8 +106,15 @@ function handleJoin(
     displayName: p.displayName,
   }));
 
-  // Add peer to room
-  addPeerToRoom(roomId, { id: peerId, ws, displayName });
+  // Add peer to room (enforces MAX_PEERS_PER_ROOM)
+  const added = addPeerToRoom(roomId, { id: peerId, ws, displayName });
+  if (!added) {
+    ws.send(JSON.stringify({ type: 'error', message: 'Room is full' }));
+    return;
+  }
+
+  const state: ClientState = { peerId, roomId, displayName };
+  clientStates.set(ws, state);
 
   // Tell the new peer about existing peers
   ws.send(
@@ -141,13 +177,24 @@ function handleChat(ws: WebSocket, msg: { text: string }): void {
   const state = clientStates.get(ws);
   if (!state || !state.roomId) return;
 
+  // Validate text: must be string, 1-2000 chars after trim
+  if (typeof msg.text !== 'string') {
+    ws.send(JSON.stringify({ type: 'error', message: 'Invalid chat text' }));
+    return;
+  }
+  const text = msg.text.trim();
+  if (text.length === 0 || text.length > 2000) {
+    ws.send(JSON.stringify({ type: 'error', message: 'Chat text must be 1-2000 characters' }));
+    return;
+  }
+
   broadcastToRoom(
     state.roomId,
     {
       type: 'chat',
       fromPeerId: state.peerId,
       displayName: state.displayName,
-      text: msg.text,
+      text,
       timestamp: Date.now(),
     },
     state.peerId

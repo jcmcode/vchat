@@ -12,6 +12,8 @@ export interface Room {
   createdAt: number;
 }
 
+export const MAX_PEERS_PER_ROOM = 6;
+
 const rooms = new Map<string, Room>();
 
 export function createRoom(roomId: string): Room {
@@ -32,11 +34,13 @@ export function getOrCreateRoom(roomId: string): Room {
   return rooms.get(roomId) ?? createRoom(roomId);
 }
 
-export function addPeerToRoom(roomId: string, peer: Peer): string[] {
+export function addPeerToRoom(roomId: string, peer: Peer): boolean {
   const room = getOrCreateRoom(roomId);
-  const existingPeerIds = Array.from(room.peers.keys());
+  if (room.peers.size >= MAX_PEERS_PER_ROOM) {
+    return false;
+  }
   room.peers.set(peer.id, peer);
-  return existingPeerIds;
+  return true;
 }
 
 export function removePeerFromRoom(roomId: string, peerId: string): void {

@@ -181,6 +181,45 @@ export function sendChatMessage(text: string): void {
   ]);
 }
 
+// Pending track replacements to retry when peer connects
+const pendingTrackReplacements = new Map<string, MediaStreamTrack | null>();
+let screenShareActive = false;
+
+function replaceVideoTrack(pc: PeerConnection, newTrack: MediaStreamTrack | null): boolean {
+  try {
+    const rtcPc = (pc.peer as unknown as { _pc: RTCPeerConnection })._pc;
+    if (rtcPc) {
+      const videoSender = rtcPc.getSenders().find((s) => s.track?.kind === 'video');
+      if (videoSender) {
+        videoSender.replaceTrack(newTrack);
+        return true;
+      }
+    }
+  } catch (e) {
+    console.warn(`replaceVideoTrack failed for ${pc.id}, queuing retry:`, e);
+  }
+
+  // Fallback: try simple-peer's removeTrack/addTrack
+  try {
+    const currentStream = get(localStream);
+    if (currentStream) {
+      const oldVideoTrack = currentStream.getVideoTracks()[0];
+      if (oldVideoTrack) {
+        pc.peer.removeTrack(oldVideoTrack, currentStream);
+      }
+    }
+    if (newTrack) {
+      const stream = new MediaStream([newTrack]);
+      pc.peer.addTrack(newTrack, stream);
+    }
+    return true;
+  } catch (e) {
+    console.warn(`replaceVideoTrack fallback also failed for ${pc.id}:`, e);
+  }
+
+  return false;
+}
+
 export function startSharingScreen(): void {
   const screen = get(screenStream);
   if (!screen) return;
@@ -188,37 +227,30 @@ export function startSharingScreen(): void {
   const screenVideoTrack = screen.getVideoTracks()[0];
   if (!screenVideoTrack) return;
 
+  screenShareActive = true;
+  pendingTrackReplacements.clear();
+
   const peerMap = get(peers);
-  for (const [, pc] of peerMap) {
-    try {
-      const rtcPc = (pc.peer as unknown as { _pc: RTCPeerConnection })._pc;
-      if (!rtcPc) continue;
-      const videoSender = rtcPc.getSenders().find((s) => s.track?.kind === 'video');
-      if (videoSender) {
-        videoSender.replaceTrack(screenVideoTrack);
-      }
-    } catch (e) {
-      console.warn('Failed to replace track for screen share:', e);
+  for (const [id, pc] of peerMap) {
+    if (!replaceVideoTrack(pc, screenVideoTrack)) {
+      // Queue for retry when peer connects
+      pendingTrackReplacements.set(id, screenVideoTrack);
     }
   }
 }
 
 export function stopSharingScreen(): void {
+  // Idempotency guard: don't run if already stopped
+  if (!screenShareActive) return;
+  screenShareActive = false;
+  pendingTrackReplacements.clear();
+
   const camera = get(localStream);
   const cameraVideoTrack = camera?.getVideoTracks()[0] ?? null;
 
   const peerMap = get(peers);
   for (const [, pc] of peerMap) {
-    try {
-      const rtcPc = (pc.peer as unknown as { _pc: RTCPeerConnection })._pc;
-      if (!rtcPc) continue;
-      const videoSender = rtcPc.getSenders().find((s) => s.track?.kind === 'video');
-      if (videoSender) {
-        videoSender.replaceTrack(cameraVideoTrack);
-      }
-    } catch (e) {
-      console.warn('Failed to restore camera track:', e);
-    }
+    replaceVideoTrack(pc, cameraVideoTrack);
   }
 }
 
@@ -276,6 +308,15 @@ function createPeerConnection(
 
   peer.on('signal', (signal) => {
     signalingClient?.sendSignal(remotePeerId, signal);
+  });
+
+  // Retry any pending track replacements once the peer connects
+  peer.on('connect', () => {
+    const pendingTrack = pendingTrackReplacements.get(remotePeerId);
+    if (pendingTrack !== undefined) {
+      pendingTrackReplacements.delete(remotePeerId);
+      replaceVideoTrack(pc, pendingTrack);
+    }
   });
 
   peer.on('stream', (remoteStream) => {

@@ -92,11 +92,15 @@
     toggleVideo();
   }
 
+  let meshStopCalled = false;
+
   async function handleScreenShare() {
     if ($isScreenSharing) {
       stopSharingScreen();
+      meshStopCalled = true;
       stopScreenShare();
     } else {
+      meshStopCalled = false;
       const stream = await startScreenShare();
       if (stream) {
         startSharingScreen();
@@ -112,10 +116,15 @@
   }
 
   // Handle browser-native "Stop sharing" button: when isScreenSharing goes
-  // from true to false externally, restore camera tracks on peers
+  // from true to false externally, restore camera tracks on peers.
+  // Guard: skip if handleScreenShare already called stopSharingScreen
+  // (stopSharingScreen is also idempotent, so this is a belt-and-suspenders check)
   $: {
-    if (wasScreenSharing && !$isScreenSharing) {
+    if (wasScreenSharing && !$isScreenSharing && !meshStopCalled) {
       stopSharingScreen();
+    }
+    if (!$isScreenSharing) {
+      meshStopCalled = false;
     }
     wasScreenSharing = $isScreenSharing;
   }

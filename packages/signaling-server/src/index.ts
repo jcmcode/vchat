@@ -9,9 +9,18 @@ const wss = new WebSocketServer({ port: PORT });
 // Track liveness for heartbeat
 const aliveMap = new WeakMap<WsType, boolean>();
 
+const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN;
+
 wss.on('connection', (ws, req) => {
-  const origin = req.headers.origin ?? 'unknown';
-  console.log(`New connection from ${origin}`);
+  const origin = req.headers.origin ?? '';
+
+  if (ALLOWED_ORIGIN && origin !== ALLOWED_ORIGIN) {
+    console.warn(`Rejected connection from origin: ${origin}`);
+    ws.close(1008, 'Origin not allowed');
+    return;
+  }
+
+  console.log(`New connection from ${origin || 'unknown'}`);
 
   aliveMap.set(ws, true);
   ws.on('pong', () => {
