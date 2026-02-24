@@ -6,20 +6,54 @@ export const audioEnabled = writable(true);
 export const videoEnabled = writable(true);
 export const isScreenSharing = writable(false);
 
-export async function startMedia(): Promise<MediaStream> {
-  const stream = await navigator.mediaDevices.getUserMedia({
+export const audioDevices = writable<MediaDeviceInfo[]>([]);
+export const videoDevices = writable<MediaDeviceInfo[]>([]);
+export const audioOutputDevices = writable<MediaDeviceInfo[]>([]);
+export const selectedAudioDevice = writable<string>('');
+export const selectedVideoDevice = writable<string>('');
+export const selectedAudioOutput = writable<string>('');
+export const voiceOnlyMode = writable(false);
+
+export async function enumerateDevices(): Promise<void> {
+  const devices = await navigator.mediaDevices.enumerateDevices();
+  audioDevices.set(devices.filter((d) => d.kind === 'audioinput'));
+  videoDevices.set(devices.filter((d) => d.kind === 'videoinput'));
+  audioOutputDevices.set(devices.filter((d) => d.kind === 'audiooutput'));
+}
+
+export async function startMedia(opts?: {
+  audioDeviceId?: string;
+  videoDeviceId?: string;
+  voiceOnly?: boolean;
+}): Promise<MediaStream> {
+  const isVoiceOnly = opts?.voiceOnly ?? get(voiceOnlyMode);
+
+  const constraints: MediaStreamConstraints = {
     audio: {
       echoCancellation: true,
       noiseSuppression: true,
       autoGainControl: true,
+      ...(opts?.audioDeviceId ? { deviceId: { exact: opts.audioDeviceId } } : {}),
     },
-    video: {
-      width: { ideal: 1280 },
-      height: { ideal: 720 },
-      frameRate: { ideal: 30, max: 30 },
-    },
-  });
+    video: isVoiceOnly
+      ? false
+      : {
+          width: { ideal: 1280 },
+          height: { ideal: 720 },
+          frameRate: { ideal: 30, max: 30 },
+          ...(opts?.videoDeviceId ? { deviceId: { exact: opts.videoDeviceId } } : {}),
+        },
+  };
+
+  const stream = await navigator.mediaDevices.getUserMedia(constraints);
   localStream.set(stream);
+
+  if (isVoiceOnly) {
+    voiceOnlyMode.set(true);
+    videoEnabled.set(false);
+  }
+
+  await enumerateDevices();
   return stream;
 }
 
@@ -56,6 +90,61 @@ export function toggleVideo(): boolean {
     return videoTrack.enabled;
   }
   return false;
+}
+
+export async function switchAudioDevice(deviceId: string): Promise<MediaStreamTrack | null> {
+  const stream = get(localStream);
+  if (!stream) return null;
+
+  // Stop old audio track
+  const oldTrack = stream.getAudioTracks()[0];
+  if (oldTrack) oldTrack.stop();
+
+  // Get new audio
+  const newStream = await navigator.mediaDevices.getUserMedia({
+    audio: {
+      deviceId: { exact: deviceId },
+      echoCancellation: true,
+      noiseSuppression: true,
+      autoGainControl: true,
+    },
+  });
+
+  const newTrack = newStream.getAudioTracks()[0];
+  if (oldTrack) stream.removeTrack(oldTrack);
+  stream.addTrack(newTrack);
+  selectedAudioDevice.set(deviceId);
+
+  // Trigger store update
+  localStream.set(stream);
+  return newTrack;
+}
+
+export async function switchVideoDevice(deviceId: string): Promise<MediaStreamTrack | null> {
+  const stream = get(localStream);
+  if (!stream) return null;
+
+  // Stop old video track
+  const oldTrack = stream.getVideoTracks()[0];
+  if (oldTrack) oldTrack.stop();
+
+  // Get new video
+  const newStream = await navigator.mediaDevices.getUserMedia({
+    video: {
+      deviceId: { exact: deviceId },
+      width: { ideal: 1280 },
+      height: { ideal: 720 },
+      frameRate: { ideal: 30, max: 30 },
+    },
+  });
+
+  const newTrack = newStream.getVideoTracks()[0];
+  if (oldTrack) stream.removeTrack(oldTrack);
+  stream.addTrack(newTrack);
+  selectedVideoDevice.set(deviceId);
+
+  localStream.set(stream);
+  return newTrack;
 }
 
 export async function startScreenShare(): Promise<MediaStream | null> {

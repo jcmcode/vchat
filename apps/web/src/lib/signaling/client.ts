@@ -3,10 +3,16 @@ export type SignalingEventType =
   | 'peer-joined'
   | 'peer-left'
   | 'signal'
-  | 'chat'
   | 'error'
   | 'connected'
-  | 'disconnected';
+  | 'disconnected'
+  | 'room-created'
+  | 'password-required'
+  | 'waiting-for-admission'
+  | 'admission-request'
+  | 'admission-granted'
+  | 'admission-denied'
+  | 'host-changed';
 
 export interface SignalingEvent {
   type: SignalingEventType;
@@ -24,6 +30,8 @@ export class SignalingClient {
   private currentRoomId: string | null = null;
   private currentPeerId: string | null = null;
   private currentDisplayName: string | null = null;
+  private isCreator = false;
+  private password: string | undefined = undefined;
 
   constructor(url: string) {
     this.url = url;
@@ -37,18 +45,40 @@ export class SignalingClient {
       this.emit({ type: 'connected' });
       // Auto-rejoin room after reconnect
       if (this.currentRoomId && this.currentPeerId && this.currentDisplayName) {
-        this.send({
-          type: 'join',
-          roomId: this.currentRoomId,
-          peerId: this.currentPeerId,
-          displayName: this.currentDisplayName,
-        });
+        if (this.isCreator) {
+          this.send({
+            type: 'create-room',
+            roomId: this.currentRoomId,
+            peerId: this.currentPeerId,
+            displayName: this.currentDisplayName,
+            ...(this.password ? { password: this.password } : {}),
+          });
+        } else {
+          this.send({
+            type: 'join',
+            roomId: this.currentRoomId,
+            peerId: this.currentPeerId,
+            displayName: this.currentDisplayName,
+            ...(this.password ? { password: this.password } : {}),
+          });
+        }
       }
     };
 
     this.ws.onmessage = (event) => {
       try {
         const msg = JSON.parse(event.data);
+        // On reconnect, if room already exists, fall back to join
+        if (msg.type === 'error' && msg.message === 'Room already exists' && this.isCreator) {
+          this.send({
+            type: 'join',
+            roomId: this.currentRoomId!,
+            peerId: this.currentPeerId!,
+            displayName: this.currentDisplayName!,
+            ...(this.password ? { password: this.password } : {}),
+          });
+          return;
+        }
         this.emit(msg);
       } catch {
         // ignore invalid JSON
@@ -91,26 +121,55 @@ export class SignalingClient {
     }
   }
 
-  joinRoom(roomId: string, peerId: string, displayName: string): void {
+  createRoom(roomId: string, peerId: string, displayName: string, password?: string): void {
     this.currentRoomId = roomId;
     this.currentPeerId = peerId;
     this.currentDisplayName = displayName;
-    this.send({ type: 'join', roomId, peerId, displayName });
+    this.isCreator = true;
+    this.password = password;
+    this.send({
+      type: 'create-room',
+      roomId,
+      peerId,
+      displayName,
+      ...(password ? { password } : {}),
+    });
+  }
+
+  joinRoom(roomId: string, peerId: string, displayName: string, password?: string): void {
+    this.currentRoomId = roomId;
+    this.currentPeerId = peerId;
+    this.currentDisplayName = displayName;
+    this.isCreator = false;
+    this.password = password;
+    this.send({
+      type: 'join',
+      roomId,
+      peerId,
+      displayName,
+      ...(password ? { password } : {}),
+    });
+  }
+
+  admitPeer(peerId: string): void {
+    this.send({ type: 'admit-peer', peerId });
+  }
+
+  denyPeer(peerId: string): void {
+    this.send({ type: 'deny-peer', peerId });
   }
 
   leaveRoom(): void {
     this.currentRoomId = null;
     this.currentPeerId = null;
     this.currentDisplayName = null;
+    this.isCreator = false;
+    this.password = undefined;
     this.send({ type: 'leave' });
   }
 
   sendSignal(targetPeerId: string, signal: unknown): void {
     this.send({ type: 'signal', targetPeerId, signal });
-  }
-
-  sendChat(text: string): void {
-    this.send({ type: 'chat', text });
   }
 
   on(type: string, handler: EventHandler): () => void {

@@ -12,6 +12,8 @@
 
   let name = getSavedDisplayName();
   let joinCode = '';
+  let roomPasswordInput = '';
+  let voiceOnly = false;
   let showSettings = false;
   let signalingUrl = getSignalServerUrl();
   let turnUrl = '';
@@ -35,14 +37,20 @@
     if (!name.trim()) return;
     saveDisplayName(name.trim());
     const id = generateRoomId();
-    goto(`/room/${id}?name=${encodeURIComponent(name.trim())}`);
+    const params = new URLSearchParams({ name: name.trim(), creator: '1' });
+    if (roomPasswordInput) params.set('password', roomPasswordInput);
+    if (voiceOnly) params.set('voiceOnly', '1');
+    goto(`/room/${id}?${params.toString()}`);
   }
 
   function joinRoom() {
     if (!name.trim() || !joinCode.trim()) return;
     saveDisplayName(name.trim());
     const code = joinCode.trim().toLowerCase();
-    goto(`/room/${code}?name=${encodeURIComponent(name.trim())}`);
+    const params = new URLSearchParams({ name: name.trim() });
+    if (roomPasswordInput) params.set('password', roomPasswordInput);
+    if (voiceOnly) params.set('voiceOnly', '1');
+    goto(`/room/${code}?${params.toString()}`);
   }
 
   function handleKeydown(e: KeyboardEvent) {
@@ -69,6 +77,18 @@
         on:keydown={handleKeydown}
         maxlength="30"
       />
+
+      <input
+        type="password"
+        bind:value={roomPasswordInput}
+        placeholder="Room password (optional)"
+        on:keydown={handleKeydown}
+      />
+
+      <label class="toggle-row">
+        <input type="checkbox" bind:checked={voiceOnly} />
+        <span>Audio only (no camera)</span>
+      </label>
 
       <button class="btn primary" on:click={createRoom} disabled={!name.trim()}>
         Create Room
@@ -151,6 +171,7 @@
     display: flex;
     align-items: center;
     justify-content: center;
+    padding: 1rem;
   }
 
   .card {
@@ -182,7 +203,8 @@
     gap: 0.75rem;
   }
 
-  input {
+  input[type="text"],
+  input[type="password"] {
     background: var(--bg-elevated);
     border: 1px solid var(--border);
     border-radius: var(--radius);
@@ -194,6 +216,21 @@
 
   input:focus {
     border-color: var(--accent);
+  }
+
+  .toggle-row {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    font-size: 0.9rem;
+    color: var(--text-muted);
+    cursor: pointer;
+    justify-content: flex-start;
+  }
+
+  .toggle-row input[type="checkbox"] {
+    width: auto;
+    accent-color: var(--accent);
   }
 
   .btn {
@@ -298,5 +335,15 @@
   .settings input {
     font-size: 0.85rem;
     padding: 0.5rem 0.75rem;
+  }
+
+  @media (max-width: 640px) {
+    .card {
+      padding: 1.5rem;
+    }
+
+    h1 {
+      font-size: 2rem;
+    }
   }
 </style>

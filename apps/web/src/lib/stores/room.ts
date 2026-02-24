@@ -5,6 +5,8 @@ export const roomId = writable<string>('');
 export const peerId = writable<string>(nanoid(12));
 export const displayName = writable<string>('');
 export const isInRoom = writable<boolean>(false);
+export const roomPassword = writable<string>('');
+export const isHost = writable<boolean>(false);
 
 const SIGNAL_URL_KEY = 'vchat_signal_url';
 const DISPLAY_NAME_KEY = 'vchat_display_name';

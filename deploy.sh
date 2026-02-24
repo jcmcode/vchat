@@ -103,7 +103,36 @@ fi
 
 echo
 echo "Building and starting containers..."
-docker compose up -d --build
+
+# Stage 1: Start web first to obtain TLS certificates
+echo "Starting web service to obtain TLS certificate..."
+docker compose up -d --build web
+
+# Poll for TLS cert (up to 120 seconds)
+echo "Waiting for TLS certificate..."
+CERT_WAIT=0
+CERT_MAX=120
+while [ $CERT_WAIT -lt $CERT_MAX ]; do
+  # Check if cert file exists in the caddy data volume
+  if docker compose exec -T web test -d /data/caddy/certificates 2>/dev/null; then
+    CERT_COUNT=$(docker compose exec -T web find /data/caddy/certificates -name "*.crt" 2>/dev/null | wc -l || echo "0")
+    if [ "$CERT_COUNT" -gt 0 ]; then
+      echo "TLS certificate obtained!"
+      break
+    fi
+  fi
+  sleep 5
+  CERT_WAIT=$((CERT_WAIT + 5))
+  echo "  Waiting for cert... (${CERT_WAIT}s/${CERT_MAX}s)"
+done
+
+if [ $CERT_WAIT -ge $CERT_MAX ]; then
+  echo "Warning: TLS certificate may not be ready yet. Starting remaining services anyway."
+fi
+
+# Stage 2: Start signaling and coturn
+echo "Starting signaling and coturn services..."
+docker compose up -d --build signaling coturn
 
 echo
 echo "=== Deployed! ==="
@@ -111,5 +140,4 @@ echo "Site: https://$DOMAIN"
 echo "Username: vchat"
 echo "Password: (the one you just entered)"
 echo
-echo "It may take a minute for the TLS certificate to be issued."
 echo "Share the URL and password with your friends."

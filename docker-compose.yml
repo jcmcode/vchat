@@ -20,6 +20,12 @@ services:
     depends_on:
       - signaling
     restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "--quiet", "http://localhost:80"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
 
   signaling:
     build:
@@ -38,6 +44,9 @@ services:
     volumes:
       - ./turnserver.conf:/etc/coturn/turnserver.conf:ro
       - caddy_data:/caddy-data:ro
+    depends_on:
+      web:
+        condition: service_healthy
     restart: unless-stopped
 
 volumes:

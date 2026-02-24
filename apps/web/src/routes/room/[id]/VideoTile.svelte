@@ -2,6 +2,7 @@
   import type { PeerConnection } from '$lib/webrtc/mesh';
 
   export let peerConnection: PeerConnection;
+  export let speaking = false;
 
   let videoEl: HTMLVideoElement;
 
@@ -10,7 +11,7 @@
   }
 </script>
 
-<div class="tile">
+<div class="tile" class:speaking>
   {#if peerConnection.stream}
     <video
       bind:this={videoEl}
@@ -34,6 +35,13 @@
     display: flex;
     align-items: center;
     justify-content: center;
+    border: 2px solid transparent;
+    transition: border-color 0.2s, box-shadow 0.2s;
+  }
+
+  .tile.speaking {
+    border-color: var(--success);
+    box-shadow: 0 0 12px rgba(34, 197, 94, 0.3);
   }
 
   video {

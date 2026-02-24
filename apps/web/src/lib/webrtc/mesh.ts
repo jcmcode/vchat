@@ -3,6 +3,17 @@ import { writable, get } from 'svelte/store';
 import { SignalingClient } from '../signaling/client.js';
 import { localStream, screenStream, isScreenSharing } from '../media/manager.js';
 import { getTurnConfig } from '../stores/room.js';
+import { deserialize, serialize, type DataChannelMessage } from './data-channel.js';
+import { createSpeakingDetector } from '../media/audio-analysis.js';
+import {
+  initFileTransfer,
+  handleFileMeta,
+  handleFileChunk,
+  handleFileAck,
+  handleFileCancel,
+  sendFile as ftSendFile,
+  type FileTransferEntry,
+} from './file-transfer.js';
 
 export interface PeerConnection {
   id: string;
@@ -17,11 +28,31 @@ export interface ChatMessage {
   text: string;
   timestamp: number;
   isLocal: boolean;
+  fileTransfer?: FileTransferEntry;
+}
+
+export interface Reaction {
+  emoji: string;
+  fromPeerId: string;
+  displayName: string;
+  timestamp: number;
+  id: string;
+}
+
+export interface AdmissionRequest {
+  peerId: string;
+  displayName: string;
 }
 
 export const peers = writable<Map<string, PeerConnection>>(new Map());
 export const chatMessages = writable<ChatMessage[]>([]);
 export const connectionState = writable<'disconnected' | 'connecting' | 'connected'>('disconnected');
+export const admissionState = writable<'none' | 'waiting' | 'denied'>('none');
+export const admissionRequests = writable<AdmissionRequest[]>([]);
+export const hostStatus = writable<boolean>(false);
+export const typingPeers = writable<Set<string>>(new Set());
+export const reactions = writable<Reaction[]>([]);
+export const speakingPeers = writable<Set<string>>(new Set());
 
 let iceServers: RTCIceServer[] = [];
 
@@ -31,6 +62,8 @@ let localDisplayName: string = '';
 let currentRoomId: string = '';
 const unsubscribers: (() => void)[] = [];
 const disconnectTimers = new Map<string, ReturnType<typeof setTimeout>>();
+const speakingDetectorCleanups = new Map<string, () => void>();
+let localSpeakingCleanup: (() => void) | null = null;
 
 function buildIceServers(): RTCIceServer[] {
   const servers: RTCIceServer[] = [
@@ -44,24 +77,100 @@ function buildIceServers(): RTCIceServer[] {
   return servers;
 }
 
+// Chat persistence
+function loadChatHistory(roomId: string): void {
+  try {
+    const key = `vchat_chat_${roomId}`;
+    const saved = localStorage.getItem(key);
+    if (saved) {
+      const msgs = JSON.parse(saved) as ChatMessage[];
+      chatMessages.set(msgs.slice(-500));
+    }
+  } catch {
+    // ignore
+  }
+}
+
+function saveChatHistory(roomId: string): void {
+  try {
+    const key = `vchat_chat_${roomId}`;
+    const msgs = get(chatMessages);
+    localStorage.setItem(key, JSON.stringify(msgs.slice(-500)));
+  } catch {
+    // ignore
+  }
+}
+
+// Data channel helpers
+function broadcastToAllPeers(data: string): void {
+  const peerMap = get(peers);
+  for (const [, pc] of peerMap) {
+    try {
+      pc.peer.send(data);
+    } catch {
+      // peer may not be connected yet
+    }
+  }
+}
+
+function sendDataToPeer(peerId: string, data: string): void {
+  const peerMap = get(peers);
+  const pc = peerMap.get(peerId);
+  if (pc) {
+    try {
+      pc.peer.send(data);
+    } catch {
+      // peer not connected
+    }
+  }
+}
+
 export function joinRoom(
   serverUrl: string,
   roomId: string,
   peerId: string,
-  displayName: string
+  displayName: string,
+  isCreator = false,
+  password?: string
 ): void {
   localPeerId = peerId;
   localDisplayName = displayName;
   currentRoomId = roomId;
   iceServers = buildIceServers();
   connectionState.set('connecting');
+  admissionState.set('none');
+  admissionRequests.set([]);
+  hostStatus.set(false);
+
+  // Load chat history
+  loadChatHistory(roomId);
+
+  // Init file transfer
+  initFileTransfer(sendDataToPeer, broadcastToAllPeers);
+
+  // Attach speaking detector to local stream
+  const stream = get(localStream);
+  if (stream && stream.getAudioTracks().length > 0) {
+    localSpeakingCleanup = createSpeakingDetector(stream, (isSpeaking) => {
+      speakingPeers.update((s) => {
+        const next = new Set(s);
+        if (isSpeaking) next.add('local');
+        else next.delete('local');
+        return next;
+      });
+    });
+  }
 
   signalingClient = new SignalingClient(serverUrl);
 
   unsubscribers.push(
     signalingClient.on('connected', () => {
       connectionState.set('connected');
-      signalingClient!.joinRoom(roomId, peerId, displayName);
+      if (isCreator) {
+        signalingClient!.createRoom(roomId, peerId, displayName, password);
+      } else {
+        signalingClient!.joinRoom(roomId, peerId, displayName, password);
+      }
     })
   );
 
@@ -74,7 +183,6 @@ export function joinRoom(
   unsubscribers.push(
     signalingClient.on('room-peers', (event) => {
       const existingPeers = event.peers as { id: string; displayName: string }[];
-      // Initiate connections to all existing peers (we are the initiator)
       for (const p of existingPeers) {
         createPeerConnection(p.id, p.displayName, true);
       }
@@ -88,8 +196,6 @@ export function joinRoom(
         displayName: string;
         type: string;
       };
-      // New peer joins — they will initiate, we wait
-      // (but we create the peer object to be ready)
       createPeerConnection(newPeerId, name, false);
     })
   );
@@ -116,19 +222,49 @@ export function joinRoom(
     })
   );
 
+  // Host/admission handlers
   unsubscribers.push(
-    signalingClient.on('chat', (event) => {
-      const { fromPeerId, displayName: name, text, timestamp } = event as {
-        fromPeerId: string;
+    signalingClient.on('host-changed', (event) => {
+      const { hostPeerId } = event as { hostPeerId: string; type: string };
+      hostStatus.set(hostPeerId === localPeerId);
+    })
+  );
+
+  unsubscribers.push(
+    signalingClient.on('waiting-for-admission', () => {
+      admissionState.set('waiting');
+    })
+  );
+
+  unsubscribers.push(
+    signalingClient.on('admission-granted', () => {
+      admissionState.set('none');
+    })
+  );
+
+  unsubscribers.push(
+    signalingClient.on('admission-denied', (event) => {
+      const { reason } = event as { reason?: string; type: string };
+      admissionState.set('denied');
+      console.log('Admission denied:', reason);
+    })
+  );
+
+  unsubscribers.push(
+    signalingClient.on('admission-request', (event) => {
+      const { peerId: reqPeerId, displayName: reqName } = event as {
+        peerId: string;
         displayName: string;
-        text: string;
-        timestamp: number;
         type: string;
       };
-      chatMessages.update((msgs) => [
-        ...msgs,
-        { fromPeerId, displayName: name, text, timestamp, isLocal: false },
-      ]);
+      admissionRequests.update((reqs) => [...reqs, { peerId: reqPeerId, displayName: reqName }]);
+    })
+  );
+
+  unsubscribers.push(
+    signalingClient.on('password-required', () => {
+      // Emit as error for UI to handle
+      admissionState.set('denied');
     })
   );
 
@@ -136,6 +272,21 @@ export function joinRoom(
 }
 
 export function leaveRoom(): void {
+  // Clean up speaking detectors
+  for (const cleanup of speakingDetectorCleanups.values()) {
+    cleanup();
+  }
+  speakingDetectorCleanups.clear();
+  if (localSpeakingCleanup) {
+    localSpeakingCleanup();
+    localSpeakingCleanup = null;
+  }
+
+  // Save chat before leaving
+  if (currentRoomId) {
+    saveChatHistory(currentRoomId);
+  }
+
   // Clean up disconnect timers
   for (const timer of disconnectTimers.values()) {
     clearTimeout(timer);
@@ -161,14 +312,39 @@ export function leaveRoom(): void {
     signalingClient = null;
   }
 
-  chatMessages.set([]);
+  // Don't clear chat messages — keep for persistence
   connectionState.set('disconnected');
+  admissionState.set('none');
+  admissionRequests.set([]);
+  hostStatus.set(false);
+  typingPeers.set(new Set());
+  reactions.set([]);
+  speakingPeers.set(new Set());
+}
+
+export function admitPeer(peerId: string): void {
+  signalingClient?.admitPeer(peerId);
+  admissionRequests.update((reqs) => reqs.filter((r) => r.peerId !== peerId));
+}
+
+export function denyPeer(peerId: string): void {
+  signalingClient?.denyPeer(peerId);
+  admissionRequests.update((reqs) => reqs.filter((r) => r.peerId !== peerId));
 }
 
 export function sendChatMessage(text: string): void {
-  if (!signalingClient || !text.trim()) return;
+  if (!text.trim()) return;
 
-  signalingClient.sendChat(text);
+  const msg: DataChannelMessage = {
+    type: 'chat',
+    text,
+    fromPeerId: localPeerId,
+    displayName: localDisplayName,
+    timestamp: Date.now(),
+  };
+
+  broadcastToAllPeers(serialize(msg));
+
   chatMessages.update((msgs) => [
     ...msgs,
     {
@@ -179,9 +355,122 @@ export function sendChatMessage(text: string): void {
       isLocal: true,
     },
   ]);
+
+  if (currentRoomId) saveChatHistory(currentRoomId);
 }
 
-// Pending track replacements to retry when peer connects
+export function sendTypingIndicator(isTyping: boolean): void {
+  const msg: DataChannelMessage = {
+    type: 'typing',
+    isTyping,
+    fromPeerId: localPeerId,
+  };
+  broadcastToAllPeers(serialize(msg));
+}
+
+export function sendReaction(emoji: string): void {
+  const msg: DataChannelMessage = {
+    type: 'reaction',
+    emoji,
+    fromPeerId: localPeerId,
+    displayName: localDisplayName,
+    timestamp: Date.now(),
+  };
+  broadcastToAllPeers(serialize(msg));
+
+  // Add locally too
+  const id = `${Date.now()}_${Math.random()}`;
+  reactions.update((r) => [...r, { emoji, fromPeerId: localPeerId, displayName: localDisplayName, timestamp: Date.now(), id }]);
+  setTimeout(() => {
+    reactions.update((r) => r.filter((x) => x.id !== id));
+  }, 2500);
+}
+
+export function sendFileToRoom(file: File): string | null {
+  const peerMap = get(peers);
+  const peerIds = Array.from(peerMap.keys());
+  return ftSendFile(file, peerIds, localPeerId, localDisplayName);
+}
+
+// Typing indicator timers
+const typingTimers = new Map<string, ReturnType<typeof setTimeout>>();
+
+function handleDataChannelMessage(fromPeerId: string, msg: DataChannelMessage): void {
+  switch (msg.type) {
+    case 'chat': {
+      chatMessages.update((msgs) => [
+        ...msgs,
+        {
+          fromPeerId: msg.fromPeerId,
+          displayName: msg.displayName,
+          text: msg.text,
+          timestamp: msg.timestamp,
+          isLocal: false,
+        },
+      ]);
+      if (currentRoomId) saveChatHistory(currentRoomId);
+
+      // Clear typing indicator for this peer
+      typingPeers.update((s) => {
+        const next = new Set(s);
+        next.delete(msg.fromPeerId);
+        return next;
+      });
+      break;
+    }
+    case 'typing': {
+      const pid = msg.fromPeerId;
+      if (msg.isTyping) {
+        typingPeers.update((s) => new Set(s).add(pid));
+        // Auto-clear after 3s
+        const existing = typingTimers.get(pid);
+        if (existing) clearTimeout(existing);
+        typingTimers.set(pid, setTimeout(() => {
+          typingPeers.update((s) => {
+            const next = new Set(s);
+            next.delete(pid);
+            return next;
+          });
+          typingTimers.delete(pid);
+        }, 3000));
+      } else {
+        typingPeers.update((s) => {
+          const next = new Set(s);
+          next.delete(pid);
+          return next;
+        });
+        const existing = typingTimers.get(pid);
+        if (existing) {
+          clearTimeout(existing);
+          typingTimers.delete(pid);
+        }
+      }
+      break;
+    }
+    case 'reaction': {
+      const id = `${Date.now()}_${Math.random()}`;
+      reactions.update((r) => [...r, { ...msg, id }]);
+      setTimeout(() => {
+        reactions.update((r) => r.filter((x) => x.id !== id));
+      }, 2500);
+      break;
+    }
+    case 'file-meta':
+      handleFileMeta(msg);
+      break;
+    case 'file-chunk':
+      handleFileChunk(msg);
+      break;
+    case 'file-ack':
+      handleFileAck(msg);
+      break;
+    case 'file-cancel':
+      handleFileCancel(msg);
+      break;
+  }
+}
+
+// Track replacement for screen sharing
 const pendingTrackReplacements = new Map<string, MediaStreamTrack | null>();
 let screenShareActive = false;
 
@@ -199,7 +488,6 @@ function replaceVideoTrack(pc: PeerConnection, newTrack: MediaStreamTrack | null
     console.warn(`replaceVideoTrack failed for ${pc.id}, queuing retry:`, e);
   }
 
-  // Fallback: try simple-peer's removeTrack/addTrack
   try {
     const currentStream = get(localStream);
     if (currentStream) {
@@ -220,6 +508,23 @@ function replaceVideoTrack(pc: PeerConnection, newTrack: MediaStreamTrack | null
   return false;
 }
 
+export function replaceTrackOnAllPeers(newTrack: MediaStreamTrack, kind: 'audio' | 'video'): void {
+  const peerMap = get(peers);
+  for (const [, pc] of peerMap) {
+    try {
+      const rtcPc = (pc.peer as unknown as { _pc: RTCPeerConnection })._pc;
+      if (rtcPc) {
+        const sender = rtcPc.getSenders().find((s) => s.track?.kind === kind);
+        if (sender) {
+          sender.replaceTrack(newTrack);
+        }
+      }
+    } catch {
+      // best effort
+    }
+  }
+}
+
 export function startSharingScreen(): void {
   const screen = get(screenStream);
   if (!screen) return;
@@ -233,14 +538,12 @@ export function startSharingScreen(): void {
   const peerMap = get(peers);
   for (const [id, pc] of peerMap) {
     if (!replaceVideoTrack(pc, screenVideoTrack)) {
-      // Queue for retry when peer connects
       pendingTrackReplacements.set(id, screenVideoTrack);
     }
   }
 }
 
 export function stopSharingScreen(): void {
-  // Idempotency guard: don't run if already stopped
   if (!screenShareActive) return;
   screenShareActive = false;
   pendingTrackReplacements.clear();
@@ -255,17 +558,14 @@ export function stopSharingScreen(): void {
 }
 
 function getStreamForNewPeer(): MediaStream | undefined {
-  // If screen sharing, build a stream with the screen video track + camera audio track
   if (get(isScreenSharing)) {
     const screen = get(screenStream);
     const camera = get(localStream);
     if (screen) {
       const combined = new MediaStream();
-      // Use screen video
       for (const track of screen.getVideoTracks()) {
         combined.addTrack(track);
       }
-      // Use camera audio
       if (camera) {
         for (const track of camera.getAudioTracks()) {
           combined.addTrack(track);
@@ -283,7 +583,6 @@ function createPeerConnection(
   remoteDisplayName: string,
   initiator: boolean
 ): void {
-  // Destroy existing connection if any (e.g. on reconnect)
   const existingMap = get(peers);
   const existing = existingMap.get(remotePeerId);
   if (existing) {
@@ -310,12 +609,20 @@ function createPeerConnection(
     signalingClient?.sendSignal(remotePeerId, signal);
   });
 
-  // Retry any pending track replacements once the peer connects
   peer.on('connect', () => {
     const pendingTrack = pendingTrackReplacements.get(remotePeerId);
     if (pendingTrack !== undefined) {
       pendingTrackReplacements.delete(remotePeerId);
       replaceVideoTrack(pc, pendingTrack);
+    }
+  });
+
+  // Data channel messages
+  peer.on('data', (data: Uint8Array | string) => {
+    const str = typeof data === 'string' ? data : new TextDecoder().decode(data);
+    const msg = deserialize(str);
+    if (msg) {
+      handleDataChannelMessage(remotePeerId, msg);
     }
   });
 
@@ -326,6 +633,23 @@ function createPeerConnection(
       updated.set(remotePeerId, { ...pc, stream: remoteStream });
       return updated;
     });
+
+    // Attach speaking detector to remote stream
+    if (remoteStream.getAudioTracks().length > 0) {
+      // Clean up previous detector if any
+      const prevCleanup = speakingDetectorCleanups.get(remotePeerId);
+      if (prevCleanup) prevCleanup();
+
+      const cleanup = createSpeakingDetector(remoteStream, (isSpeaking) => {
+        speakingPeers.update((s) => {
+          const next = new Set(s);
+          if (isSpeaking) next.add(remotePeerId);
+          else next.delete(remotePeerId);
+          return next;
+        });
+      });
+      speakingDetectorCleanups.set(remotePeerId, cleanup);
+    }
   });
 
   peer.on('close', () => {
@@ -337,7 +661,7 @@ function createPeerConnection(
     destroyPeerConnection(remotePeerId);
   });
 
-  // ICE connection state monitoring for recovery
+  // ICE connection state monitoring
   try {
     const rtcPc = (peer as unknown as { _pc: RTCPeerConnection })._pc;
     if (rtcPc) {
@@ -345,14 +669,12 @@ function createPeerConnection(
         const state = rtcPc.iceConnectionState;
 
         if (state === 'connected' || state === 'completed') {
-          // Connection recovered — clear any pending disconnect timer
           const timer = disconnectTimers.get(remotePeerId);
           if (timer) {
             clearTimeout(timer);
             disconnectTimers.delete(remotePeerId);
           }
         } else if (state === 'disconnected') {
-          // Give it 5 seconds to recover before treating as failed
           const timer = setTimeout(() => {
             disconnectTimers.delete(remotePeerId);
             console.warn(`Peer ${remoteDisplayName} disconnected — reconnecting`);
@@ -360,7 +682,6 @@ function createPeerConnection(
           }, 5000);
           disconnectTimers.set(remotePeerId, timer);
         } else if (state === 'failed') {
-          // Clear any pending timer and reconnect immediately
           const timer = disconnectTimers.get(remotePeerId);
           if (timer) {
             clearTimeout(timer);
@@ -372,7 +693,7 @@ function createPeerConnection(
       });
     }
   } catch {
-    // _pc may not be available yet; ICE monitoring is best-effort
+    // _pc may not be available yet
   }
 
   peers.update((map) => {
@@ -388,7 +709,6 @@ function reconnectPeer(remotePeerId: string, remoteDisplayName: string): void {
   if (existing) {
     existing.peer.destroy();
   }
-  // Re-create as initiator since we detected the failure
   createPeerConnection(remotePeerId, remoteDisplayName, true);
 }
 
@@ -398,6 +718,26 @@ function destroyPeerConnection(remotePeerId: string): void {
     clearTimeout(timer);
     disconnectTimers.delete(remotePeerId);
   }
+
+  // Clean up speaking detector
+  const cleanup = speakingDetectorCleanups.get(remotePeerId);
+  if (cleanup) {
+    cleanup();
+    speakingDetectorCleanups.delete(remotePeerId);
+  }
+
+  // Clean up typing state
+  typingPeers.update((s) => {
+    const next = new Set(s);
+    next.delete(remotePeerId);
+    return next;
+  });
+
+  speakingPeers.update((s) => {
+    const next = new Set(s);
+    next.delete(remotePeerId);
+    return next;
+  });
 
   const peerMap = get(peers);
   const pc = peerMap.get(remotePeerId);

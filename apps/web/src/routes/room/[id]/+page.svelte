@@ -7,13 +7,20 @@
     peers,
     chatMessages,
     connectionState,
+    admissionState,
+    admissionRequests,
+    hostStatus,
+    reactions as reactionsStore,
+    speakingPeers,
     joinRoom,
     leaveRoom,
     sendChatMessage,
+    sendReaction,
+    admitPeer,
+    denyPeer,
     startSharingScreen,
     stopSharingScreen,
     type PeerConnection,
-    type ChatMessage,
   } from '$lib/webrtc/mesh';
   import {
     localStream,
@@ -21,6 +28,7 @@
     audioEnabled,
     videoEnabled,
     isScreenSharing,
+    voiceOnlyMode,
     startMedia,
     stopMedia,
     toggleAudio,
@@ -31,11 +39,18 @@
   import { getSignalServerUrl, getSavedDisplayName, peerId } from '$lib/stores/room';
   import VideoTile from './VideoTile.svelte';
   import ChatPanel from './ChatPanel.svelte';
+  import WaitingScreen from './WaitingScreen.svelte';
+  import AdmissionPanel from './AdmissionPanel.svelte';
+  import DeviceSettings from './DeviceSettings.svelte';
+  import ReactionOverlay from './ReactionOverlay.svelte';
+  import ReactionPicker from './ReactionPicker.svelte';
 
   let roomId = '';
   let displayName = '';
   let mediaReady = false;
   let showChat = false;
+  let showDeviceSettings = false;
+  let showReactionPicker = false;
   let peerList: PeerConnection[] = [];
   let localVideoEl: HTMLVideoElement;
   let copied = false;
@@ -43,7 +58,7 @@
 
   $: roomId = $page.params.id;
   $: peerList = Array.from($peers.values());
-  $: gridCols = getGridCols(peerList.length + 1); // +1 for self
+  $: gridCols = getGridCols(peerList.length + 1);
 
   function getGridCols(count: number): number {
     if (count <= 1) return 1;
@@ -54,21 +69,23 @@
   onMount(async () => {
     if (!browser) return;
 
-    // Get display name from URL or saved
     const urlName = $page.url.searchParams.get('name');
     displayName = urlName || getSavedDisplayName() || 'Anonymous';
 
+    const isCreator = $page.url.searchParams.get('creator') === '1';
+    const password = $page.url.searchParams.get('password') || undefined;
+    const voiceOnly = $page.url.searchParams.get('voiceOnly') === '1';
+
     try {
-      await startMedia();
+      await startMedia({ voiceOnly });
       mediaReady = true;
     } catch (err) {
       console.error('Failed to get media:', err);
-      // Continue without media — can still do text chat
       mediaReady = true;
     }
 
     const serverUrl = getSignalServerUrl();
-    joinRoom(serverUrl, roomId, $peerId, displayName);
+    joinRoom(serverUrl, roomId, $peerId, displayName, isCreator, password);
   });
 
   onDestroy(() => {
@@ -79,6 +96,12 @@
   });
 
   function handleLeave() {
+    leaveRoom();
+    stopMedia();
+    goto('/');
+  }
+
+  function handleCancelWaiting() {
     leaveRoom();
     stopMedia();
     goto('/');
@@ -115,10 +138,6 @@
     setTimeout(() => { copied = false; }, 2000);
   }
 
-  // Handle browser-native "Stop sharing" button: when isScreenSharing goes
-  // from true to false externally, restore camera tracks on peers.
-  // Guard: skip if handleScreenShare already called stopSharingScreen
-  // (stopSharingScreen is also idempotent, so this is a belt-and-suspenders check)
   $: {
     if (wasScreenSharing && !$isScreenSharing && !meshStopCalled) {
       stopSharingScreen();
@@ -129,7 +148,6 @@
     wasScreenSharing = $isScreenSharing;
   }
 
-  // Bind local video to stream — show screen when sharing, camera otherwise
   $: if (localVideoEl) {
     if ($isScreenSharing && $screenStream) {
       localVideoEl.srcObject = $screenStream;
@@ -137,10 +155,33 @@
       localVideoEl.srcObject = $localStream;
     }
   }
+
+  // Redirect on denied admission
+  $: if ($admissionState === 'denied') {
+    setTimeout(() => {
+      leaveRoom();
+      stopMedia();
+      goto('/');
+    }, 3000);
+  }
+
+  $: localSpeaking = $speakingPeers.has('local');
 </script>
 
+{#if $admissionState === 'waiting'}
+  <WaitingScreen on:cancel={handleCancelWaiting} />
+{/if}
+
+{#if $admissionState === 'denied'}
+  <div class="denied-overlay">
+    <div class="denied-card">
+      <h2>Access Denied</h2>
+      <p>You were not admitted to this room. Redirecting...</p>
+    </div>
+  </div>
+{/if}
+
 <div class="room">
-  <!-- Top bar -->
   <header>
     <div class="room-info">
       <span class="room-id">{roomId}</span>
@@ -150,35 +191,50 @@
       <span class="conn-status" class:connected={$connectionState === 'connected'}>
         {$connectionState}
       </span>
+      {#if $hostStatus}
+        <span class="host-badge">Host</span>
+      {/if}
     </div>
     <div class="peer-count">
       {peerList.length + 1} in call
     </div>
   </header>
 
-  <!-- Video grid -->
+  {#if $hostStatus && $admissionRequests.length > 0}
+    <AdmissionPanel
+      requests={$admissionRequests}
+      on:admit={(e) => admitPeer(e.detail)}
+      on:deny={(e) => denyPeer(e.detail)}
+    />
+  {/if}
+
+  <ReactionOverlay reactions={$reactionsStore} />
+
   <main class="video-grid" style="--cols: {gridCols}">
-    <!-- Local video -->
-    <div class="tile self" class:screen-sharing={$isScreenSharing}>
-      <video
-        bind:this={localVideoEl}
-        autoplay
-        muted
-        playsinline
-      ></video>
+    <div class="tile self" class:screen-sharing={$isScreenSharing} class:speaking={localSpeaking}>
+      {#if $voiceOnlyMode && !$isScreenSharing}
+        <div class="no-video">
+          <span class="avatar">{displayName.charAt(0).toUpperCase()}</span>
+        </div>
+      {:else}
+        <video
+          bind:this={localVideoEl}
+          autoplay
+          muted
+          playsinline
+        ></video>
+      {/if}
       <span class="tile-name">{displayName} (you)</span>
       {#if !$audioEnabled}
         <span class="muted-badge">Muted</span>
       {/if}
     </div>
 
-    <!-- Remote peers -->
     {#each peerList as pc (pc.id)}
-      <VideoTile peerConnection={pc} />
+      <VideoTile peerConnection={pc} speaking={$speakingPeers.has(pc.id)} />
     {/each}
   </main>
 
-  <!-- Chat panel -->
   {#if showChat}
     <ChatPanel
       messages={$chatMessages}
@@ -187,7 +243,14 @@
     />
   {/if}
 
-  <!-- Controls bar -->
+  {#if showDeviceSettings}
+    <DeviceSettings />
+  {/if}
+
+  {#if showReactionPicker}
+    <ReactionPicker on:react={(e) => { sendReaction(e.detail); showReactionPicker = false; }} />
+  {/if}
+
   <footer>
     <div class="controls">
       <button
@@ -196,7 +259,7 @@
         on:click={handleToggleAudio}
         title={$audioEnabled ? 'Mute' : 'Unmute'}
       >
-        {$audioEnabled ? 'Mic On' : 'Mic Off'}
+        <span class="ctrl-label">{$audioEnabled ? 'Mic On' : 'Mic Off'}</span>
       </button>
 
       <button
@@ -205,7 +268,7 @@
         on:click={handleToggleVideo}
         title={$videoEnabled ? 'Camera off' : 'Camera on'}
       >
-        {$videoEnabled ? 'Cam On' : 'Cam Off'}
+        <span class="ctrl-label">{$videoEnabled ? 'Cam On' : 'Cam Off'}</span>
       </button>
 
       <button
@@ -214,7 +277,7 @@
         on:click={handleScreenShare}
         title={$isScreenSharing ? 'Stop sharing' : 'Share screen'}
       >
-        {$isScreenSharing ? 'Stop Share' : 'Screen'}
+        <span class="ctrl-label">{$isScreenSharing ? 'Stop' : 'Screen'}</span>
       </button>
 
       <button
@@ -223,11 +286,29 @@
         on:click={() => { showChat = !showChat; }}
         title="Chat"
       >
-        Chat
+        <span class="ctrl-label">Chat</span>
+      </button>
+
+      <button
+        class="ctrl-btn"
+        class:active={showReactionPicker}
+        on:click={() => { showReactionPicker = !showReactionPicker; showDeviceSettings = false; }}
+        title="React"
+      >
+        <span class="ctrl-label">React</span>
+      </button>
+
+      <button
+        class="ctrl-btn"
+        class:active={showDeviceSettings}
+        on:click={() => { showDeviceSettings = !showDeviceSettings; showReactionPicker = false; }}
+        title="Settings"
+      >
+        <span class="ctrl-label">Settings</span>
       </button>
 
       <button class="ctrl-btn leave" on:click={handleLeave} title="Leave call">
-        Leave
+        <span class="ctrl-label">Leave</span>
       </button>
     </div>
   </footer>
@@ -284,6 +365,15 @@
     color: var(--success);
   }
 
+  .host-badge {
+    font-size: 0.75rem;
+    background: var(--accent);
+    color: white;
+    padding: 0.15rem 0.5rem;
+    border-radius: 4px;
+    font-weight: 600;
+  }
+
   .peer-count {
     color: var(--text-muted);
     font-size: 0.9rem;
@@ -303,6 +393,13 @@
     background: var(--bg-surface);
     border-radius: var(--radius);
     overflow: hidden;
+    border: 2px solid transparent;
+    transition: border-color 0.2s, box-shadow 0.2s;
+  }
+
+  .tile.speaking {
+    border-color: var(--success);
+    box-shadow: 0 0 12px rgba(34, 197, 94, 0.3);
   }
 
   .tile video {
@@ -313,6 +410,28 @@
 
   .tile.self:not(.screen-sharing) video {
     transform: scaleX(-1);
+  }
+
+  .tile .no-video {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 100%;
+    height: 100%;
+    background: var(--bg-elevated);
+  }
+
+  .tile .avatar {
+    font-size: 3rem;
+    font-weight: 600;
+    color: var(--text-muted);
+    background: var(--border);
+    width: 80px;
+    height: 80px;
+    border-radius: 50%;
+    display: flex;
+    align-items: center;
+    justify-content: center;
   }
 
   .tile-name {
@@ -337,6 +456,35 @@
     font-size: 0.7rem;
   }
 
+  .denied-overlay {
+    position: fixed;
+    inset: 0;
+    background: rgba(0, 0, 0, 0.85);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    z-index: 100;
+  }
+
+  .denied-card {
+    background: var(--bg-surface);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 2rem;
+    text-align: center;
+    max-width: 320px;
+  }
+
+  .denied-card h2 {
+    color: var(--danger);
+    margin-bottom: 0.5rem;
+  }
+
+  .denied-card p {
+    color: var(--text-muted);
+    font-size: 0.9rem;
+  }
+
   footer {
     padding: 0.75rem;
     background: var(--bg-surface);
@@ -347,6 +495,7 @@
     display: flex;
     justify-content: center;
     gap: 0.5rem;
+    flex-wrap: wrap;
   }
 
   .ctrl-btn {
@@ -383,5 +532,32 @@
 
   .ctrl-btn.leave:hover {
     background: #dc2626;
+  }
+
+  @media (max-width: 640px) {
+    .video-grid {
+      grid-template-columns: 1fr;
+    }
+
+    .ctrl-btn {
+      padding: 0.5rem 0.8rem;
+      font-size: 0.8rem;
+    }
+
+    .room-info {
+      gap: 0.4rem;
+    }
+
+    .room-id {
+      font-size: 0.9rem;
+    }
+
+    header {
+      padding: 0.5rem 0.75rem;
+    }
+
+    .copy-btn {
+      display: none;
+    }
   }
 </style>
