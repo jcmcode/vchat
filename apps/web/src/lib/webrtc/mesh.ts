@@ -23,12 +23,18 @@ export interface PeerConnection {
 }
 
 export interface ChatMessage {
+  id: string;
   fromPeerId: string;
   displayName: string;
   text: string;
   timestamp: number;
   isLocal: boolean;
   fileTransfer?: FileTransferEntry;
+}
+
+let msgCounter = 0;
+function nextMsgId(): string {
+  return `msg_${Date.now()}_${++msgCounter}`;
 }
 
 export interface Reaction {
@@ -83,7 +89,10 @@ function loadChatHistory(roomId: string): void {
     const key = `vchat_chat_${roomId}`;
     const saved = localStorage.getItem(key);
     if (saved) {
-      const msgs = JSON.parse(saved) as ChatMessage[];
+      const msgs = (JSON.parse(saved) as ChatMessage[]).map((m, i) => ({
+        ...m,
+        id: m.id || `loaded_${i}_${m.timestamp}`,
+      }));
       chatMessages.set(msgs.slice(-500));
     }
   } catch {
@@ -348,6 +357,7 @@ export function sendChatMessage(text: string): void {
   chatMessages.update((msgs) => [
     ...msgs,
     {
+      id: nextMsgId(),
       fromPeerId: localPeerId,
       displayName: localDisplayName,
       text,
@@ -401,6 +411,7 @@ function handleDataChannelMessage(fromPeerId: string, msg: DataChannelMessage): 
       chatMessages.update((msgs) => [
         ...msgs,
         {
+          id: nextMsgId(),
           fromPeerId: msg.fromPeerId,
           displayName: msg.displayName,
           text: msg.text,
@@ -459,10 +470,10 @@ function handleDataChannelMessage(fromPeerId: string, msg: DataChannelMessage): 
       handleFileMeta(msg);
       break;
     case 'file-chunk':
-      handleFileChunk(msg);
+      handleFileChunk(msg, fromPeerId);
       break;
     case 'file-ack':
-      handleFileAck(msg);
+      handleFileAck(msg, fromPeerId);
       break;
     case 'file-cancel':
       handleFileCancel(msg);
@@ -478,31 +489,18 @@ function replaceVideoTrack(pc: PeerConnection, newTrack: MediaStreamTrack | null
   try {
     const rtcPc = (pc.peer as unknown as { _pc: RTCPeerConnection })._pc;
     if (rtcPc) {
-      const videoSender = rtcPc.getSenders().find((s) => s.track?.kind === 'video');
+      // Use transceivers to reliably find the video sender even when track is null
+      const transceiver = rtcPc.getTransceivers().find(
+        (t) => t.sender.track?.kind === 'video' || t.receiver.track?.kind === 'video' || t.mid !== null && t.receiver.track === null && t.sender.track === null
+      );
+      const videoSender = transceiver?.sender ?? rtcPc.getSenders().find((s) => s.track?.kind === 'video');
       if (videoSender) {
         videoSender.replaceTrack(newTrack);
         return true;
       }
     }
   } catch (e) {
-    console.warn(`replaceVideoTrack failed for ${pc.id}, queuing retry:`, e);
-  }
-
-  try {
-    const currentStream = get(localStream);
-    if (currentStream) {
-      const oldVideoTrack = currentStream.getVideoTracks()[0];
-      if (oldVideoTrack) {
-        pc.peer.removeTrack(oldVideoTrack, currentStream);
-      }
-    }
-    if (newTrack) {
-      const stream = new MediaStream([newTrack]);
-      pc.peer.addTrack(newTrack, stream);
-    }
-    return true;
-  } catch (e) {
-    console.warn(`replaceVideoTrack fallback also failed for ${pc.id}:`, e);
+    console.warn(`replaceVideoTrack failed for ${pc.id}:`, e);
   }
 
   return false;
@@ -514,7 +512,11 @@ export function replaceTrackOnAllPeers(newTrack: MediaStreamTrack, kind: 'audio'
     try {
       const rtcPc = (pc.peer as unknown as { _pc: RTCPeerConnection })._pc;
       if (rtcPc) {
-        const sender = rtcPc.getSenders().find((s) => s.track?.kind === kind);
+        // Use transceivers to find sender even when current track is null
+        const transceiver = rtcPc.getTransceivers().find(
+          (t) => t.sender.track?.kind === kind || t.receiver.track?.kind === kind
+        );
+        const sender = transceiver?.sender ?? rtcPc.getSenders().find((s) => s.track?.kind === kind);
         if (sender) {
           sender.replaceTrack(newTrack);
         }

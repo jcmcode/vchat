@@ -112,7 +112,7 @@
   </div>
 
   <div class="messages" bind:this={messagesContainer}>
-    {#each messages as msg (msg.timestamp + msg.fromPeerId)}
+    {#each messages as msg (msg.id)}
       <div class="message" class:own={msg.isLocal}>
         <div class="msg-meta">
           <span class="msg-name">{msg.isLocal ? 'You' : msg.displayName}</span>

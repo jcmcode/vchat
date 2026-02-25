@@ -55,6 +55,20 @@
   let localVideoEl: HTMLVideoElement;
   let copied = false;
   let wasScreenSharing = false;
+  let mediaError = '';
+  let wasConnected = false;
+  let unreadCount = 0;
+  let lastSeenMessageCount = 0;
+
+  function handleWindowClick(e: MouseEvent) {
+    const target = e.target as HTMLElement;
+    if (showDeviceSettings && !target.closest('.device-settings') && !target.closest('.ctrl-btn')) {
+      showDeviceSettings = false;
+    }
+    if (showReactionPicker && !target.closest('.reaction-picker') && !target.closest('.ctrl-btn')) {
+      showReactionPicker = false;
+    }
+  }
 
   $: roomId = $page.params.id;
   $: peerList = Array.from($peers.values());
@@ -81,6 +95,17 @@
       mediaReady = true;
     } catch (err) {
       console.error('Failed to get media:', err);
+      if (err instanceof DOMException) {
+        if (err.name === 'NotAllowedError') {
+          mediaError = 'Camera/microphone access was denied. Check your browser permissions.';
+        } else if (err.name === 'NotFoundError') {
+          mediaError = 'No camera or microphone found on this device.';
+        } else {
+          mediaError = `Media error: ${err.message}`;
+        }
+      } else {
+        mediaError = 'Could not access camera or microphone.';
+      }
       mediaReady = true;
     }
 
@@ -166,6 +191,21 @@
   }
 
   $: localSpeaking = $speakingPeers.has('local');
+
+  // Track unread messages when chat is closed
+  $: {
+    if (showChat) {
+      lastSeenMessageCount = $chatMessages.length;
+      unreadCount = 0;
+    } else if ($chatMessages.length > lastSeenMessageCount) {
+      unreadCount = $chatMessages.length - lastSeenMessageCount;
+    }
+  }
+
+  $: {
+    if ($connectionState === 'connected') wasConnected = true;
+  }
+  $: showReconnecting = wasConnected && $connectionState === 'disconnected';
 </script>
 
 {#if $admissionState === 'waiting'}
@@ -181,7 +221,9 @@
   </div>
 {/if}
 
-<div class="room">
+<!-- svelte-ignore a11y-click-events-have-key-events -->
+<!-- svelte-ignore a11y-no-static-element-interactions -->
+<div class="room" on:click={handleWindowClick}>
   <header>
     <div class="room-info">
       <span class="room-id">{roomId}</span>
@@ -200,6 +242,19 @@
     </div>
   </header>
 
+  {#if showReconnecting}
+    <div class="reconnecting-banner">
+      <span class="reconnect-spinner"></span>
+      Connection lost. Reconnecting...
+    </div>
+  {/if}
+
+  {#if mediaError}
+    <div class="media-error-banner">
+      {mediaError}
+    </div>
+  {/if}
+
   {#if $hostStatus && $admissionRequests.length > 0}
     <AdmissionPanel
       requests={$admissionRequests}
@@ -212,7 +267,7 @@
 
   <main class="video-grid" style="--cols: {gridCols}">
     <div class="tile self" class:screen-sharing={$isScreenSharing} class:speaking={localSpeaking}>
-      {#if $voiceOnlyMode && !$isScreenSharing}
+      {#if ($voiceOnlyMode || !$videoEnabled) && !$isScreenSharing}
         <div class="no-video">
           <span class="avatar">{displayName.charAt(0).toUpperCase()}</span>
         </div>
@@ -287,6 +342,9 @@
         title="Chat"
       >
         <span class="ctrl-label">Chat</span>
+        {#if unreadCount > 0 && !showChat}
+          <span class="unread-badge">{unreadCount > 99 ? '99+' : unreadCount}</span>
+        {/if}
       </button>
 
       <button
@@ -456,6 +514,42 @@
     font-size: 0.7rem;
   }
 
+  .reconnecting-banner {
+    background: rgba(245, 158, 11, 0.15);
+    border: 1px solid #f59e0b;
+    color: #f59e0b;
+    padding: 0.5rem 1rem;
+    font-size: 0.85rem;
+    text-align: center;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 0.5rem;
+  }
+
+  .reconnect-spinner {
+    width: 14px;
+    height: 14px;
+    border: 2px solid rgba(245, 158, 11, 0.3);
+    border-top-color: #f59e0b;
+    border-radius: 50%;
+    animation: spin 0.8s linear infinite;
+    flex-shrink: 0;
+  }
+
+  @keyframes spin {
+    to { transform: rotate(360deg); }
+  }
+
+  .media-error-banner {
+    background: rgba(239, 68, 68, 0.15);
+    border: 1px solid var(--danger);
+    color: var(--danger);
+    padding: 0.5rem 1rem;
+    font-size: 0.85rem;
+    text-align: center;
+  }
+
   .denied-overlay {
     position: fixed;
     inset: 0;
@@ -499,6 +593,7 @@
   }
 
   .ctrl-btn {
+    position: relative;
     background: var(--bg-elevated);
     color: var(--text);
     padding: 0.6rem 1.2rem;
@@ -522,6 +617,24 @@
     background: var(--accent);
     border-color: var(--accent);
     color: white;
+  }
+
+  .unread-badge {
+    position: absolute;
+    top: -4px;
+    right: -4px;
+    background: var(--danger);
+    color: white;
+    font-size: 0.65rem;
+    font-weight: 700;
+    min-width: 18px;
+    height: 18px;
+    border-radius: 9px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 0 4px;
+    line-height: 1;
   }
 
   .ctrl-btn.leave {

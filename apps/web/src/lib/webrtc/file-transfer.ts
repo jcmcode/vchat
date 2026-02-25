@@ -116,7 +116,6 @@ function sendNextChunk(fileId: string, peerId: string): void {
       fileId,
       chunkIndex: nextChunk,
       data: base64,
-      fromPeerId: '', // filled by caller context
     });
 
     if (sendDataToPeerFn) sendDataToPeerFn(peerId, msg);
@@ -175,19 +174,18 @@ export function handleFileChunk(msg: {
   chunkIndex: number;
   data: string;
   fromPeerId: string;
-}): void {
+}, actualFromPeerId: string): void {
   const incoming = incomingChunks.get(msg.fileId);
   if (!incoming) return;
 
   incoming.chunks[msg.chunkIndex] = msg.data;
 
-  // Send ack
+  // Send ack back to the peer who sent this chunk
   if (sendDataToPeerFn) {
-    sendDataToPeerFn(msg.fromPeerId, JSON.stringify({
+    sendDataToPeerFn(actualFromPeerId, JSON.stringify({
       type: 'file-ack',
       fileId: msg.fileId,
       chunkIndex: msg.chunkIndex,
-      fromPeerId: '',
     }));
   }
 
@@ -230,9 +228,9 @@ export function handleFileChunk(msg: {
   }
 }
 
-export function handleFileAck(msg: { fileId: string; chunkIndex: number; fromPeerId: string }): void {
-  // Send next chunk to this peer
-  sendNextChunk(msg.fileId, msg.fromPeerId);
+export function handleFileAck(msg: { fileId: string; chunkIndex: number }, actualFromPeerId: string): void {
+  // Send next chunk to the peer who sent this ack
+  sendNextChunk(msg.fileId, actualFromPeerId);
 }
 
 export function cancelFileTransfer(fileId: string): void {
@@ -249,7 +247,7 @@ export function cancelFileTransfer(fileId: string): void {
   });
 
   if (broadcastFn) {
-    broadcastFn(JSON.stringify({ type: 'file-cancel', fileId, fromPeerId: '' }));
+    broadcastFn(JSON.stringify({ type: 'file-cancel', fileId }));
   }
 }
 
