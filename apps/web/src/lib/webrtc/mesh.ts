@@ -485,6 +485,31 @@ function handleDataChannelMessage(fromPeerId: string, msg: DataChannelMessage): 
 const pendingTrackReplacements = new Map<string, MediaStreamTrack | null>();
 let screenShareActive = false;
 
+// Audio mixing for screen share audio + mic
+let mixedAudioCtx: AudioContext | null = null;
+let mixedAudioDest: MediaStreamAudioDestinationNode | null = null;
+
+function createMixedAudioTrack(micStream: MediaStream, screen: MediaStream): MediaStreamTrack {
+  mixedAudioCtx = new AudioContext();
+  mixedAudioDest = mixedAudioCtx.createMediaStreamDestination();
+
+  const micSource = mixedAudioCtx.createMediaStreamSource(micStream);
+  const screenSource = mixedAudioCtx.createMediaStreamSource(screen);
+
+  micSource.connect(mixedAudioDest);
+  screenSource.connect(mixedAudioDest);
+
+  return mixedAudioDest.stream.getAudioTracks()[0];
+}
+
+function cleanupMixedAudio(): void {
+  if (mixedAudioCtx) {
+    mixedAudioCtx.close();
+    mixedAudioCtx = null;
+    mixedAudioDest = null;
+  }
+}
+
 function replaceVideoTrack(pc: PeerConnection, newTrack: MediaStreamTrack | null): boolean {
   try {
     const rtcPc = (pc.peer as unknown as { _pc: RTCPeerConnection })._pc;
@@ -543,6 +568,16 @@ export function startSharingScreen(): void {
       pendingTrackReplacements.set(id, screenVideoTrack);
     }
   }
+
+  // Mix screen audio with mic so peers hear both voice and shared audio
+  const screenAudioTracks = screen.getAudioTracks();
+  if (screenAudioTracks.length > 0) {
+    const mic = get(localStream);
+    if (mic) {
+      const mixedTrack = createMixedAudioTrack(mic, screen);
+      replaceTrackOnAllPeers(mixedTrack, 'audio');
+    }
+  }
 }
 
 export function stopSharingScreen(): void {
@@ -557,6 +592,13 @@ export function stopSharingScreen(): void {
   for (const [, pc] of peerMap) {
     replaceVideoTrack(pc, cameraVideoTrack);
   }
+
+  // Revert audio to mic-only
+  cleanupMixedAudio();
+  const micAudioTrack = camera?.getAudioTracks()[0];
+  if (micAudioTrack) {
+    replaceTrackOnAllPeers(micAudioTrack, 'audio');
+  }
 }
 
 function getStreamForNewPeer(): MediaStream | undefined {
@@ -568,7 +610,12 @@ function getStreamForNewPeer(): MediaStream | undefined {
       for (const track of screen.getVideoTracks()) {
         combined.addTrack(track);
       }
-      if (camera) {
+      // Use mixed audio (mic + screen) if available, otherwise mic-only
+      if (mixedAudioDest) {
+        for (const track of mixedAudioDest.stream.getAudioTracks()) {
+          combined.addTrack(track);
+        }
+      } else if (camera) {
         for (const track of camera.getAudioTracks()) {
           combined.addTrack(track);
         }

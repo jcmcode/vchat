@@ -151,7 +151,7 @@ export async function startScreenShare(): Promise<MediaStream | null> {
   try {
     const stream = await navigator.mediaDevices.getDisplayMedia({
       video: { frameRate: { ideal: 30 } },
-      audio: false,
+      audio: true,
     });
 
     // When user stops sharing via browser UI
