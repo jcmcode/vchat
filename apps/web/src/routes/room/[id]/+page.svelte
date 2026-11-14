@@ -80,6 +80,8 @@
   import Icon from '$lib/ui/Icon.svelte';
   import VideoTile from './VideoTile.svelte';
   import { setE2EKey, verification, blockedConnections, hasRoomKey, isValidRoomKey, allowUnverified } from '$lib/webrtc/e2e';
+  import ConnectionDetails from './ConnectionDetails.svelte';
+  import ConnectionHint from './ConnectionHint.svelte';
   import ChatPanel from './ChatPanel.svelte';
   import WaitingScreen from './WaitingScreen.svelte';
   import AdmissionPanel from './AdmissionPanel.svelte';
@@ -844,6 +846,7 @@
       {/if}
 
       <ReactionOverlay reactions={$reactionsStore} />
+      <ConnectionHint />
 
       {#if showDeviceSettings}
         <DeviceSettings />
@@ -988,6 +991,7 @@
               <p>Read all of it to {selectedPeer.displayName} (by voice, or another app). If you both see the same code, nobody is in the middle of your connection.</p>
             </div>
           {/if}
+          <ConnectionDetails peerId={selectedPeer.id} />
           {#if $verification.get(selectedPeer.id)?.state === 'unverified'}
             <button class="btn secondary" on:click={() => selectedPeer && allowUnverified(selectedPeer.id)}>
               <Icon name="shield-alert" size={16} /> Allow this unverified connection
@@ -1867,6 +1871,8 @@
     display: flex;
     flex-direction: column;
     gap: var(--space-4, 1rem);
+    max-height: calc(100dvh - 2rem);
+    overflow-y: auto;
   }
 
   .person-head {
