@@ -165,18 +165,27 @@ let switchTimer: ReturnType<typeof setTimeout> | null = null;
 /** Don't swap the picture more often than this when the speaker changes. */
 const SWITCH_DWELL_MS = 3000;
 
-/** Only connections that passed the trust gate (mesh.ts sets `stream` only once trusted). */
+/** Their shared screen while one is arriving (mesh.ts sets `screenStream` only once trusted). */
+function trustedScreen(id: string): MediaStream | null {
+  const pc = get(peers).get(id);
+  return pc?.trusted && get(sharingPeers).has(id) ? pc.screenStream : null;
+}
+
+/**
+ * What to show for a peer: their shared screen, else their camera. Only connections that passed
+ * the trust gate (mesh.ts sets `stream` and `screenStream` only once trusted).
+ */
 function trustedStream(id: string): MediaStream | null {
   const pc = get(peers).get(id);
-  return pc?.trusted ? pc.stream : null;
+  return pc?.trusted ? trustedScreen(id) ?? pc.stream : null;
 }
 
 function candidates(): PipCandidate[] {
   const media = get(peerMediaState);
-  const sharing = get(sharingPeers);
   return Array.from(get(peers).keys(), (id) => {
     const live = !!trustedStream(id)?.getVideoTracks().some((t) => t.readyState === 'live');
-    const isSharing = sharing.has(id);
+    // Only a screen that's actually arriving counts as sharing (a bare claim gets no priority).
+    const isSharing = !!trustedScreen(id);
     return { id, sharing: isSharing, hasVideo: live && (isSharing || media.get(id)?.video !== false) };
   });
 }

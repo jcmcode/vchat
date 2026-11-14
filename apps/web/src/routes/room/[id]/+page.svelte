@@ -50,6 +50,7 @@
     stopMedia,
     toggleAudio,
     toggleVideo,
+    cameraStarting,
     startScreenShare,
     stopScreenShare,
   } from '$lib/media/manager';
@@ -89,6 +90,7 @@
   import Icon from '$lib/ui/Icon.svelte';
   import VideoTile from './VideoTile.svelte';
   import { setE2EKey, verification, blockedConnections, hasRoomKey, isValidRoomKey, allowUnverified } from '$lib/webrtc/e2e';
+  import { pickPresenter } from '$lib/webrtc/media-slots';
   import { pipMode, pipOpen, pipAvailable, togglePip } from '$lib/ui/pip';
   import ConnectionDetails from './ConnectionDetails.svelte';
   import ConnectionHint from './ConnectionHint.svelte';
@@ -227,7 +229,8 @@
   $: peerList = Array.from($peers.values());
 
   // ── Stage: whiteboard or a shared screen takes the main area; tiles move to a strip ──
-  $: remoteSharer = [...$sharingPeers].find((id) => $peers.has(id)) ?? null;
+  // The latest presenter whose screen is actually arriving (a bare claim can't take the stage).
+  $: remoteSharer = pickPresenter($sharingPeers, (id) => !!$peers.get(id)?.screenStream);
   $: stage = $whiteboardOpen
     ? 'whiteboard'
     : $isScreenSharing
@@ -236,7 +239,10 @@
         ? 'remote-screen'
         : null;
   $: stagePeer = stage === 'remote-screen' && remoteSharer ? $peers.get(remoteSharer) ?? null : null;
-  $: stripPeers = stagePeer ? peerList.filter((p) => p.id !== stagePeer?.id) : peerList;
+  // The presenter keeps their tile (camera and sound); the stage shows only their screen.
+  $: stripPeers = peerList;
+  // Any other screen being shared goes in the strip, so no share is ever hidden.
+  $: stripScreens = peerList.filter((p) => p.screenStream && $sharingPeers.has(p.id) && p.id !== stagePeer?.id);
   $: gridCols = getGridCols(peerList.length + 1);
 
   function getGridCols(count: number): number {
@@ -535,8 +541,16 @@
     toggleAudio();
   }
 
-  function handleToggleVideo() {
-    toggleVideo();
+  /** Why the camera didn't turn back on (busy, unplugged, blocked). */
+  let cameraError = '';
+
+  async function handleToggleVideo() {
+    try {
+      await toggleVideo();
+      cameraError = '';
+    } catch (err) {
+      cameraError = err instanceof Error ? err.message : "Couldn't turn the camera on.";
+    }
   }
 
   let meshStopCalled = false;
@@ -939,6 +953,15 @@
       </div>
     {/if}
 
+    {#if cameraError}
+      <div class="banner danger" role="alert">
+        <span>{cameraError}</span>
+        <button class="banner-dismiss" on:click={() => (cameraError = '')} aria-label="Dismiss">
+          <Icon name="x" size={14} />
+        </button>
+      </div>
+    {/if}
+
     {#if $whiteboardNotice && !$whiteboardOpen}
       <div class="banner info" role="status">
         <Icon name="whiteboard" size={16} />
@@ -972,6 +995,7 @@
                     peerConnection={stagePeer}
                     speaking={$speakingPeers.has(stagePeer.id)}
                     contain
+                    screen
                     presenting
                     verification={$verification.get(stagePeer.id)?.state}
                     bind:videoEl={stageVideoEl}
@@ -1010,6 +1034,10 @@
                 on:select={() => (selectedPeerId = pc.id)}
               />
             {/each}
+
+            {#each stripScreens as pc (pc.id)}
+              <VideoTile peerConnection={pc} contain screen presenting verification={$verification.get(pc.id)?.state} />
+            {/each}
           </div>
         </main>
 
@@ -1046,11 +1074,12 @@
               </button>
             {/if}
 
-            {#if !chatOnly && $localStream?.getVideoTracks().length}
+            {#if !chatOnly && $localStream && !$voiceOnlyMode}
               <button
                 class="ctrl-btn"
                 class:off={!$videoEnabled}
                 aria-pressed={$videoEnabled}
+                disabled={$cameraStarting}
                 on:click={handleToggleVideo}
                 title={$videoEnabled ? 'Camera off' : 'Camera on'}
               >
@@ -1792,6 +1821,11 @@
   .ctrl-btn.off:hover {
     background: var(--danger-soft);
     border-color: var(--danger);
+  }
+
+  .ctrl-btn:disabled {
+    opacity: 0.6;
+    cursor: progress;
   }
 
   .ctrl-btn.active {

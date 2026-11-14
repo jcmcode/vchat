@@ -43,22 +43,26 @@
   $: people = Array.from($peers.values(), (pc) => {
     const media = $peerMediaState.get(pc.id);
     const sharing = $sharingPeers.has(pc.id);
-    const stream = pc.trusted ? pc.stream : null;
+    // Their shared screen while one is arriving, else their camera (both set only once trusted).
+    const screen = pc.trusted && sharing ? pc.screenStream : null;
+    const stream = pc.trusted ? screen ?? pc.stream : null;
     const state = $verification.get(pc.id)?.state;
     return {
       id: pc.id,
       name: pc.displayName,
       stream,
-      showVideo: !!stream && (sharing || media?.video !== false),
+      showVideo: !!stream && (!!screen || media?.video !== false),
       sharing,
+      contain: !!screen,
       muted: media?.audio === false,
       speaking: $speakingPeers.has(pc.id),
       unverified: state === 'unverified' || state === 'failed' || state === 'allowed' || state === 'nokey',
     };
   });
   $: hasMic = !chatOnly && !!$localStream?.getAudioTracks().length;
-  $: hasCam = !chatOnly && !!$localStream?.getVideoTracks().length;
-  $: selfVideo = hasCam && !$voiceOnlyMode && $videoEnabled ? $localStream : null;
+  // Camera off removes the camera track (manager.ts), so the button depends on how you joined.
+  $: hasCam = !chatOnly && !!$localStream && !$voiceOnlyMode;
+  $: selfVideo = hasCam && $videoEnabled && $localStream?.getVideoTracks().length ? $localStream : null;
 </script>
 
 <div class="pip">
@@ -67,7 +71,7 @@
       <li class="person" class:speaking={p.speaking}>
         {#if p.showVideo}
           <!-- svelte-ignore a11y-media-has-caption -->
-          <video use:playStream={p.stream} autoplay muted playsinline class:contain={p.sharing}></video>
+          <video use:playStream={p.stream} autoplay muted playsinline class:contain={p.contain}></video>
         {:else}
           <span class="avatar" aria-hidden="true">{initial(p.name)}</span>
         {/if}

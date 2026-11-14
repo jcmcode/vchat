@@ -2,12 +2,15 @@ import type SimplePeer from 'simple-peer';
 import Peer from './simple-peer.js';
 import { writable, get } from 'svelte/store';
 import { SignalingClient } from '../signaling/client.js';
-import { localStream, screenStream, isScreenSharing, audioEnabled, videoEnabled } from '../media/manager.js';
+import { localStream, screenStream, audioEnabled, videoEnabled } from '../media/manager.js';
 import { fetchIceServers } from '../stores/room.js';
 import { deserialize, serialize, type AnyDataMessage, type DataChannelMessage } from './data-channel.js';
 import { createSpeakingDetector } from '../media/audio-analysis.js';
 import { readSdpIdentity } from './e2e-proof.js';
 import { nameKey, stripInvisible } from './name-key.js';
+import { enableSending, isValidMid, localSlots, remoteSlots, sendingBlocked } from './media-slots.js';
+import { holdEarlyState, type EarlyState } from './early-state.js';
+import { cameraTarget, screenTarget, tuneSender } from '../media/quality.js';
 import {
   initFileTransfer,
   handleFileMeta,
@@ -39,8 +42,12 @@ export interface PeerConnection {
   pinned: { fingerprint: string; ufrag: string } | null;
   /** Tracks we want to send on each sender, applied once trusted. */
   intended: Map<RTCRtpSender, MediaStreamTrack | null>;
-  /** Remote stream received before trust (not shown or played yet). */
-  pendingStream: MediaStream | null;
+  /** Their shared screen (shown on the stage): set once trusted, while they announce one. */
+  screenStream: MediaStream | null;
+  /** The mid they announced for their screen transceiver (only ever looked up on this connection). */
+  screenMid: string | null;
+  /** Their latest screen/media state sent before we trusted them: applied in trustPeer (early-state.ts). */
+  earlyState: Map<EarlyState['type'], EarlyState>;
 }
 
 export interface ChatMessage {
@@ -179,19 +186,19 @@ export function getPeerConnection(peerId: string): PeerConnection | undefined {
 export function trustPeer(peerId: string, sid: string): void {
   const pc = get(peers).get(peerId);
   if (!pc || pc.sid !== sid || pc.trusted || !pc.connected) return;
+  syncSenders(pc); // what each sender should carry right now (camera, mic, screen); still held
   pc.trusted = true;
   for (const [sender, track] of pc.intended) sender.replaceTrack(track).catch(() => {});
-  const pendingTrack = pendingTrackReplacements.get(peerId);
-  if (pendingTrack !== undefined) {
-    pendingTrackReplacements.delete(peerId);
-    replaceVideoTrack(pc, pendingTrack, get(screenStream) ?? undefined);
-  }
-  if (pc.pendingStream) attachRemoteStream(pc, pc.pendingStream);
-  pc.pendingStream = null;
+  // State they sent while we were still checking them (they trusted us first), validated as usual.
+  const early = [...pc.earlyState.values()];
+  pc.earlyState.clear();
+  for (const msg of early) handleDataChannelMessage(peerId, msg);
+  refreshRemoteMedia(pc);
   updatePeers();
   // Tell them what we're doing right now, then let features sync state.
-  if (screenShareActive) sendIfConnected(pc, serialize({ type: 'screen-state', sharing: true }));
+  if (screenShareActive) sendIfConnected(pc, serialize(screenState(pc, true)));
   sendIfConnected(pc, serialize({ type: 'media-state', ...localMediaState() }));
+  scheduleRetune(); // one more peer to send to
   for (const handler of connectHandlers) handler(peerId);
 }
 
@@ -708,6 +715,8 @@ export async function joinRoom(opts: JoinOptions): Promise<void> {
   unsubscribers.push(audioEnabled.subscribe(publishMediaState));
   unsubscribers.push(videoEnabled.subscribe(publishMediaState));
   unsubscribers.push(localStream.subscribe(publishMediaState));
+  // Senders follow the local stream: camera turned off (track gone) or on again, camera switched.
+  unsubscribers.push(localStream.subscribe(() => syncAllSenders()));
 
   client.enterRoom({ roomId, peerId, displayName, secret, password, token, isCreator });
   client.connect();
@@ -751,7 +760,9 @@ export function leaveRoom(): void {
   remoteSessionStarts.clear();
   blockedPeers.clear();
   reconnectAttempts.clear();
-  addedScreenTracks.clear();
+  if (retuneTimer) clearTimeout(retuneTimer);
+  retuneTimer = null;
+  watchScreenSize(false);
 
   const peerMap = get(peers);
   peers.set(new Map());
@@ -768,7 +779,6 @@ export function leaveRoom(): void {
 
   cleanupMixedAudio();
   screenShareActive = false;
-  pendingTrackReplacements.clear();
   resetFileTransfers();
 
   connectionState.set('disconnected');
@@ -928,6 +938,14 @@ function handleDataChannelMessage(fromPeerId: string, anyMsg: DataChannelMessage
     }
     case 'screen-state': {
       const sharing = msg.sharing === true;
+      // Which of *their* video transceivers is the screen. It's only looked up on this peer's own
+      // connection (remoteSlots), so nobody can label anyone else's video.
+      const pc = get(peers).get(fromPeerId);
+      const mid = sharing && isValidMid(msg.mid) ? msg.mid : null;
+      if (pc && pc.screenMid !== mid) {
+        pc.screenMid = mid;
+        refreshRemoteMedia(pc);
+      }
       if (get(sharingPeers).has(fromPeerId) === sharing) break; // no change
       sharingPeers.update((s) => {
         const next = new Set(s);
@@ -1023,8 +1041,10 @@ function handleDataChannelMessage(fromPeerId: string, anyMsg: DataChannelMessage
   }
 }
 
-// Track replacement for screen sharing
-const pendingTrackReplacements = new Map<string, MediaStreamTrack | null>();
+// ── Outgoing media: microphone, camera and shared screen ─────────────────────────
+// Every connection has the same three transceivers (media-slots.ts): audio, camera, screen. What
+// each one should carry is worked out from the local state and applied through setSenderTrack, so
+// nothing is sent before the connection is verified. The screen goes out next to the camera.
 let screenShareActive = false;
 
 // Audio mixing for screen share audio + mic
@@ -1054,73 +1074,122 @@ function cleanupMixedAudio(): void {
   }
 }
 
-/** Screen tracks we had to *add* (the peer had no video sender, e.g. we joined audio-only). */
-const addedScreenTracks = new Map<string, { track: MediaStreamTrack; stream: MediaStream }>();
-
-function videoSender(pc: PeerConnection): RTCRtpSender | null {
-  return senderFor(pc, 'video');
+function rtcOf(pc: PeerConnection): RTCPeerConnection | null {
+  return (pc.peer as unknown as { _pc?: RTCPeerConnection | null })._pc ?? null;
 }
 
-/** Point this peer's outgoing video at `track` (camera or screen). Returns false if not possible yet. */
-function replaceVideoTrack(pc: PeerConnection, newTrack: MediaStreamTrack | null, screen?: MediaStream): boolean {
+function transceiversOf(pc: PeerConnection): RTCRtpTransceiver[] {
   try {
-    const sender = videoSender(pc);
-    if (sender) {
-      setSenderTrack(pc, sender, newTrack);
-      return true;
-    }
-    // No video sender (audio-only / no camera): add the screen as a new track. It's grouped with
-    // our audio stream so the other side keeps a single picture-and-sound stream for us.
-    // (Only on a verified connection; otherwise it's applied when trust is established.)
-    if (newTrack && screen && pc.connected && pc.trusted) {
-      const stream = get(localStream) ?? screen;
-      pc.peer.addTrack(newTrack, stream);
-      addedScreenTracks.set(pc.id, { track: newTrack, stream });
-      return true;
-    }
-  } catch (e) {
-    console.warn(`replaceVideoTrack failed for ${pc.id}:`, e);
+    return rtcOf(pc)?.getTransceivers() ?? [];
+  } catch {
+    return []; // connection already closed
   }
-  return false;
 }
 
-function unshareScreen(pc: PeerConnection, cameraTrack: MediaStreamTrack | null): void {
-  const added = addedScreenTracks.get(pc.id);
-  if (added) {
-    addedScreenTracks.delete(pc.id);
-    try {
-      pc.peer.removeTrack(added.track, added.stream);
-    } catch {
-      // connection already gone
-    }
-    return;
+/** The microphone, mixed with the shared screen's sound while presenting. */
+function outgoingAudioTrack(): MediaStreamTrack | null {
+  const mixed = screenShareActive ? mixedAudioDest?.stream.getAudioTracks()[0] : undefined;
+  return mixed ?? get(localStream)?.getAudioTracks()[0] ?? null;
+}
+
+/** The camera, only while it's on (turning it off stops the track and removes it). */
+function outgoingCameraTrack(): MediaStreamTrack | null {
+  if (!get(videoEnabled)) return null;
+  return get(localStream)?.getVideoTracks().find((t) => t.readyState === 'live') ?? null;
+}
+
+function outgoingScreenTrack(): MediaStreamTrack | null {
+  if (!screenShareActive) return null;
+  return get(screenStream)?.getVideoTracks().find((t) => t.readyState === 'live') ?? null;
+}
+
+/** Point each of this connection's senders at what it should carry right now (held back until trusted). */
+function syncSenders(pc: PeerConnection): void {
+  const slots = localSlots(transceiversOf(pc));
+  const wanted: [RTCRtpTransceiver | undefined, MediaStreamTrack | null][] = [
+    [slots.audio, outgoingAudioTrack()],
+    [slots.camera, outgoingCameraTrack()],
+    [slots.screen, outgoingScreenTrack()],
+  ];
+  for (const [t, track] of wanted) {
+    if (!t) continue;
+    const stale = !pc.intended.has(t.sender) || pc.intended.get(t.sender) !== track || (pc.trusted && t.sender.track !== track);
+    if (stale) setSenderTrack(pc, t.sender, track);
   }
-  replaceVideoTrack(pc, cameraTrack);
+}
+
+function syncAllSenders(): void {
+  for (const pc of get(peers).values()) syncSenders(pc);
 }
 
 /** Every outgoing track change goes through here: applied now if trusted, else when trusted. */
 function setSenderTrack(pc: PeerConnection, sender: RTCRtpSender, track: MediaStreamTrack | null): void {
   pc.intended.set(sender, track);
   if (pc.trusted) sender.replaceTrack(track).catch(() => {});
+  scheduleRetune(); // the new track may have a different size
 }
 
-/** The sender for our outgoing audio or video on this connection (even while held back). */
+/** The sender for our outgoing audio or camera on this connection (even while held back). */
 function senderFor(pc: PeerConnection, kind: 'audio' | 'video'): RTCRtpSender | null {
-  for (const [sender, track] of pc.intended) if (track?.kind === kind || sender.track?.kind === kind) return sender;
-  const rtcPc = (pc.peer as unknown as { _pc?: RTCPeerConnection })._pc;
-  const sendCapable = (d: RTCRtpTransceiverDirection | null | undefined) => d === 'sendrecv' || d === 'sendonly';
-  const t = rtcPc
-    ?.getTransceivers()
-    .find(
-      (t) =>
-        t.currentDirection !== 'stopped' &&
-        (t.sender.track?.kind === kind ||
-          (t.receiver.track?.kind === kind && (sendCapable(t.currentDirection) || sendCapable(t.direction))))
-    );
-  return t?.sender ?? null;
+  const slots = localSlots(transceiversOf(pc));
+  return (kind === 'audio' ? slots.audio : slots.camera)?.sender ?? null;
 }
 
-export function replaceTrackOnAllPeers(newTrack: MediaStreamTrack, kind: 'audio' | 'video'): void {
+/** Our screen-state for one connection, naming the transceiver that carries the screen on it. */
+function screenState(pc: PeerConnection, sharing: boolean): DataChannelMessage {
+  const mid = sharing ? localSlots(transceiversOf(pc)).screen?.mid : null;
+  return mid ? { type: 'screen-state', sharing, mid } : { type: 'screen-state', sharing };
+}
+
+let retuneTimer: ReturnType<typeof setTimeout> | null = null;
+
+/** Re-apply the upload caps (quality.ts) shortly: peers came or went, a share started, a track changed. */
+function scheduleRetune(): void {
+  if (retuneTimer) return;
+  retuneTimer = setTimeout(() => {
+    retuneTimer = null;
+    retune();
+  }, 0);
+}
+
+function retune(): void {
+  // Only verified connections receive anything, so they're the ones the upload is split across.
+  const sending = Array.from(get(peers).values()).filter((pc) => pc.trusted);
+  const camera = cameraTarget(sending.length, screenShareActive);
+  const screen = screenTarget(sending.length, !!outgoingCameraTrack());
+  for (const pc of sending) {
+    const slots = localSlots(transceiversOf(pc));
+    for (const [t, target] of [
+      [slots.camera, camera],
+      [slots.screen, screen],
+    ] as const) {
+      const track = t ? pc.intended.get(t.sender) : null;
+      if (t && track) void tuneSender(t.sender, target, track.getSettings());
+    }
+  }
+}
+
+/**
+ * A shared surface can change size on the same track ("share this tab instead", a resized window),
+ * which changes how much to scale it down: check every couple of seconds while presenting.
+ */
+let screenSizeTimer: ReturnType<typeof setInterval> | null = null;
+function watchScreenSize(on: boolean): void {
+  if (screenSizeTimer) clearInterval(screenSizeTimer);
+  screenSizeTimer = null;
+  if (!on) return;
+  let last = '';
+  screenSizeTimer = setInterval(() => {
+    const s = outgoingScreenTrack()?.getSettings();
+    const size = `${s?.width ?? 0}x${s?.height ?? 0}`;
+    if (size === last) return;
+    last = size;
+    scheduleRetune();
+  }, 2000);
+}
+
+/** Point every connection's microphone or camera sender at `newTrack` (null: send nothing). */
+export function replaceTrackOnAllPeers(newTrack: MediaStreamTrack | null, kind: 'audio' | 'video'): void {
   for (const [, pc] of get(peers)) {
     const sender = senderFor(pc, kind);
     if (sender) setSenderTrack(pc, sender, newTrack);
@@ -1149,81 +1218,43 @@ export function useNewMicTrack(track: MediaStreamTrack): void {
   }
 }
 
+/**
+ * Share the screen in `screenStream`. It goes out on its own transceiver next to the camera (which
+ * carries on, or stays off), to verified connections only; others get it once they're verified.
+ * Each peer is told which of our transceivers carries it.
+ */
 export function startSharingScreen(): void {
   const screen = get(screenStream);
-  if (!screen) return;
-
-  const screenVideoTrack = screen.getVideoTracks()[0];
-  if (!screenVideoTrack) return;
-
+  if (!screen?.getVideoTracks()[0]) return;
   screenShareActive = true;
-  pendingTrackReplacements.clear();
-  broadcastToAllPeers(serialize({ type: 'screen-state', sharing: true }));
-
-  const peerMap = get(peers);
-  for (const [id, pc] of peerMap) {
-    if (!replaceVideoTrack(pc, screenVideoTrack, screen)) {
-      pendingTrackReplacements.set(id, screenVideoTrack);
-    }
-  }
 
   // Mix screen audio with mic so peers hear both voice and shared audio
-  const screenAudioTracks = screen.getAudioTracks();
-  if (screenAudioTracks.length > 0) {
-    const mic = get(localStream);
-    if (mic) {
-      const mixedTrack = createMixedAudioTrack(mic, screen);
-      replaceTrackOnAllPeers(mixedTrack, 'audio');
+  const mic = get(localStream);
+  if (screen.getAudioTracks().length > 0 && mic?.getAudioTracks().length) {
+    try {
+      createMixedAudioTrack(mic, screen);
+    } catch (e) {
+      cleanupMixedAudio(); // send the microphone alone
+      console.warn('Could not mix in the shared audio:', e);
     }
   }
+
+  syncAllSenders();
+  for (const pc of get(peers).values()) sendIfConnected(pc, serialize(screenState(pc, true)));
+  scheduleRetune(); // the screen takes most of the upload now
+  watchScreenSize(true);
 }
 
 export function stopSharingScreen(): void {
   if (!screenShareActive) return;
   screenShareActive = false;
-  pendingTrackReplacements.clear();
   broadcastToAllPeers(serialize({ type: 'screen-state', sharing: false }));
 
-  const camera = get(localStream);
-  const cameraVideoTrack = camera?.getVideoTracks()[0] ?? null;
-
-  const peerMap = get(peers);
-  for (const [, pc] of peerMap) {
-    unshareScreen(pc, cameraVideoTrack);
-  }
-
-  // Revert audio to mic-only
+  // Revert audio to mic-only and stop sending the screen. The camera carries on as it was.
   cleanupMixedAudio();
-  const micAudioTrack = camera?.getAudioTracks()[0];
-  if (micAudioTrack) {
-    replaceTrackOnAllPeers(micAudioTrack, 'audio');
-  }
-}
-
-function getStreamForNewPeer(): MediaStream | undefined {
-  if (get(isScreenSharing)) {
-    const screen = get(screenStream);
-    const camera = get(localStream);
-    if (screen) {
-      const combined = new MediaStream();
-      for (const track of screen.getVideoTracks()) {
-        combined.addTrack(track);
-      }
-      // Use mixed audio (mic + screen) if available, otherwise mic-only
-      if (mixedAudioDest) {
-        for (const track of mixedAudioDest.stream.getAudioTracks()) {
-          combined.addTrack(track);
-        }
-      } else if (camera) {
-        for (const track of camera.getAudioTracks()) {
-          combined.addTrack(track);
-        }
-      }
-      return combined;
-    }
-  }
-  const stream = get(localStream);
-  return stream ?? undefined;
+  syncAllSenders();
+  scheduleRetune();
+  watchScreenSize(false);
 }
 
 /**
@@ -1327,7 +1358,6 @@ function createPeerConnection(
 
   const peer = new Peer({
     initiator,
-    stream: getStreamForNewPeer(),
     trickle: true,
     config: {
       iceServers,
@@ -1336,9 +1366,6 @@ function createPeerConnection(
       rtcpMuxPolicy: 'require',
       ...(relayOnly ? { iceTransportPolicy: 'relay' as const } : {}),
     },
-    // Without this, someone with no camera/mic (or chat-only) would offer no media sections and
-    // never receive anyone else's audio/video.
-    offerOptions: { offerToReceiveAudio: true, offerToReceiveVideo: true },
     // Cap incoming data-channel messages at the transport level, before the browser assembles them.
     sdpTransform: (sdp: string) =>
       /a=max-message-size:/.test(sdp)
@@ -1358,19 +1385,87 @@ function createPeerConnection(
     trusted: false,
     pinned: null,
     intended: new Map(),
-    pendingStream: null,
+    screenStream: null,
+    screenMid: null,
+    earlyState: new Map(),
   };
+
+  // Media layout (media-slots.ts): audio, camera, screen. The offerer creates all three, able to
+  // send and receive, so every connection has them (also for someone with no camera, audio-only or
+  // chat-only) and none is ever added later. The answerer adds its microphone and camera first, so
+  // the offer adopts them, and gets the rest from the offer. Microphone and camera share a stream
+  // id so the other side keeps them in sync.
+  const rtc = rtcOf(pc);
+  const syncStream = new MediaStream();
+  const withStream = new WeakSet<RTCRtpSender>();
+  try {
+    if (initiator) {
+      rtc?.addTransceiver('audio', { direction: 'sendrecv', streams: [syncStream] });
+      rtc?.addTransceiver('video', { direction: 'sendrecv', streams: [syncStream] });
+      rtc?.addTransceiver('video', { direction: 'sendrecv' });
+    } else if (rtc) {
+      for (const track of [outgoingAudioTrack(), outgoingCameraTrack()]) {
+        if (track) withStream.add(rtc.addTrack(track, syncStream));
+      }
+    }
+  } catch (e) {
+    console.warn('Could not set up media for a connection:', e);
+  }
 
   // Hold our camera/mic back until this connection is verified: remember each sender's track and
   // send nothing for now. (trustPeer puts them back.)
-  const rtc = (peer as unknown as { _pc?: RTCPeerConnection })._pc;
   for (const sender of rtc?.getSenders() ?? []) {
     pc.intended.set(sender, sender.track);
     sender.replaceTrack(null).catch(() => {});
   }
+  syncSenders(pc);
 
   // Events from a connection we've since replaced must not touch the new one.
   const isCurrent = () => get(peers).get(remotePeerId)?.peer === peer;
+
+  // Answerer: transceivers created from the offer start out receive-only. Let our slots send too
+  // (still nothing until verified) while the offer is being applied, so the answer already allows
+  // it, and give the microphone and camera our stream id where the browser supports that.
+  const prepareToSend = () => {
+    if (initiator || !rtc) return;
+    const ts = rtc.getTransceivers();
+    enableSending(ts);
+    const slots = localSlots(ts);
+    for (const t of [slots.audio, slots.camera]) {
+      if (!t || withStream.has(t.sender) || typeof t.sender.setStreams !== 'function') continue;
+      withStream.add(t.sender);
+      try {
+        t.sender.setStreams(syncStream);
+      } catch {
+        // Not supported: this pair just isn't lip-synced.
+      }
+    }
+  };
+  let sendFixes = 0;
+  rtc?.addEventListener('track', () => {
+    if (!isCurrent()) return;
+    prepareToSend();
+    refreshRemoteMedia(pc);
+  });
+  rtc?.addEventListener('signalingstatechange', () => {
+    if (!isCurrent()) return;
+    if (rtc.signalingState === 'have-remote-offer') prepareToSend();
+    if (rtc.signalingState !== 'stable') return;
+    // If the answer still went out receive-only somewhere (those events came too late in this
+    // browser), ask the offerer for one more round. A couple of times per connection at most.
+    if (!initiator && sendFixes < 2 && sendingBlocked(rtc.getTransceivers())) {
+      sendFixes++;
+      prepareToSend();
+      try {
+        (peer as unknown as { negotiate(): void }).negotiate();
+      } catch {
+        // destroyed meanwhile
+      }
+    }
+    syncSenders(pc);
+    refreshRemoteMedia(pc);
+    scheduleRetune();
+  });
 
   peer.on('signal', (data) => {
     if (!isCurrent() || !pc.sid) return;
@@ -1392,17 +1487,14 @@ function createPeerConnection(
     const str = typeof data === 'string' ? data : new TextDecoder().decode(data);
     const msg = deserialize(str);
     if (!msg) return;
-    // Until verified, the only thing we accept is the verification proof itself.
-    if (!pc.trusted && msg.type !== 'e2e-auth') return;
+    // Until verified, the only thing we act on is the verification proof itself. Their latest
+    // screen/media state is kept (a validated copy, one of each) and applied once trusted.
+    if (!pc.trusted && msg.type !== 'e2e-auth') {
+      holdEarlyState(pc.earlyState, msg);
+      return;
+    }
     if (!allowType(remotePeerId, msg.type)) return;
     handleDataChannelMessage(remotePeerId, msg);
-  });
-
-  peer.on('stream', (remoteStream: MediaStream) => {
-    if (!isCurrent()) return;
-    // Don't show or play anything from an unverified connection.
-    if (pc.trusted) attachRemoteStream(pc, remoteStream);
-    else pc.pendingStream = remoteStream;
   });
 
   peer.on('close', () => {
@@ -1468,6 +1560,28 @@ function attachRemoteStream(pc: PeerConnection, remoteStream: MediaStream): void
   }
 }
 
+function holdsExactly(stream: MediaStream | null, tracks: MediaStreamTrack[]): boolean {
+  const have = stream?.getTracks() ?? [];
+  return have.length === tracks.length && tracks.every((t) => have.includes(t));
+}
+
+/**
+ * What we show and play for a peer, built from its connection's transceivers (media-slots.ts):
+ * microphone and camera in `stream`, and the shared screen it announced (if any) in
+ * `screenStream`. Nothing at all before the connection is verified.
+ */
+function refreshRemoteMedia(pc: PeerConnection): void {
+  if (!pc.trusted) return;
+  const slots = remoteSlots(transceiversOf(pc), pc.screenMid);
+  const main = [slots.audio, slots.camera].flatMap((t) => (t ? [t.receiver.track] : []));
+  if (main.length > 0 && !holdsExactly(pc.stream, main)) attachRemoteStream(pc, new MediaStream(main));
+  const screen = slots.screen ? [slots.screen.receiver.track] : [];
+  if (screen.length ? !holdsExactly(pc.screenStream, screen) : pc.screenStream !== null) {
+    pc.screenStream = screen.length ? new MediaStream(screen) : null;
+    updatePeers();
+  }
+}
+
 const reconnectAttempts = new Map<string, number[]>();
 
 function reconnectPeer(remotePeerId: string, remoteDisplayName: string): void {
@@ -1496,7 +1610,6 @@ function teardownPeer(remotePeerId: string): void {
   if (pc) {
     // In-flight file transfers can't survive a new connection; mark them cancelled on both sides.
     dropRecipient(remotePeerId);
-    addedScreenTracks.delete(remotePeerId);
     // Detach first so the old peer's async 'close' event is recognised as stale.
     peers.update((map) => {
       const next = new Map(map);
@@ -1509,7 +1622,7 @@ function teardownPeer(remotePeerId: string): void {
 
 function destroyPeerConnection(remotePeerId: string): void {
   teardownPeer(remotePeerId);
-  pendingTrackReplacements.delete(remotePeerId);
+  scheduleRetune(); // one peer fewer to send to
   dropRecipient(remotePeerId);
   peerMediaState.update((m) => {
     if (!m.has(remotePeerId)) return m;
