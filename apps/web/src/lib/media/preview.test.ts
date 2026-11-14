@@ -260,6 +260,38 @@ test('hand-off with the camera off, and cancelling releases everything', async (
   await flush();
 });
 
+test('a hidden page releases the devices, keeps the choices, and reopens only when asked', async () => {
+  const answer = deferred<FakeTrack[]>();
+  const gum = new FakeGetUserMedia();
+  const preview = new MediaPreview({ getUserMedia: gum.fn });
+  preview.setMic(false);
+  await preview.use('video');
+  await preview.useMic('mic-2');
+  const { audio, video } = tracksOf(preview);
+  gum.then(() => answer.promise);
+  const pending = preview.useCamera('cam-2');
+  preview.suspend();
+  assert.equal(audio!.readyState, 'ended');
+  assert.equal(video!.readyState, 'ended');
+  const late = new FakeTrack('video');
+  answer.resolve([late]);
+  await pending;
+  assert.equal(late.readyState, 'ended'); // answered while hidden: stopped at once
+  assert.equal(preview.snapshot.audioTrack, null);
+  assert.equal(preview.snapshot.micOn, false);
+
+  // Coming back: nothing reopens by itself (camera toggles and device picks only record the choice)…
+  const calls = gum.calls.length;
+  await preview.setCamera(true);
+  await preview.useMic('mic-3');
+  assert.equal(gum.calls.length, calls);
+  // …until the user asks, with the same choices.
+  await preview.use('video');
+  assert.deepEqual((gum.calls.at(-1)!.audio as MediaTrackConstraints).deviceId, { exact: 'mic-3' });
+  assert.deepEqual((gum.calls.at(-1)!.video as MediaTrackConstraints).deviceId, { exact: 'cam-2' });
+  assert.equal(tracksOf(preview).audio!.enabled, false);
+});
+
 test('subscribers see every change (Svelte store contract)', async () => {
   const preview = new MediaPreview({ getUserMedia: new FakeGetUserMedia().fn });
   const seen: string[] = [];

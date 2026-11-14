@@ -7,6 +7,7 @@ import { get, writable } from 'svelte/store';
 import { localStream, videoEnabled, selectedVideoDevice, videoDevices } from './manager.js';
 import { facingOf, openFlippedCamera, openTrack, videoConstraints, type Facing } from './camera.js';
 import { insecureContextError } from './media-errors.js';
+import { rememberDevice } from './device-prefs.js';
 
 /** Which way your camera faces (undefined: the browser doesn't say, as for most webcams). */
 export const cameraFacing = writable<Facing | undefined>(undefined);
@@ -47,12 +48,33 @@ export function cameraNeedsReopen(): boolean {
 
 const isEnded = (track: MediaStreamTrack) => track.readyState === 'ended';
 
-let busy: Promise<MediaStreamTrack | null> | null = null;
+/** The camera change in progress, for the call (local stream) it belongs to. */
+let busy: { stream: MediaStream | null; run: Promise<MediaStreamTrack | null> } | null = null;
 
-/** Run one camera change at a time (a double tap must not open two cameras). */
+/**
+ * Run one camera change at a time (a double tap must not open two cameras). Scoped to the call:
+ * a prompt left unanswered in an earlier call never blocks the next one.
+ */
 function exclusive(run: () => Promise<MediaStreamTrack | null>): Promise<MediaStreamTrack | null> {
-  if (!busy) busy = run().finally(() => (busy = null));
-  return busy;
+  const stream = get(localStream);
+  if (busy && busy.stream === stream) return busy.run;
+  const entry: { stream: MediaStream | null; run: Promise<MediaStreamTrack | null> } = {
+    stream,
+    run: run().finally(() => {
+      if (busy === entry) busy = null;
+    }),
+  };
+  busy = entry;
+  return entry.run;
+}
+
+/** A camera picked while it was off: remembered only if it's the one that opens when turned on. */
+let pickedWhileOff: { stream: MediaStream | null; deviceId: string } | null = null;
+
+/** Pick the camera to use when it's turned on again, without opening it now. */
+export function chooseCameraForLater(deviceId: string): void {
+  pickedWhileOff = { stream: get(localStream), deviceId };
+  selectedVideoDevice.set(deviceId);
 }
 
 /** Put `track` in place of the stream's current camera track. */
@@ -92,6 +114,12 @@ export function reopenCamera(): Promise<MediaStreamTrack | null> {
     track.enabled = true;
     useCameraTrack(stream, track, facingOf(track) ?? facing);
     videoEnabled.set(true);
+    // Remember a camera picked while it was off only if that's the one now in use.
+    const picked = pickedWhileOff;
+    pickedWhileOff = null;
+    if (picked && picked.stream === stream && picked.deviceId === track.getSettings().deviceId) {
+      rememberDevice('videoInput', picked.deviceId);
+    }
     return track;
   });
 }

@@ -317,6 +317,11 @@ const FATAL_ERRORS: Record<string, string> = {
   'Removed by host': 'The host removed you from this call.',
 };
 
+/** "Can't reach the call server" clears itself on reconnect; every other room error ends the call. */
+export function isTransientRoomError(message: string): boolean {
+  return message === FATAL_ERRORS['Cannot connect'];
+}
+
 let iceServers: RTCIceServer[] = [];
 let iceRefreshTimer: ReturnType<typeof setTimeout> | null = null;
 

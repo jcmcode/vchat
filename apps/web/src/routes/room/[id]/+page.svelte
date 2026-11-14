@@ -31,6 +31,7 @@
     startSharingScreen,
     stopSharingScreen,
     replaceTrackOnAllPeers,
+    isTransientRoomError,
     type PeerConnection,
   } from '$lib/webrtc/mesh';
   import {
@@ -156,6 +157,9 @@
   let inCall = false;
   $: if (inCall && !$roomError && $admissionState !== 'denied') void wakeLock.enable();
   else wakeLock.disable();
+  // A fatal error (room full, invite expired, too many password attempts…) or being denied ends the
+  // call: release the camera and microphone now, not when "Back to home" is clicked.
+  $: if (($roomError && !isTransientRoomError($roomError)) || $admissionState === 'denied') stopMedia();
 
   // Front/back camera flip on phones and tablets.
   const touchDevice = browser && isTouchDevice();

@@ -222,6 +222,19 @@ export class MediaPreview {
     };
   }
 
+  /**
+   * The page was hidden: release the camera and microphone and drop any request in flight, but
+   * keep the choices (mode, mute, camera off, devices). Nothing is reopened until the user asks
+   * again, so the preview shows "Check camera & mic" when they come back.
+   */
+  suspend(): void {
+    if (this.closed) return;
+    this.started = false;
+    this.release('audio');
+    this.release('video');
+    this.update({ problem: null, cameraProblem: null });
+  }
+
   /** Release everything (cancel, leaving the page). Safe to call more than once. */
   stop(): void {
     this.closed = true;

@@ -216,6 +216,12 @@
     dispatch('cancel');
   }
 
+  // A hidden tab doesn't keep the camera and microphone on: release them (the choices are kept)
+  // and show "Check camera & mic" again on return.
+  function onVisibilityChange() {
+    if (document.visibilityState === 'hidden') preview.suspend();
+  }
+
   function problemTitle(p: MediaProblem): string {
     return describeProblem(p).title;
   }
@@ -223,6 +229,7 @@
 
 <!-- Browsers keep audio (the level meter, the test sound) suspended until the page is used. -->
 <svelte:window on:pointerdown={resumeSharedAudio} on:keydown={resumeSharedAudio} />
+<svelte:document on:visibilitychange={onVisibilityChange} />
 
 <div class="overlay">
   <form class="prejoin card fade-in" role="dialog" aria-modal="true" aria-labelledby="prejoin-title" on:submit|preventDefault={join}>

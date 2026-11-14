@@ -14,7 +14,7 @@
   } from '$lib/media/manager';
   import { replaceTrackOnAllPeers, useNewMicTrack } from '$lib/webrtc/mesh';
   import { rememberDevice } from '$lib/media/device-prefs';
-  import { cameraNeedsReopen, flipCamera, isTouchDevice, syncCameraFacing } from '$lib/media/call-camera';
+  import { cameraNeedsReopen, chooseCameraForLater, flipCamera, isTouchDevice, syncCameraFacing } from '$lib/media/call-camera';
   import Icon from '$lib/ui/Icon.svelte';
   import { onMount } from 'svelte';
 
@@ -42,10 +42,10 @@
   async function handleVideoChange(e: Event) {
     const deviceId = (e.target as HTMLSelectElement).value;
     deviceError = '';
-    // The camera is released (joined with it off): don't open it now, just use this one when it's turned on.
+    // The camera is released (joined with it off): don't open it now, just use this one when it's
+    // turned on (and remember it then, if it's the one that opens).
     if (cameraNeedsReopen()) {
-      selectedVideoDevice.set(deviceId);
-      rememberDevice('videoInput', deviceId);
+      chooseCameraForLater(deviceId);
       return;
     }
     try {
