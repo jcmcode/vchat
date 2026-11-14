@@ -2,7 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { connect4, COLS, type Connect4State } from './connect4.js';
 import { chess, legalMoves, play, positionFromFen, stateFromPosition, type ChessState, type Position } from './chess.js';
-import { BALL_R, TABLE_H, TABLE_W, canPlaceCue, pool, remaining, type PoolState } from './pool.js';
+import { BALL_R, TABLE_H, TABLE_W, canPlaceCue, pool, remaining, startShot, stepSim, type PoolState } from './pool.js';
 import { fromSnapshot, newSession, resultOf, shouldAdopt, stop, toSnapshot, tryMove } from './session-model.js';
 import type { Seat } from './rules.js';
 import { INVITE_TTL_MS, InviteBook } from './invite-model.js';
@@ -232,6 +232,60 @@ test('pool: the 8 wins after your group is cleared and loses before', () => {
   assert.equal(pool.apply(win as PoolState, eightShot, 0), null, 'no shots after the game');
 });
 
+/** Play a shot out and return the finished simulation. */
+function simulate(state: PoolState, shot: object) {
+  const sim = startShot(state, shot);
+  assert.ok(sim);
+  while (stepSim(sim)) {
+    /* run to rest */
+  }
+  return sim;
+}
+
+test('pool physics: a rolling cue ball follows through, a sliding one stops dead', () => {
+  // Both sink the 3 in the top side pocket, straight on.
+  // From far away and soft, the cue ball is rolling by the time it arrives and keeps going.
+  const follow = simulate(table({ 0: [TABLE_W / 2, 470], 3: [TABLE_W / 2, 240], 8: [100, 100] }), { dx: 0, dy: -1, power: 0.25 });
+  assert.equal(follow.firstHit, 3);
+  assert.ok(follow.potted.includes(3));
+  assert.ok(follow.balls[0].in || follow.balls[0].y < 240 - BALL_R * 4, `followed through to ${follow.balls[0].y}`);
+
+  // From close and harder, it's still sliding at contact, so it stops where it hit (a stun shot).
+  const stun = simulate(table({ 0: [TABLE_W / 2, 300], 3: [TABLE_W / 2, 240], 8: [100, 100] }), { dx: 0, dy: -1, power: 0.5 });
+  assert.equal(stun.firstHit, 3);
+  assert.ok(stun.potted.includes(3));
+  assert.ok(Math.abs(stun.balls[0].y - (240 + BALL_R * 2)) < BALL_R * 2, `stopped at ${stun.balls[0].y}`);
+});
+
+test('pool physics: a struck ball slides, then rolls at 5/7 of its speed', () => {
+  const sim = startShot(table({ 0: [100, 250], 8: [900, 450] }), { dx: 1, dy: 0, power: 0.3 });
+  assert.ok(sim);
+  const start = sim.balls[0].vx;
+  for (let i = 0; i < 240 * 3 && sim.balls[0].vx !== sim.balls[0].ux; i++) stepSim(sim);
+  assert.equal(sim.balls[0].vx, sim.balls[0].ux, 'rolling');
+  assert.ok(sim.balls[0].x < TABLE_W / 2, 'within half the table');
+  assert.ok(sim.balls[0].vx < start * (5 / 7) + 1 && sim.balls[0].vx > start * 0.6, `${sim.balls[0].vx} vs ${start}`);
+});
+
+test('pool physics: the fastest shot never passes through a ball', () => {
+  const sim = simulate(table({ 0: [100, 250], 3: [130, 250], 8: [900, 450] }), { dx: 1, dy: 0, power: 1 });
+  assert.equal(sim.firstHit, 3);
+  assert.ok(sim.balls[0].x < sim.balls[3].x || sim.balls[3].in, 'the object ball stays ahead');
+});
+
+test('pool physics: balls drop through the pocket openings and bounce off solid cushion', () => {
+  // Rolled along the top rail into the corner.
+  const corner = simulate(table({ 0: [300, BALL_R], 8: [500, 250] }), { dx: -1, dy: 0, power: 0.4 });
+  assert.deepEqual(corner.potted, [0]);
+  // Straight into the side pocket.
+  const side = simulate(table({ 0: [TABLE_W / 2, 300], 8: [100, 100] }), { dx: 0, dy: -1, power: 0.4 });
+  assert.deepEqual(side.potted, [0]);
+  // Straight at the cushion beside it: comes back.
+  const bounce = simulate(table({ 0: [300, 300], 8: [100, 100] }), { dx: 0, dy: -1, power: 0.4 });
+  assert.deepEqual(bounce.potted, []);
+  assert.ok(bounce.balls[0].y > BALL_R);
+});
+
 test('pool: placing the cue ball and refusing bad shots', () => {
   const start = pool.init();
   assert.equal(canPlaceCue(start, 100, 100), true);
@@ -307,11 +361,11 @@ test('session: resigning, and which game wins when two arrive', () => {
 test('invites: one per person, checked, rate limited, and only the sender can take one back', () => {
   const book = new InviteBook();
   assert.equal(book.receive('bob', { id: 'i1', kind: 'chess' }, 0)?.from, 'bob');
-  for (const bad of [null, {}, { id: 'x', kind: 'poker' }, { id: '', kind: 'chess' }, { id: 'x'.repeat(41), kind: 'pool' }, { id: 7, kind: 'pool' }]) {
+  for (const bad of [null, {}, { id: 'x', kind: 'poker' }, { id: '', kind: 'chess' }, { id: 'x'.repeat(41), kind: 'pool2' }, { id: 7, kind: 'pool2' }]) {
     assert.equal(book.receive('carol', bad, 5_000), null, JSON.stringify(bad));
   }
-  assert.equal(book.receive('bob', { id: 'i2', kind: 'pool' }, 500), null, 'too soon');
-  assert.equal(book.receive('bob', { id: 'i3', kind: 'pool' }, 2_000)?.id, 'i3', 'a newer one replaces the older');
+  assert.equal(book.receive('bob', { id: 'i2', kind: 'pool2' }, 500), null, 'too soon');
+  assert.equal(book.receive('bob', { id: 'i3', kind: 'pool2' }, 2_000)?.id, 'i3', 'a newer one replaces the older');
   assert.deepEqual(book.list().map((i) => i.id), ['i3']);
 
   book.receive('dave', { id: 'd1', kind: 'connect4' }, 3_000);

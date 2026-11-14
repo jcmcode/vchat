@@ -5,6 +5,11 @@
 // runs in fixed steps and uses only + - * / and Math.sqrt (which give identical results in every
 // browser); no sin/cos/atan2, no clocks, no randomness.
 //
+// Physics: balls slide when struck and then roll (each ball tracks its spin, so a rolling cue ball
+// follows through after contact and a sliding one stops dead), rolling balls slow down faster at
+// speed, cushions rebound less the harder they're hit, and pockets are openings in the cushions
+// with jaws a ball can rattle off.
+//
 // The rules, kept simple:
 //  - Ball 0 is the cue ball, 1-7 solids, 8 the eight, 9-15 stripes.
 //  - The break is taken from behind the head string. The table is "open" until someone pockets a
@@ -24,16 +29,42 @@ export const HEAD_STRING = 250;
 const FOOT_SPOT = 750;
 const MID_Y = 250;
 
-/** Simulation steps per second of table time. */
+/** Simulation steps per second of table time (what the table animation advances by). */
 export const STEPS_PER_SECOND = 240;
 const DT = 1 / STEPS_PER_SECOND;
-const MAX_SPEED = 2500;
-/** Rolling resistance: how fast a ball slows down. */
-const DECEL = 270;
-const CUSHION_BOUNCE = 0.74;
+/** Each step is split into this many substeps, so even the fastest ball moves a small fraction of its radius at a time. */
+const SUBSTEPS = 4;
+const H = DT / SUBSTEPS;
+/** Cue ball speed at full power (table units per second; the table is 1000 units long). */
+const MAX_SPEED = 3200;
+/**
+ * Cloth friction while a ball slides (its spin doesn't match its speed): it slows the ball and
+ * brings its spin round until it rolls. A solid ball reaches rolling at 5/7 of its sliding speed.
+ */
+const SLIDE_DECEL = 1200;
+/** Rolling resistance: a constant part, plus a part that grows with speed (fast balls die off quicker). */
+const ROLL_DECEL = 55;
+const ROLL_DRAG = 0.32;
+/** Cushion rebound: livelier for gentle hits, deader for hard ones. */
+const CUSHION_E_SOFT = 0.86;
+const CUSHION_E_LOSS = 0.00005;
+const CUSHION_E_MIN = 0.62;
+/** Speed kept along the cushion during a rebound. */
+const CUSHION_GRIP = 0.96;
 const BALL_BOUNCE = 0.95;
+/** Below this a rolling ball has stopped. */
+const REST_SPEED = 1;
 const MAX_STEPS = STEPS_PER_SECOND * 30;
 export const MIN_POWER = 0.02;
+
+// Pocket openings: the cushions stop short of each pocket, with a jaw point at each end of the gap.
+/** How far the corner pocket opening runs along each rail from the corner. */
+const CORNER_GAP = 30;
+/** Half the side pocket opening. */
+const SIDE_GAP = 25;
+/** Jaw points sit just behind the cushion line, so a ball frozen to the rail rolls past them. */
+const JAW_SET_BACK = 3;
+const JAW_R = 2;
 
 export interface Pocket {
   x: number;
@@ -176,6 +207,12 @@ function parseShot(raw: unknown): PoolShot | null {
 interface MovingBall extends Ball {
   vx: number;
   vy: number;
+  /**
+   * The ball's spin, as the speed it would roll at if it were rolling without slipping. Equal to
+   * (vx, vy) while it rolls; different while it slides (just struck, or just after a collision).
+   */
+  ux: number;
+  uy: number;
 }
 
 export interface Sim {
@@ -192,7 +229,7 @@ export function startShot(state: PoolState, raw: unknown): Sim | null {
   if (state.over) return null;
   const shot = parseShot(raw);
   if (!shot) return null;
-  const balls: MovingBall[] = state.balls.map((b) => ({ x: b.x, y: b.y, in: b.in, vx: 0, vy: 0 }));
+  const balls: MovingBall[] = state.balls.map((b) => ({ x: b.x, y: b.y, in: b.in, vx: 0, vy: 0, ux: 0, uy: 0 }));
   const cue = balls[0];
   if (state.ballInHand && shot.cue) {
     if (!canPlaceCue(state, shot.cue.x, shot.cue.y)) return null;
@@ -202,52 +239,152 @@ export function startShot(state: PoolState, raw: unknown): Sim | null {
   if (cue.in) return null;
   const length = Math.sqrt(shot.dx * shot.dx + shot.dy * shot.dy);
   const speed = MAX_SPEED * shot.power;
+  // A centre-ball hit: the cue ball sets off sliding, with no spin yet.
   cue.vx = (shot.dx / length) * speed;
   cue.vy = (shot.dy / length) * speed;
   return { balls, firstHit: -1, potted: [], steps: 0 };
 }
 
-/** Advance one step. Returns whether anything is still moving. */
-export function stepSim(sim: Sim): boolean {
+/** Is the cushion solid at this point along a long rail (top/bottom), or is it a pocket opening? */
+function longRailSolid(x: number): boolean {
+  const fromSide = x - TABLE_W / 2;
+  return x >= CORNER_GAP && x <= TABLE_W - CORNER_GAP && (fromSide >= SIDE_GAP || fromSide <= -SIDE_GAP);
+}
+
+/** Is the cushion solid at this point along a short rail (left/right)? */
+function shortRailSolid(y: number): boolean {
+  return y >= CORNER_GAP && y <= TABLE_H - CORNER_GAP;
+}
+
+const JAWS: { x: number; y: number }[] = [
+  // Corners: one jaw on each rail.
+  { x: CORNER_GAP, y: -JAW_SET_BACK },
+  { x: -JAW_SET_BACK, y: CORNER_GAP },
+  { x: TABLE_W - CORNER_GAP, y: -JAW_SET_BACK },
+  { x: TABLE_W + JAW_SET_BACK, y: CORNER_GAP },
+  { x: CORNER_GAP, y: TABLE_H + JAW_SET_BACK },
+  { x: -JAW_SET_BACK, y: TABLE_H - CORNER_GAP },
+  { x: TABLE_W - CORNER_GAP, y: TABLE_H + JAW_SET_BACK },
+  { x: TABLE_W + JAW_SET_BACK, y: TABLE_H - CORNER_GAP },
+  // Sides.
+  { x: TABLE_W / 2 - SIDE_GAP, y: -JAW_SET_BACK },
+  { x: TABLE_W / 2 + SIDE_GAP, y: -JAW_SET_BACK },
+  { x: TABLE_W / 2 - SIDE_GAP, y: TABLE_H + JAW_SET_BACK },
+  { x: TABLE_W / 2 + SIDE_GAP, y: TABLE_H + JAW_SET_BACK },
+];
+
+function cushionBounce(normalSpeed: number): number {
+  const e = CUSHION_E_SOFT - CUSHION_E_LOSS * normalSpeed;
+  return e < CUSHION_E_MIN ? CUSHION_E_MIN : e;
+}
+
+/**
+ * Bounce off a cushion whose inward normal is (nx, ny), with `into` = the speed into it (> 0).
+ * The cushion reverses the ball, takes a little off its speed along it, and kills its roll into the
+ * cushion (it comes off sliding, and picks up roll again on the cloth).
+ */
+function rebound(b: MovingBall, nx: number, ny: number, into: number): void {
+  const e = cushionBounce(into);
+  const along = b.vx * -ny + b.vy * nx;
+  const out = into * e;
+  b.vx = nx * out + -ny * along * CUSHION_GRIP;
+  b.vy = ny * out + nx * along * CUSHION_GRIP;
+  const spinIn = b.ux * nx + b.uy * ny;
+  b.ux -= spinIn * nx;
+  b.uy -= spinIn * ny;
+}
+
+/** Cloth friction for one substep: slide towards rolling, or roll and slow down. */
+function friction(b: MovingBall): void {
+  const sx = b.vx - b.ux;
+  const sy = b.vy - b.uy;
+  const slip = Math.sqrt(sx * sx + sy * sy);
+  if (slip > 1e-9) {
+    const grip = SLIDE_DECEL * H;
+    if (slip <= grip * 3.5) {
+      // Reaches rolling within this substep: speed and spin meet at the rolling speed.
+      b.vx = (5 * b.vx + 2 * b.ux) / 7;
+      b.vy = (5 * b.vy + 2 * b.uy) / 7;
+      b.ux = b.vx;
+      b.uy = b.vy;
+    } else {
+      const k = grip / slip;
+      b.vx -= sx * k;
+      b.vy -= sy * k;
+      b.ux += 2.5 * sx * k;
+      b.uy += 2.5 * sy * k;
+    }
+    return;
+  }
+  const speed = Math.sqrt(b.vx * b.vx + b.vy * b.vy);
+  const slower = speed - (ROLL_DECEL + ROLL_DRAG * speed) * H;
+  if (slower <= REST_SPEED) {
+    b.vx = 0;
+    b.vy = 0;
+    b.ux = 0;
+    b.uy = 0;
+  } else {
+    const k = slower / speed;
+    b.vx *= k;
+    b.vy *= k;
+    b.ux = b.vx;
+    b.uy = b.vy;
+  }
+}
+
+/** Cushions and pocket jaws. */
+function cushions(b: MovingBall): void {
+  if (b.x < BALL_R && b.vx < 0 && shortRailSolid(b.y)) {
+    b.x = BALL_R * 2 - b.x;
+    rebound(b, 1, 0, -b.vx);
+  } else if (b.x > TABLE_W - BALL_R && b.vx > 0 && shortRailSolid(b.y)) {
+    b.x = (TABLE_W - BALL_R) * 2 - b.x;
+    rebound(b, -1, 0, b.vx);
+  }
+  if (b.y < BALL_R && b.vy < 0 && longRailSolid(b.x)) {
+    b.y = BALL_R * 2 - b.y;
+    rebound(b, 0, 1, -b.vy);
+  } else if (b.y > TABLE_H - BALL_R && b.vy > 0 && longRailSolid(b.x)) {
+    b.y = (TABLE_H - BALL_R) * 2 - b.y;
+    rebound(b, 0, -1, b.vy);
+  }
+  const reach = BALL_R + JAW_R;
+  for (const j of JAWS) {
+    const dx = b.x - j.x;
+    const dy = b.y - j.y;
+    const d2 = dx * dx + dy * dy;
+    if (d2 >= reach * reach || d2 === 0) continue;
+    const d = Math.sqrt(d2);
+    const nx = dx / d;
+    const ny = dy / d;
+    b.x = j.x + nx * reach;
+    b.y = j.y + ny * reach;
+    const into = -(b.vx * nx + b.vy * ny);
+    if (into > 0) rebound(b, nx, ny, into);
+  }
+}
+
+/** In a pocket: within a pocket's drop zone, or through an opening past the cushion line. */
+function dropped(b: Ball): boolean {
+  return b.x < 0 || b.x > TABLE_W || b.y < 0 || b.y > TABLE_H || inPocket(b.x, b.y);
+}
+
+function substep(sim: Sim): void {
   const { balls } = sim;
   const n = balls.length;
-  let moving = false;
   for (let i = 0; i < n; i++) {
     const b = balls[i];
-    if (b.in || (b.vx === 0 && b.vy === 0)) continue;
-    b.x += b.vx * DT;
-    b.y += b.vy * DT;
-    const speed = Math.sqrt(b.vx * b.vx + b.vy * b.vy);
-    const slower = speed - DECEL * DT;
-    if (slower <= 0) {
-      b.vx = 0;
-      b.vy = 0;
-    } else {
-      const k = slower / speed;
-      b.vx *= k;
-      b.vy *= k;
-    }
-    if (inPocket(b.x, b.y)) {
+    if (b.in || (b.vx === 0 && b.vy === 0 && b.ux === 0 && b.uy === 0)) continue;
+    b.x += b.vx * H;
+    b.y += b.vy * H;
+    friction(b);
+    if (dropped(b)) {
       b.in = true;
-      b.vx = 0;
-      b.vy = 0;
+      b.vx = b.vy = b.ux = b.uy = 0;
       sim.potted.push(i);
       continue;
     }
-    if (b.x < BALL_R) {
-      b.x = BALL_R * 2 - b.x;
-      b.vx = -b.vx * CUSHION_BOUNCE;
-    } else if (b.x > TABLE_W - BALL_R) {
-      b.x = (TABLE_W - BALL_R) * 2 - b.x;
-      b.vx = -b.vx * CUSHION_BOUNCE;
-    }
-    if (b.y < BALL_R) {
-      b.y = BALL_R * 2 - b.y;
-      b.vy = -b.vy * CUSHION_BOUNCE;
-    } else if (b.y > TABLE_H - BALL_R) {
-      b.y = (TABLE_H - BALL_R) * 2 - b.y;
-      b.vy = -b.vy * CUSHION_BOUNCE;
-    }
+    cushions(b);
   }
   const touching = BALL_R * 2;
   for (let i = 0; i < n; i++) {
@@ -270,6 +407,9 @@ export function stepSim(sim: Sim): boolean {
       b.y += ny * push;
       const closing = (a.vx - b.vx) * nx + (a.vy - b.vy) * ny;
       if (closing <= 0) continue;
+      // Equal masses: the speed along the line of centres is (almost all) handed over. Spin isn't,
+      // so afterwards each ball slides until the cloth turns its spin into roll: a rolling cue ball
+      // follows through, a sliding one stops (a stun shot), and an object ball sets off sliding.
       const impulse = ((1 + BALL_BOUNCE) / 2) * closing;
       a.vx -= impulse * nx;
       a.vy -= impulse * ny;
@@ -278,13 +418,19 @@ export function stepSim(sim: Sim): boolean {
       if (i === 0 && sim.firstHit < 0) sim.firstHit = j;
     }
   }
-  for (let i = 0; i < n; i++) {
-    if (!balls[i].in && (balls[i].vx !== 0 || balls[i].vy !== 0)) {
+}
+
+/** Advance one step. Returns whether anything is still moving. */
+export function stepSim(sim: Sim): boolean {
+  for (let k = 0; k < SUBSTEPS; k++) substep(sim);
+  sim.steps++;
+  let moving = false;
+  for (const b of sim.balls) {
+    if (!b.in && (b.vx !== 0 || b.vy !== 0 || b.ux !== 0 || b.uy !== 0)) {
       moving = true;
       break;
     }
   }
-  sim.steps++;
   return moving && sim.steps < MAX_STEPS;
 }
 

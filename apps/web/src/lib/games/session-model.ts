@@ -10,12 +10,17 @@ import { connect4 } from './connect4.js';
 import { pool } from './pool.js';
 import { isRecord, type GameOver, type GameRules, type Seat } from './rules.js';
 
-export type GameKind = 'connect4' | 'chess' | 'pool';
+/**
+ * 'pool2' is pool with the newer physics. Every player simulates each shot themselves, so both must
+ * run the same physics: a tab still on the old version (which calls it 'pool') can't start or join
+ * one of these games, rather than quietly ending up with a different table.
+ */
+export type GameKind = 'connect4' | 'chess' | 'pool2';
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
-export const RULES: Record<GameKind, GameRules<any>> = { connect4, chess, pool };
+export const RULES: Record<GameKind, GameRules<any>> = { connect4, chess, pool2: pool };
 
-export const GAME_NAMES: Record<GameKind, string> = { connect4: 'Connect 4', chess: 'Chess', pool: 'Pool' };
+export const GAME_NAMES: Record<GameKind, string> = { connect4: 'Connect 4', chess: 'Chess', pool2: 'Pool' };
 
 const MAX_ID = 40;
 const MAX_PEER_ID = 64;

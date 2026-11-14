@@ -27,6 +27,8 @@
   export let rolling = false;
   /** The table as it is shown (lags the real game while a shot plays out). */
   export let view: PoolState | null = null;
+  /** Plays your shot (the call's game by default). */
+  export let play: (shot: unknown) => boolean = playMove;
 
   let table: PoolState = session.state as PoolState;
   $: view = table;
@@ -34,7 +36,10 @@
   const RAIL = 38;
   const FULL_W = TABLE_W + RAIL * 2;
   const FULL_H = TABLE_H + RAIL * 2;
-  const COLORS = ['#f4f1e6', '#f2c230', '#2f63d8', '#d8372f', '#7a3fb5', '#ee7d25', '#1f9a58', '#8e2a2a', '#16181d'];
+  // Standard ball colours: 1 yellow, 2 blue, 3 red, 4 purple, 5 orange, 6 green, 7 maroon, 8 black
+  // (the stripes 9-15 repeat 1-7 as a band).
+  const COLORS = ['#f6f3ea', '#f7c614', '#1f4fd6', '#de2a22', '#7b2fbe', '#f57418', '#13894a', '#8a1c1c', '#111317'];
+  const CLOTH = '#1f7d50';
 
   let canvas: HTMLCanvasElement;
   let wrap: HTMLDivElement;
@@ -55,13 +60,29 @@
   let aim: { dx: number; dy: number } | null = null;
   let power = 60;
   let cuePlace: { x: number; y: number } | null = null;
-  let dragging: 'aim' | 'cue' | null = null;
+  let dragging: 'aim' | 'cue' | 'pull' | null = null;
+
+  // Pulling the cue back: grab the stick, draw it back (further = harder), let go to strike.
+  /** How far back (table units) the stick goes at full power. */
+  const PULL_MAX = 170;
+  const STICK_LEN = 330;
+  /** How close to the stick (table units, either side) counts as grabbing it. */
+  const STICK_GRAB = 34;
+  /** The stroke forward to the ball before the shot is played. */
+  const STROKE_MS = 110;
+  let pullStart = 0;
+  let pullStartPower = 0;
+  let pullMoved = false;
+  let overStick = false;
+  /** The cue on its way forward (power at the start of the stroke, when it started). */
+  let stroke: { power: number; at: number } | null = null;
+  let strokeRaf = 0;
 
   $: ready = canMove && !rolling;
   $: follow(session);
-  $: if (!ready && (aim || cuePlace)) dropAim();
+  $: if (!ready && (aim || cuePlace || stroke)) dropAim();
   $: remoteAim = !canMove && !rolling ? $gameAim : null;
-  $: table, aim, power, cuePlace, remoteAim, redraw();
+  $: table, aim, power, cuePlace, remoteAim, overStick, dragging, redraw();
 
   /** Keep up with the game: play the newest shot, or jump straight to the table if we fell behind. */
   function follow(s: Session) {
@@ -155,6 +176,53 @@
     aim = null;
     cuePlace = null;
     dragging = null;
+    overStick = false;
+    stroke = null;
+    if (strokeRaf) cancelAnimationFrame(strokeRaf);
+    strokeRaf = 0;
+  }
+
+  /** Where the stick's tip sits behind the cue ball at a given power (0-100). */
+  function stickBack(p: number): number {
+    return BALL_R + 6 + (p / 100) * PULL_MAX;
+  }
+
+  /** How far behind the cue ball `p` is along the aim line, and how far to the side of it. */
+  function alongAim(p: { x: number; y: number }): { behind: number; side: number } | null {
+    if (!aim) return null;
+    const length = Math.hypot(aim.dx, aim.dy);
+    if (!length) return null;
+    const ux = aim.dx / length;
+    const uy = aim.dy / length;
+    const cue = cuePosition();
+    const rx = cue.x - p.x;
+    const ry = cue.y - p.y;
+    return { behind: rx * ux + ry * uy, side: Math.abs(rx * uy - ry * ux) };
+  }
+
+  function onStick(p: { x: number; y: number }): boolean {
+    const at = alongAim(p);
+    if (!at) return false;
+    return at.side < STICK_GRAB && at.behind > BALL_R && at.behind < stickBack(power) + STICK_LEN + STICK_GRAB;
+  }
+
+  /** Let go of a pulled-back cue: it strokes forward to the ball, then the shot is played. */
+  function strike() {
+    if (!ready || !aim || stroke) return;
+    stroke = { power, at: performance.now() };
+    const tick = (now: number) => {
+      strokeRaf = 0;
+      if (!stroke) return;
+      if (now - stroke.at >= STROKE_MS) {
+        power = stroke.power;
+        stroke = null;
+        shoot();
+        return;
+      }
+      draw();
+      strokeRaf = requestAnimationFrame(tick);
+    };
+    strokeRaf = requestAnimationFrame(tick);
   }
 
   function aimAt(p: { x: number; y: number }) {
@@ -167,19 +235,37 @@
   }
 
   function pointerDown(e: PointerEvent) {
-    if (!ready) return;
+    if (!ready || stroke) return;
     const p = toTable(e);
     const cue = cuePosition();
     const onCue = Math.hypot(p.x - cue.x, p.y - cue.y) < BALL_R * 2.4;
-    dragging = table.ballInHand && onCue ? 'cue' : 'aim';
+    dragging = table.ballInHand && onCue ? 'cue' : onStick(p) ? 'pull' : 'aim';
     canvas.setPointerCapture(e.pointerId);
     if (dragging === 'aim') aimAt(p);
+    if (dragging === 'pull') {
+      pullStart = alongAim(p)?.behind ?? 0;
+      pullStartPower = power;
+      pullMoved = false;
+    }
     e.preventDefault();
   }
 
   function pointerMove(e: PointerEvent) {
-    if (!ready || !dragging) return;
+    if (!ready || stroke) return;
     const p = toTable(e);
+    if (!dragging) {
+      overStick = onStick(p);
+      return;
+    }
+    if (dragging === 'pull') {
+      // The stick follows the pointer: draw it back for more power, push it in for less.
+      const delta = (alongAim(p)?.behind ?? pullStart) - pullStart;
+      if (Math.abs(delta) > 4) pullMoved = true;
+      const pulled = Math.min(PULL_MAX, Math.max(0, (pullStartPower / 100) * PULL_MAX + delta));
+      power = Math.round((pulled / PULL_MAX) * 100);
+      announce();
+      return;
+    }
     if (dragging === 'cue') {
       const x = Math.min(table.breakShot ? HEAD_STRING : TABLE_W - BALL_R, Math.max(BALL_R, p.x));
       const y = Math.min(TABLE_H - BALL_R, Math.max(BALL_R, p.y));
@@ -193,6 +279,16 @@
   }
 
   function pointerUp() {
+    if (dragging === 'pull') {
+      dragging = null;
+      // A tap on the stick does nothing; a pull let go strikes; pushed all the way in cancels.
+      if (pullMoved && power >= MIN_POWER * 100) strike();
+      else if (pullMoved) {
+        power = pullStartPower;
+        announce();
+      }
+      return;
+    }
     dragging = null;
   }
 
@@ -209,17 +305,22 @@
   function shoot() {
     if (!ready || !aim) return;
     const shot = { dx: aim.dx, dy: aim.dy, power: Math.max(MIN_POWER, power / 100), ...(table.ballInHand && cuePlace ? { cue: cuePlace } : {}) };
-    if (playMove(shot)) {
+    if (play(shot)) {
       shareAim(null);
       dropAim();
     }
   }
 
   function keydown(e: KeyboardEvent) {
-    if (!ready) return;
+    if (!ready || stroke) return;
     if (e.key === 'ArrowLeft') nudge(e.shiftKey ? -2 : -0.25);
     else if (e.key === 'ArrowRight') nudge(e.shiftKey ? 2 : 0.25);
-    else if (e.key === 'Enter') shoot();
+    else if (e.key === 'ArrowUp' || e.key === 'ArrowDown') {
+      power = Math.min(100, Math.max(2, power + (e.key === 'ArrowUp' ? 5 : -5)));
+      announce();
+    } else if (e.key === 'Enter') {
+      if (aim) strike();
+    }
     else return;
     e.preventDefault();
   }
@@ -245,42 +346,52 @@
     c.save();
     c.globalAlpha = alpha;
     c.translate(b.x, b.y);
+    // Shadow on the cloth.
     c.beginPath();
-    c.arc(1.5, 2, BALL_R, 0, Math.PI * 2);
-    c.fillStyle = 'rgba(0, 0, 0, 0.28)';
+    c.arc(1.5, 2.2, BALL_R, 0, Math.PI * 2);
+    c.fillStyle = 'rgba(0, 0, 0, 0.3)';
     c.fill();
     c.beginPath();
     c.arc(0, 0, BALL_R, 0, Math.PI * 2);
     const striped = groupOf(n) === 'stripe';
     const color = COLORS[n > 8 ? n - 8 : n];
-    c.fillStyle = striped ? '#f4f1e6' : color;
+    c.fillStyle = striped ? COLORS[0] : color;
     c.fill();
+    c.save();
+    c.clip();
     if (striped) {
-      c.save();
-      c.clip();
+      // A wide band round the middle, white caps top and bottom: the way stripes look on a real ball.
       c.fillStyle = color;
-      c.fillRect(-BALL_R, -BALL_R * 0.55, BALL_R * 2, BALL_R * 1.1);
-      c.restore();
+      c.fillRect(-BALL_R, -BALL_R * 0.62, BALL_R * 2, BALL_R * 1.24);
     }
+    // Light from the top left.
+    const shade = c.createRadialGradient(-BALL_R * 0.4, -BALL_R * 0.45, BALL_R * 0.1, 0, 0, BALL_R * 1.05);
+    shade.addColorStop(0, 'rgba(255, 255, 255, 0.35)');
+    shade.addColorStop(0.45, 'rgba(255, 255, 255, 0)');
+    shade.addColorStop(1, 'rgba(0, 0, 0, 0.3)');
+    c.fillStyle = shade;
+    c.fillRect(-BALL_R, -BALL_R, BALL_R * 2, BALL_R * 2);
+    c.restore();
     if (n > 0) {
+      // A small number spot, so the ball's colour (or stripe) is what you see.
       c.beginPath();
-      c.arc(0, 0, BALL_R * 0.5, 0, Math.PI * 2);
+      c.arc(0, 0, BALL_R * 0.42, 0, Math.PI * 2);
       c.fillStyle = '#f7f5ee';
       c.fill();
       c.fillStyle = '#16181d';
-      c.font = `700 ${BALL_R * 0.78}px system-ui, sans-serif`;
+      c.font = `700 ${BALL_R * (n > 9 ? 0.5 : 0.58)}px system-ui, sans-serif`;
       c.textAlign = 'center';
       c.textBaseline = 'middle';
-      c.fillText(String(n), 0, 0.6);
+      c.fillText(String(n), 0, 0.5);
     }
     c.beginPath();
-    c.arc(-BALL_R * 0.35, -BALL_R * 0.4, BALL_R * 0.22, 0, Math.PI * 2);
-    c.fillStyle = 'rgba(255, 255, 255, 0.5)';
+    c.arc(-BALL_R * 0.38, -BALL_R * 0.42, BALL_R * 0.18, 0, Math.PI * 2);
+    c.fillStyle = 'rgba(255, 255, 255, 0.6)';
     c.fill();
     c.restore();
   }
 
-  function drawAim(c: CanvasRenderingContext2D, balls: Ball[], shot: Aim, mine: boolean) {
+  function drawAim(c: CanvasRenderingContext2D, balls: Ball[], shot: Aim, mine: boolean, back: number, held: boolean) {
     const cue = shot.cue ?? balls[0];
     const length = Math.hypot(shot.dx, shot.dy);
     if (!length) return;
@@ -312,10 +423,9 @@
         c.stroke();
       }
     }
-    // The cue, drawn back further the harder the shot.
-    const back = BALL_R + 8 + shot.power * 70;
-    c.strokeStyle = '#d9b77a';
-    c.lineWidth = 5;
+    // The cue, drawn back further the harder the shot (and following the pointer while you pull it).
+    c.strokeStyle = held ? '#ecd09a' : '#d9b77a';
+    c.lineWidth = held ? 6 : 5;
     c.beginPath();
     c.moveTo(cue.x - ux * back, cue.y - uy * back);
     c.lineTo(cue.x - ux * (back + 330), cue.y - uy * (back + 330));
@@ -342,7 +452,7 @@
     c.translate(RAIL, RAIL);
     c.fillStyle = '#17633f';
     c.fillRect(-12, -12, TABLE_W + 24, TABLE_H + 24);
-    c.fillStyle = '#1f7d50';
+    c.fillStyle = CLOTH;
     c.fillRect(0, 0, TABLE_W, TABLE_H);
 
     for (const p of POCKETS) {
@@ -364,7 +474,15 @@
     const balls: Ball[] = sim ? sim.balls : table.balls.map((b, i) => (i === 0 && cuePlace ? { ...cuePlace, in: false } : b));
     const shot: Aim | null = sim ? null : ready && aim ? { ...aim, power: power / 100 } : remoteAim;
     const shown = shot?.cue && !ready ? balls.map((b, i) => (i === 0 ? { ...shot.cue!, in: false } : b)) : balls;
-    if (shot) drawAim(c, shown, shot, ready);
+    if (shot) {
+      // During the stroke the tip eases forward from where it was pulled to the ball.
+      let back = stickBack(shot.power * 100);
+      if (stroke && ready) {
+        const t = Math.min(1, (performance.now() - stroke.at) / STROKE_MS);
+        back = BALL_R + (stickBack(stroke.power) - BALL_R) * (1 - t * t);
+      }
+      drawAim(c, shown, shot, ready, back, ready && (dragging === 'pull' || overStick || !!stroke));
+    }
     shown.forEach((b, i) => {
       if (!b.in) drawBall(c, i, b);
     });
@@ -390,6 +508,7 @@
 
   onDestroy(() => {
     if (raf) cancelAnimationFrame(raf);
+    if (strokeRaf) cancelAnimationFrame(strokeRaf);
     observer?.disconnect();
     if (canMove) shareAim(null);
   });
@@ -401,8 +520,10 @@
     <canvas
       bind:this={canvas}
       class:ready
+      class:grab={ready && overStick && !dragging}
+      class:grabbing={ready && dragging === 'pull'}
       tabindex={ready ? 0 : -1}
-      aria-label="Pool table. {ready ? 'Press or drag on the table to aim; left and right arrows fine-tune, Enter shoots.' : ''}"
+      aria-label="Pool table. {ready ? 'Press or drag on the table to aim, then pull the cue back and let go to shoot. Left and right arrows fine-tune the aim, up and down set the power, Enter shoots.' : ''}"
       on:pointerdown={pointerDown}
       on:pointermove={pointerMove}
       on:pointerup={pointerUp}
@@ -422,9 +543,11 @@
         <input type="range" min="2" max="100" bind:value={power} on:input={announce} />
         <span class="power-value">{power}%</span>
       </label>
-      <button class="shoot" on:click={shoot} disabled={!aim}>Shoot</button>
+      <button class="shoot" on:click={strike} disabled={!aim || !!stroke}>Shoot</button>
       <span class="hint">
-        {#if table.ballInHand}Drag the cue ball to place it{table.breakShot ? ' behind the line' : ''}. {/if}{aim ? '' : 'Press or drag on the table to aim.'}
+        {#if table.ballInHand}Drag the cue ball to place it{table.breakShot ? ' behind the line' : ''}. {/if}{aim
+          ? 'Pull the cue back and let go to shoot.'
+          : 'Press or drag on the table to aim.'}
       </span>
     {:else}
       <span class="hint">{rolling ? 'Balls are rolling…' : ''}</span>
@@ -463,6 +586,14 @@
 
   canvas.ready {
     cursor: crosshair;
+  }
+
+  canvas.grab {
+    cursor: grab;
+  }
+
+  canvas.grabbing {
+    cursor: grabbing;
   }
 
   canvas:focus-visible {
