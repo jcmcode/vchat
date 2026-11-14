@@ -135,6 +135,7 @@ Everything below travels over the WebRTC **data channels** between browsers. It'
 | Screen annotations | `lib/collab/annotations.ts`, `AnnotationLayer.svelte` | `annot` with `pointer` / `pointer-off` / `stroke` / `remove` / `clear`, scoped by `screen` (the presenter's peer id) |
 | Whiteboard | `lib/collab/whiteboard.ts`, `Whiteboard.svelte`, `whiteboard/TextEditor.svelte` | `wb` with `stroke` / `update` / `remove` / `clear` / `opened` / `sync-req` / `sync` |
 | Room name | `lib/collab/room-meta.ts` | `room-name`, accepted only from the current host |
+| Raised hands | `lib/collab/hands.ts`, `hand-model.ts` | `hand { raised }`, sent on change and to newcomers |
 
 **Drawing model** (`lib/collab/strokes.ts`, pure and unit-tested). A stroke is a flat list of integer points. The model supports two coordinate spaces, and every message is validated by `sanitizeStroke(raw, author, space)` for the space it belongs to:
 
@@ -156,6 +157,27 @@ Anyone in the call may edit any text box (strokes stay author-only). A box is cr
 - **PNG** saves that image.
 - **PDF** is a single page with the image (a small built-in PDF writer).
 - **DOCX** (`docx.ts` + `zip.ts`, no libraries) contains a title ("Whiteboard — date"), the board image inline, then every text box as editable paragraphs in reading order (top-to-bottom, then left-to-right). Bold, italic and underline runs, colors, bullets and numbered lists (`word/numbering.xml`, each list restarting at its own first number) are kept. The ZIP is written uncompressed with real CRC-32s.
+
+**Raised hands** (`lib/collab/hand-model.ts`, pure and unit-tested). Each person raises or lowers only their own hand: the message names nobody, and whose hand it is comes from the connection it arrived on. A message must be exactly `{ type: 'hand', raised: <boolean> }` (with any other field it's ignored), is only accepted from a verified connection, and is rate-limited per participant (5/s, burst 10, malformed messages included). The sender coalesces rapid toggles into at most one update per 300ms, always the latest state. Every new or rebuilt connection is sent the current state, and a hand comes down when its owner leaves. The brief notice ("Alex raised their hand") uses the name the app shows for that person, never text from the message. It's skipped for the state a new connection catches up on, and shown at most once per person per 5 seconds.
+
+## Participant controls
+
+These change only your own view and controls. Nothing about them is sent to anyone.
+
+**Volume and pin** (`lib/ui/participants.ts`, pure and unit-tested; `lib/ui/participant-prefs.ts`). Tap a person to set how loud they play for you (0–100%), mute them for yourself, or pin them. Volume sets `volume`/`muted` on the element that plays their audio, and is kept in memory until you leave the call (also when their connection drops and comes back). `selectStage()` decides what's on the stage, in this order: the whiteboard (if you opened it), your own screen share, a remote screen share (the pinned person's, if several people share), then the person you pinned. Everyone else moves to the strip. A pin is dropped when that person leaves.
+
+**Keyboard shortcuts** (`lib/ui/shortcuts.ts`, pure and unit-tested; `KeyboardShortcuts.svelte`). Press `?` in a call, or open Settings → Keyboard shortcuts, to see them.
+
+| Keys | Action |
+|---|---|
+| Ctrl+D (Mac: Cmd+D) | Microphone on/off |
+| Ctrl+E (Mac: Cmd+E) | Camera on/off |
+| Space, held | Talk while muted |
+| Ctrl+Alt+H (Mac: Ctrl+Cmd+H) | Raise or lower your hand |
+| Ctrl+Alt+C (Mac: Ctrl+Cmd+C) | Open or close the chat |
+| `?` | Show the list |
+
+Toggles use modifier combinations, so they can't collide with typing or with the whiteboard's single-key tools, which ignore keys pressed with Ctrl, Cmd or Alt. A letter is read from the keyboard layout, falling back to the physical key on non-Latin layouts (and for Option on a Mac). No shortcut fires while focus is in an input of any type, a textarea, select, contenteditable element or ARIA text widget, during IME composition, or outside the call itself (pre-join, password and waiting screens). The mic and camera shortcuts do nothing for chat-only participants. Hold-to-talk only unmutes if you're muted, never takes Space from a focused button, link, tile or form control, and is off while the whiteboard is open (Space pans it). It mutes again when Space is released, when any other key is pressed, when the window loses focus or the tab is hidden, when focus moves into a text field, on a context menu or page hide, when the whiteboard opens, and when you leave.
 
 ## Signaling protocol
 
@@ -232,7 +254,7 @@ A socket is bound to the room it was authorized for at the upgrade (`/ws?room=`)
 - **Input validation.** All signaling messages are validated, size-limited (64KB; 32KB for a signal payload) and rate-limited per connection. WebSocket origins are checked. The Node server drops clients that stop reading (over 1MB queued).
 - **Peer data.** Names shown in chat come from the server's validated list, not from what a peer claims over the data channel. SVG files aren't previewed inline.
 - **Storage.** Chat is kept in memory only and never written to storage: it is gone when you leave, are removed, refresh or close the tab. The invite token, room key and per-room identity live in sessionStorage so a refresh can rejoin; they are cleared when you leave the call or are removed from it (if the tab is closed without leaving, the browser may keep them for its own "reopen closed tab" feature until the session ends). localStorage holds your display name, TURN preferences and, on the owner's own browser, the rooms they created (including their host links and room keys, which grant host access until they expire). Expired rooms are pruned and the list is cleared on sign-out. Don't use the owner dashboard on a shared computer.
-- **Untrusted peers.** Everything received over data channels is size- and rate-limited per participant. Files are capped (3 at a time, 150MB total per sender, 50 files / 300MB per peer per call) and checked chunk by chunk, with a 60s stall timeout. Received images are previewed only after a header check (at most 16 megapixels). Whiteboard and annotation data is capped (3,000 strokes / 600k points). Nobody can rewrite someone else's strokes or file entries. Names are made unique (compared after folding case, accents, compatibility forms and common look-alike letters) and stripped of invisible/bidi characters.
+- **Untrusted peers.** Everything received over data channels is size- and rate-limited per participant. Files are capped (3 at a time, 150MB total per sender, 50 files / 300MB per peer per call) and checked chunk by chunk, with a 60s stall timeout. Received images are previewed only after a header check (at most 16 megapixels). Whiteboard and annotation data is capped (3,000 strokes / 600k points). Raised-hand messages must have their exact shape and are rate-limited per participant. Nobody can rewrite someone else's strokes or file entries. Names are made unique (compared after folding case, accents, compatibility forms and common look-alike letters) and stripped of invisible/bidi characters.
 - **Hide my IP address.** An optional pre-join setting makes the browser use only the TURN relay (`iceTransportPolicy: relay`), so other participants see the relay's address instead of yours. It needs TURN to be configured.
 - **Server hardening.** In private mode a WebSocket is only accepted with a valid invite or host token, sent as a subprotocol so it never appears in URLs. Invite links carry the token after `#`, which browsers never send to servers. Owner logins are throttled (see above). Room-password guesses are limited to 10 per room and client per 10 minutes, with a backstop of 200 per room; on Cloudflare the client is identified by an HMAC of its IP keyed with `SECRET_KEY`, never the raw address. These throttles live in memory (per process, or per Durable Object/isolate on Cloudflare) and forget clients once their window passes. Configuration fails closed.
 - **No logs.** Room activity is only logged with `DEBUG_LOGS=1`. Workers Logs are disabled in `wrangler.jsonc`. In the Docker setup, Caddy discards all logs (its error log would otherwise include IPs and the token header), coturn's logging is off, and every container uses Docker's `none` logging driver.
@@ -272,6 +294,7 @@ These logs can contain IP addresses, room ids, names and (in Caddy's error log) 
 - Screen sharing replaces your camera feed. In audio-only mode there's no video track to swap, so remote peers won't see your screen.
 - Switching microphones while sharing screen audio drops the screen audio until you re-share.
 - Firefox doesn't support choosing the speaker output on all platforms (`setSinkId`).
+- Per-person volume has no effect on iPhone and iPad, where browsers ignore volume changes on media elements. "Mute for me" still works.
 
 ---
 
