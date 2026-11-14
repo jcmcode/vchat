@@ -127,34 +127,53 @@ export interface TunableSender {
   setParameters(parameters: never): Promise<void>;
 }
 
-function sameEncoding(current: Encoding, wanted: EncodingSettings): boolean {
-  return (
-    current.maxBitrate === wanted.maxBitrate &&
-    current.maxFramerate === wanted.maxFramerate &&
-    Math.abs((Number(current.scaleResolutionDownBy) || 1) - wanted.scaleResolutionDownBy) < 0.01 &&
-    current.priority === wanted.priority &&
-    current.networkPriority === wanted.networkPriority
-  );
+/** What we set: the encoding fields, plus degradationPreference (on the parameters) for screens. */
+type Field = keyof EncodingSettings | 'degradationPreference';
+/** Widely supported, tried first on their own when something is refused. */
+const ESSENTIAL: Field[] = ['maxBitrate', 'scaleResolutionDownBy'];
+/** Added one at a time, most useful first, when a browser refuses something. */
+const OPTIONAL: Field[] = ['maxFramerate', 'degradationPreference', 'priority', 'networkPriority'];
+const MAINTAIN_RESOLUTION = 'maintain-resolution';
+
+/** Fields each sender's browser refused, so they aren't tried again on every change. */
+const refusedFields = new WeakMap<TunableSender, Set<Field>>();
+
+function matches(params: SendParameters & { encodings: Encoding[] }, wanted: EncodingSettings, fields: Field[]): boolean {
+  return fields.every((f) => {
+    if (f === 'degradationPreference') return params.degradationPreference === MAINTAIN_RESOLUTION;
+    if (f === 'scaleResolutionDownBy') {
+      return params.encodings.every((e) => Math.abs((Number(e.scaleResolutionDownBy) || 1) - wanted.scaleResolutionDownBy) < 0.01);
+    }
+    return params.encodings.every((e) => e[f] === wanted[f]);
+  });
 }
 
-function readParameters(sender: TunableSender): SendParameters | null {
+/**
+ * The sender's parameters, or null if it has none (closed). Some browsers (older Firefox) report no
+ * encodings at all; then we offer one (`seeded`), which they accept and others refuse.
+ */
+function readParameters(sender: TunableSender): { params: SendParameters & { encodings: Encoding[] }; seeded: boolean } | null {
   try {
     const params = sender.getParameters() as SendParameters | null;
-    // No encodings yet: the sender hasn't been negotiated. The caller retunes after negotiation.
-    return params && Array.isArray(params.encodings) && params.encodings.length > 0 ? params : null;
+    if (!params || !Array.isArray(params.encodings)) return null;
+    const seeded = params.encodings.length === 0;
+    if (seeded) params.encodings = [{}];
+    return { params: params as SendParameters & { encodings: Encoding[] }, seeded };
   } catch {
     return null;
   }
 }
 
-/** Senders whose browser refused degradationPreference (the screen's content hint still applies). */
-const noPreference = new WeakSet<TunableSender>();
-
-/** One getParameters/setParameters round with `edit` applied. False if the browser refused it. */
-async function trySet(sender: TunableSender, edit: (params: SendParameters & { encodings: Encoding[] }) => void): Promise<boolean> {
-  const params = readParameters(sender);
-  if (!params?.encodings) return true; // gone or not negotiated: nothing to do now
-  edit(params as SendParameters & { encodings: Encoding[] });
+/** One getParameters/setParameters round setting only `fields`. False if the browser refused it. */
+async function trySet(sender: TunableSender, wanted: EncodingSettings, fields: Field[]): Promise<boolean> {
+  const read = readParameters(sender);
+  if (!read) return true; // gone: nothing to do
+  const { params } = read;
+  // Same values on every encoding (there is one: no simulcast). Count and rids stay untouched.
+  for (const f of fields) {
+    if (f === 'degradationPreference') params.degradationPreference = MAINTAIN_RESOLUTION;
+    else for (const e of params.encodings) (e as Record<string, unknown>)[f] = wanted[f];
+  }
   try {
     await sender.setParameters(params as never);
     return true;
@@ -165,25 +184,26 @@ async function trySet(sender: TunableSender, edit: (params: SendParameters & { e
 
 async function applyOnce(sender: TunableSender, target: VideoTarget, source: SourceSize | undefined): Promise<void> {
   const wanted = encodingFor(target, source);
-  const params = readParameters(sender);
-  if (!params?.encodings) return;
-  const preference = target.maintainResolution && !noPreference.has(sender) ? 'maintain-resolution' : undefined;
-  if (params.encodings.every((e) => sameEncoding(e, wanted)) && (!preference || params.degradationPreference === preference)) return;
+  const refused = refusedFields.get(sender) ?? new Set<Field>();
+  const optional = OPTIONAL.filter((f) => !refused.has(f) && (f !== 'degradationPreference' || target.maintainResolution));
+  const read = readParameters(sender);
+  if (!read) return;
+  if (!read.seeded && matches(read.params, wanted, [...ESSENTIAL, ...optional])) return;
+  if (await trySet(sender, wanted, [...ESSENTIAL, ...optional])) return;
+  // A browser that won't take the encoding we offered: try again on the next change.
+  if (read.seeded) return;
 
-  // Same values on every encoding (there is one: no simulcast). Count and rids stay untouched.
-  const all = (p: { encodings: Encoding[] }) => p.encodings.forEach((e) => Object.assign(e, wanted));
-  if (preference) {
-    if (await trySet(sender, (p) => (all(p), (p.degradationPreference = preference)))) return;
-    noPreference.add(sender);
+  // Something was refused. Find out what, one field at a time, keeping everything that's accepted.
+  let kept = ESSENTIAL;
+  if (!(await trySet(sender, wanted, kept))) {
+    await trySet(sender, wanted, ['maxBitrate']);
+    return;
   }
-  if (await trySet(sender, all)) return;
-  // Some browsers refuse some of these fields: fall back to the widely supported ones.
-  await trySet(sender, (p) =>
-    p.encodings.forEach((e) => {
-      e.maxBitrate = wanted.maxBitrate;
-      e.scaleResolutionDownBy = wanted.scaleResolutionDownBy;
-    })
-  );
+  for (const f of optional) {
+    if (await trySet(sender, wanted, [...kept, f])) kept = [...kept, f];
+    else refused.add(f);
+  }
+  refusedFields.set(sender, refused);
 }
 
 interface TuneJob {

@@ -134,10 +134,9 @@ test('tuneSender applies the target', async () => {
   assert.equal(f.current().degradationPreference, 'maintain-resolution');
 });
 
-test('tuneSender skips senders that are not negotiated yet, and unchanged settings', async () => {
-  const empty = fakeSender({ encodings: [] });
-  await tuneSender(empty.sender, cameraTarget(1, false));
-  assert.equal(empty.calls.length, 0);
+test('tuneSender skips senders without parameters, and unchanged settings', async () => {
+  const none = { getParameters: () => ({}), setParameters: () => Promise.reject(new Error('unexpected')) } as unknown as TunableSender;
+  await tuneSender(none, cameraTarget(1, false));
 
   const f = fakeSender();
   await tuneSender(f.sender, cameraTarget(3, false), { width: 1280, height: 720 });
@@ -145,25 +144,54 @@ test('tuneSender skips senders that are not negotiated yet, and unchanged settin
   assert.equal(f.calls.length, 1);
 });
 
-test('tuneSender drops degradationPreference when the browser refuses it, and remembers that', async () => {
+test('tuneSender drops only degradationPreference when the browser refuses it, and remembers that', async () => {
   const f = fakeSender({ refuse: (p) => 'degradationPreference' in p });
   await tuneSender(f.sender, screenTarget(4), { width: 1920, height: 1080 });
-  assert.equal(f.calls.length, 1);
-  assert.equal(firstEncoding(f.current()).priority, 'high', 'the other fields still apply');
+  const enc = firstEncoding(f.current());
+  assert.equal(enc.priority, 'high', 'the other fields still apply');
+  assert.equal(enc.networkPriority, 'high');
+  assert.equal(enc.maxFramerate, screenTarget(4).maxFramerate);
   assert.equal(f.current().degradationPreference, undefined);
   const before = f.attempts();
   await tuneSender(f.sender, screenTarget(4), { width: 1920, height: 1080 });
   assert.equal(f.attempts(), before, 'nothing left to change: no more attempts');
+  // A new target is applied in one go, without the refused field.
+  await tuneSender(f.sender, screenTarget(2), { width: 1920, height: 1080 });
+  assert.equal(f.attempts(), before + 1);
+  assert.equal(firstEncoding(f.current()).maxBitrate, screenTarget(2).maxBitrate);
 });
 
-test('tuneSender falls back to the basic fields when the browser refuses the others', async () => {
+test('one refused field does not drop the others', async () => {
   const f = fakeSender({ refuse: (p) => firstEncoding(p).priority !== undefined });
-  await tuneSender(f.sender, screenTarget(4), { width: 1920, height: 1080 });
-  assert.equal(f.calls.length, 1);
+  await tuneSender(f.sender, screenTarget(4), { width: 3840, height: 2160 });
   const enc = firstEncoding(f.current());
   assert.equal(enc.maxBitrate, screenTarget(4).maxBitrate);
-  assert.equal(enc.scaleResolutionDownBy, 1);
+  assert.equal(enc.scaleResolutionDownBy, 2);
+  assert.equal(enc.maxFramerate, screenTarget(4).maxFramerate);
+  assert.equal(enc.networkPriority, 'high');
   assert.equal(enc.priority, undefined);
+  assert.equal(f.current().degradationPreference, 'maintain-resolution');
+});
+
+test('tuneSender falls back to the bitrate alone if even the resolution scale is refused', async () => {
+  const f = fakeSender({ refuse: (p) => firstEncoding(p).scaleResolutionDownBy !== undefined });
+  await tuneSender(f.sender, cameraTarget(5, false), { width: 1280, height: 720 });
+  const enc = firstEncoding(f.current());
+  assert.equal(enc.maxBitrate, cameraTarget(5, false).maxBitrate);
+  assert.equal(enc.scaleResolutionDownBy, undefined);
+});
+
+test('tuneSender offers an encoding to browsers that report none', async () => {
+  const f = fakeSender({ encodings: [] });
+  await tuneSender(f.sender, cameraTarget(5, false), { width: 1280, height: 720 });
+  assert.equal(f.calls.length, 1);
+  assert.equal((f.current().encodings as unknown[]).length, 1);
+  assert.equal(firstEncoding(f.current()).maxBitrate, cameraTarget(5, false).maxBitrate);
+
+  // A browser that refuses the offered encoding isn't probed field by field.
+  const refusing = fakeSender({ encodings: [], refuse: () => true });
+  await tuneSender(refusing.sender, cameraTarget(5, false), { width: 1280, height: 720 });
+  assert.equal(refusing.attempts(), 1);
 });
 
 test('tuneSender never throws', async () => {

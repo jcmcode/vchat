@@ -9,6 +9,7 @@ import { createSpeakingDetector } from '../media/audio-analysis.js';
 import { readSdpIdentity } from './e2e-proof.js';
 import { nameKey, stripInvisible } from './name-key.js';
 import { enableSending, isValidMid, localSlots, remoteSlots, sendingBlocked } from './media-slots.js';
+import { holdEarlyState, type EarlyState } from './early-state.js';
 import { cameraTarget, screenTarget, tuneSender } from '../media/quality.js';
 import {
   initFileTransfer,
@@ -45,6 +46,8 @@ export interface PeerConnection {
   screenStream: MediaStream | null;
   /** The mid they announced for their screen transceiver (only ever looked up on this connection). */
   screenMid: string | null;
+  /** Their latest screen/media state sent before we trusted them: applied in trustPeer (early-state.ts). */
+  earlyState: Map<EarlyState['type'], EarlyState>;
 }
 
 export interface ChatMessage {
@@ -170,6 +173,10 @@ export function trustPeer(peerId: string, sid: string): void {
   syncSenders(pc); // what each sender should carry right now (camera, mic, screen); still held
   pc.trusted = true;
   for (const [sender, track] of pc.intended) sender.replaceTrack(track).catch(() => {});
+  // State they sent while we were still checking them (they trusted us first), validated as usual.
+  const early = [...pc.earlyState.values()];
+  pc.earlyState.clear();
+  for (const msg of early) handleDataChannelMessage(peerId, msg);
   refreshRemoteMedia(pc);
   updatePeers();
   // Tell them what we're doing right now, then let features sync state.
@@ -703,6 +710,7 @@ export function leaveRoom(): void {
   reconnectAttempts.clear();
   if (retuneTimer) clearTimeout(retuneTimer);
   retuneTimer = null;
+  watchScreenSize(false);
 
   const peerMap = get(peers);
   peers.set(new Map());
@@ -1086,6 +1094,25 @@ function retune(): void {
   }
 }
 
+/**
+ * A shared surface can change size on the same track ("share this tab instead", a resized window),
+ * which changes how much to scale it down: check every couple of seconds while presenting.
+ */
+let screenSizeTimer: ReturnType<typeof setInterval> | null = null;
+function watchScreenSize(on: boolean): void {
+  if (screenSizeTimer) clearInterval(screenSizeTimer);
+  screenSizeTimer = null;
+  if (!on) return;
+  let last = '';
+  screenSizeTimer = setInterval(() => {
+    const s = outgoingScreenTrack()?.getSettings();
+    const size = `${s?.width ?? 0}x${s?.height ?? 0}`;
+    if (size === last) return;
+    last = size;
+    scheduleRetune();
+  }, 2000);
+}
+
 /** Point every connection's microphone or camera sender at `newTrack` (null: send nothing). */
 export function replaceTrackOnAllPeers(newTrack: MediaStreamTrack | null, kind: 'audio' | 'video'): void {
   for (const [, pc] of get(peers)) {
@@ -1140,6 +1167,7 @@ export function startSharingScreen(): void {
   syncAllSenders();
   for (const pc of get(peers).values()) sendIfConnected(pc, serialize(screenState(pc, true)));
   scheduleRetune(); // the screen takes most of the upload now
+  watchScreenSize(true);
 }
 
 export function stopSharingScreen(): void {
@@ -1151,6 +1179,7 @@ export function stopSharingScreen(): void {
   cleanupMixedAudio();
   syncAllSenders();
   scheduleRetune();
+  watchScreenSize(false);
 }
 
 /**
@@ -1283,6 +1312,7 @@ function createPeerConnection(
     intended: new Map(),
     screenStream: null,
     screenMid: null,
+    earlyState: new Map(),
   };
 
   // Media layout (media-slots.ts): audio, camera, screen. The offerer creates all three, able to
@@ -1382,8 +1412,12 @@ function createPeerConnection(
     const str = typeof data === 'string' ? data : new TextDecoder().decode(data);
     const msg = deserialize(str);
     if (!msg) return;
-    // Until verified, the only thing we accept is the verification proof itself.
-    if (!pc.trusted && msg.type !== 'e2e-auth') return;
+    // Until verified, the only thing we act on is the verification proof itself. Their latest
+    // screen/media state is kept (a validated copy, one of each) and applied once trusted.
+    if (!pc.trusted && msg.type !== 'e2e-auth') {
+      holdEarlyState(pc.earlyState, msg);
+      return;
+    }
     if (!allowType(remotePeerId, msg.type)) return;
     handleDataChannelMessage(remotePeerId, msg);
   });

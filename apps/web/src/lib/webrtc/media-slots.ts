@@ -80,6 +80,17 @@ export function enableSending<T extends TransceiverLike>(ts: readonly T[]): T[] 
   return changed;
 }
 
+/**
+ * Whose screen goes on the stage: the most recent of `sharers` (oldest first) whose screen we're
+ * actually receiving. Someone who only *says* they're sharing can't blank the stage or hide a real
+ * presenter.
+ */
+export function pickPresenter(sharers: Iterable<string>, hasScreen: (peerId: string) => boolean): string | null {
+  let picked: string | null = null;
+  for (const id of sharers) if (hasScreen(id)) picked = id;
+  return picked;
+}
+
 const canSend = (d: Direction | null | undefined) => d === 'sendrecv' || d === 'sendonly';
 
 /** Whether one of our slots wants to send but the last negotiation didn't allow it (needs another round). */

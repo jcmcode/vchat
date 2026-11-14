@@ -122,6 +122,27 @@ function cameraErrorMessage(err: unknown): string {
   return "Couldn't turn the camera on.";
 }
 
+/** Camera changes (on, off, switch) run one at a time, so two cameras are never left open. */
+let cameraQueue: Promise<unknown> = Promise.resolve();
+function withCamera<T>(task: () => Promise<T>): Promise<T> {
+  const run = cameraQueue.then(task);
+  cameraQueue = run.catch(() => {});
+  return run;
+}
+
+/** Make `track` the only camera in `stream`: any other one is stopped and removed. */
+function putCamera(stream: MediaStream, track: MediaStreamTrack): void {
+  for (const old of stream.getVideoTracks()) {
+    if (old === track) continue;
+    old.stop();
+    stream.removeTrack(old);
+  }
+  if (!stream.getVideoTracks().includes(track)) stream.addTrack(track);
+  watchCamera(track);
+  const deviceId = track.getSettings().deviceId;
+  if (deviceId) selectedVideoDevice.set(deviceId);
+}
+
 let cameraToggle: Promise<boolean> | null = null;
 
 /**
@@ -129,11 +150,12 @@ let cameraToggle: Promise<boolean> | null = null;
  * removed from the local stream, and peers' video senders are pointed at nothing (mesh.ts follows
  * `localStream`). Camera on asks for the selected camera again, or the default one if that camera
  * is gone. If it can't be had (busy, unplugged, blocked) the camera stays off and this throws an
- * Error with a message to show. Resolves to whether the camera is now on.
+ * Error with a message to show. Resolves to whether the camera is now on. A second click while
+ * one is in progress gets the same result instead of toggling again.
  */
 export function toggleVideo(): Promise<boolean> {
   if (!cameraToggle) {
-    cameraToggle = (get(videoEnabled) ? turnCameraOff() : turnCameraOn()).finally(() => {
+    cameraToggle = withCamera(() => (get(videoEnabled) ? turnCameraOff() : turnCameraOn())).finally(() => {
       cameraToggle = null;
     });
   }
@@ -182,10 +204,7 @@ async function turnCameraOn(): Promise<boolean> {
     camera.getTracks().forEach((t) => t.stop());
     return get(videoEnabled);
   }
-  stream.addTrack(track);
-  watchCamera(track);
-  const deviceId = track.getSettings().deviceId;
-  if (deviceId) selectedVideoDevice.set(deviceId);
+  putCamera(stream, track);
   videoEnabled.set(true);
   localStream.set(stream);
   return true;
@@ -218,34 +237,31 @@ export async function switchAudioDevice(deviceId: string): Promise<MediaStreamTr
   return newTrack;
 }
 
-export async function switchVideoDevice(deviceId: string): Promise<MediaStreamTrack | null> {
-  const stream = get(localStream);
-  if (!stream) return null;
+/** Switch cameras (queued with turning it on and off). Resolves to the new track, or null if the camera is off. */
+export function switchVideoDevice(deviceId: string): Promise<MediaStreamTrack | null> {
+  return withCamera(async () => {
+    const stream = get(localStream);
+    if (!stream) return null;
 
-  // Camera off: don't open the new camera now, just use it when the camera is turned back on.
-  if (!get(videoEnabled) || get(voiceOnlyMode)) {
+    // Camera off: don't open the new camera now, just use it when the camera is turned back on.
+    if (!get(videoEnabled) || get(voiceOnlyMode)) {
+      selectedVideoDevice.set(deviceId);
+      return null;
+    }
+
+    // Get the new camera first: if it fails (busy, unplugged) the current one keeps working.
+    const newStream = await navigator.mediaDevices.getUserMedia({ video: cameraConstraints(deviceId) });
+    const newTrack = newStream.getVideoTracks()[0];
+    // Turned off (or left the call) while we waited: release the new camera again.
+    if (!newTrack || !get(videoEnabled) || get(localStream) !== stream) {
+      newStream.getTracks().forEach((t) => t.stop());
+      return null;
+    }
+    putCamera(stream, newTrack);
     selectedVideoDevice.set(deviceId);
-    return null;
-  }
-
-  // Get the new camera first: if it fails (busy, unplugged) the current one keeps working.
-  const oldTrack = stream.getVideoTracks()[0];
-  const newStream = await navigator.mediaDevices.getUserMedia({ video: cameraConstraints(deviceId) });
-
-  const newTrack = newStream.getVideoTracks()[0];
-  // Turned off (or left the call) while we waited: release the new camera again.
-  if (!newTrack || !get(videoEnabled) || get(localStream) !== stream) {
-    newStream.getTracks().forEach((t) => t.stop());
-    return null;
-  }
-  oldTrack?.stop();
-  if (oldTrack) stream.removeTrack(oldTrack);
-  stream.addTrack(newTrack);
-  watchCamera(newTrack);
-  selectedVideoDevice.set(deviceId);
-
-  localStream.set(stream);
-  return newTrack;
+    localStream.set(stream);
+    return newTrack;
+  });
 }
 
 export async function startScreenShare(): Promise<MediaStream | null> {

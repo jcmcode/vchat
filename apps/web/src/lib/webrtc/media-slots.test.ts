@@ -4,6 +4,7 @@ import {
   enableSending,
   isValidMid,
   localSlots,
+  pickPresenter,
   remoteSlots,
   sendingBlocked,
   type Direction,
@@ -102,4 +103,15 @@ test('sendingBlocked: a slot wants to send but the negotiated direction does not
   assert.equal(sendingBlocked([t('audio', '0', 'sendrecv', 'sendonly')]), false);
   assert.equal(sendingBlocked([t('audio', '0', 'recvonly', 'recvonly')]), false, "we didn't ask to send");
   assert.equal(sendingBlocked([t('audio', '0'), t('video', '1'), t('video', '2'), t('video', '3', 'sendrecv', 'recvonly')]), false, 'not one of our slots');
+});
+
+test('pickPresenter: the most recent sharer whose screen is arriving', () => {
+  const screens = new Set(['a', 'c']);
+  const has = (id: string) => screens.has(id);
+  assert.equal(pickPresenter(['a', 'b', 'c'], has), 'c');
+  assert.equal(pickPresenter(new Set(['c', 'a', 'b']), has), 'a');
+  // Someone who only claims to share (no screen arriving) can't take or blank the stage.
+  assert.equal(pickPresenter(['a', 'b'], has), 'a');
+  assert.equal(pickPresenter(['b'], has), null);
+  assert.equal(pickPresenter([], has), null);
 });

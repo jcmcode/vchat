@@ -81,6 +81,7 @@
   import Icon from '$lib/ui/Icon.svelte';
   import VideoTile from './VideoTile.svelte';
   import { setE2EKey, verification, blockedConnections, hasRoomKey, isValidRoomKey, allowUnverified } from '$lib/webrtc/e2e';
+  import { pickPresenter } from '$lib/webrtc/media-slots';
   import ChatPanel from './ChatPanel.svelte';
   import WaitingScreen from './WaitingScreen.svelte';
   import AdmissionPanel from './AdmissionPanel.svelte';
@@ -158,7 +159,8 @@
   $: peerList = Array.from($peers.values());
 
   // ── Stage: whiteboard or a shared screen takes the main area; tiles move to a strip ──
-  $: remoteSharer = [...$sharingPeers].find((id) => $peers.has(id)) ?? null;
+  // The latest presenter whose screen is actually arriving (a bare claim can't take the stage).
+  $: remoteSharer = pickPresenter($sharingPeers, (id) => !!$peers.get(id)?.screenStream);
   $: stage = $whiteboardOpen
     ? 'whiteboard'
     : $isScreenSharing
@@ -169,6 +171,8 @@
   $: stagePeer = stage === 'remote-screen' && remoteSharer ? $peers.get(remoteSharer) ?? null : null;
   // The presenter keeps their tile (camera and sound); the stage shows only their screen.
   $: stripPeers = peerList;
+  // Any other screen being shared goes in the strip, so no share is ever hidden.
+  $: stripScreens = peerList.filter((p) => p.screenStream && $sharingPeers.has(p.id) && p.id !== stagePeer?.id);
   $: gridCols = getGridCols(peerList.length + 1);
 
   function getGridCols(count: number): number {
@@ -851,6 +855,10 @@
               selectable
               on:select={() => (selectedPeerId = pc.id)}
             />
+          {/each}
+
+          {#each stripScreens as pc (pc.id)}
+            <VideoTile peerConnection={pc} contain screen presenting verification={$verification.get(pc.id)?.state} />
           {/each}
         </div>
       </main>
