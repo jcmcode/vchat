@@ -9,6 +9,8 @@ Your own private, end-to-end encrypted video calls. Deploy it on your domain, si
 - **2–6 people** per room
 - **Features**:
   - Video, audio-only, or **chat-only** participation
+  - A **pre-join check**: camera preview, microphone level, microphone/camera/speaker pickers and a test sound. Join muted or with your camera off. Nothing is switched on until you choose
+  - On phones: **front/back camera flip**, and the screen stays on during a call
   - **Screen sharing** (with audio), plus a **laser pointer and drawing** over the shared screen that everyone sees
   - A **shared whiteboard** (pen, highlighter, text, eraser) you can export as **PDF** or PNG
   - Group chat, **private direct messages** and **files sent straight to one person** (tap them), and reactions

@@ -20,7 +20,9 @@
 
 2. JOIN      Bob opens the invite link /room/<id>#invite=<token>&k=<room key>. The fragment is
              moved into the tab's storage and stripped from the address bar before any network
-             request (it never reaches a server or the history). The browser fetches
+             request (it never reaches a server or the history). On the pre-join screen he
+             types his name, picks camera & mic, audio only or chat only, and can check his
+             camera, microphone and speaker. Then the browser fetches
              /api/ice-servers (the token unlocks TURN credentials), opens /ws?room=<id> and
              sends join with the token. If the room has a password he's asked for it. If the
              invite requires approval he waits until the owner lets him in. If the owner hasn't
@@ -116,7 +118,12 @@ The Node server (`src/index.ts`) keeps a `Map<roomId, Room>` in memory. The Clou
 | `lib/signaling/client.ts` | WebSocket client: keepalive pings, exponential-backoff reconnect, automatic re-entry |
 | `lib/webrtc/mesh.ts` | Peer connections, session ids, glare handling, ICE recovery, data-channel messages |
 | `lib/webrtc/file-transfer.ts` | Chunked, acknowledged, per-recipient file transfer (50MB max) |
-| `lib/media/manager.ts` | Camera/mic/screen capture, device switching, audio-only fallback |
+| `lib/media/manager.ts` | Camera/mic/screen capture, device switching, audio-only fallback, adopting the pre-join stream (`adoptMedia`) |
+| `lib/media/preview.ts`, `routes/room/[id]/PreJoin.svelte` | Pre-join check: camera preview, mic level, device pickers, test sound, join muted or camera off |
+| `lib/media/camera.ts`, `lib/media/call-camera.ts` | Constraints, front/back camera flip, reopening a released camera in the call |
+| `lib/media/media-errors.ts` | Friendly camera/mic errors and per-browser steps to allow access |
+| `lib/media/device-prefs.ts` | The microphone, camera and speaker you last picked (localStorage) |
+| `lib/media/wake-lock.ts` | Keeps the screen on during a call (Screen Wake Lock API) |
 | `lib/stores/room.ts` | Endpoints, ICE fetch, per-tab identity, preferences |
 
 The app is a static SPA (SvelteKit + adapter-static). Its Content-Security-Policy is emitted as a `<meta>` tag with a hash for SvelteKit's boot script (`svelte.config.js`), so it works on any host.
@@ -231,8 +238,10 @@ A socket is bound to the room it was authorized for at the upgrade (`/ws?room=`)
 - **TURN credentials.** Short-lived (4h by default, never past the invite's expiry): coturn uses a shared-secret HMAC (`use-auth-secret`) with a unique `<expiry>:<random>` username per response, and Cloudflare credentials come from its API (cached briefly per role and room). No TURN password is baked into the frontend. coturn has per-user and total quotas, a per-session and total bandwidth cap, and refuses to relay to private, special-purpose, NAT64/Teredo and cloud-metadata addresses or any address of the host itself.
 - **Input validation.** All signaling messages are validated, size-limited (64KB; 32KB for a signal payload) and rate-limited per connection. WebSocket origins are checked. The Node server drops clients that stop reading (over 1MB queued).
 - **Peer data.** Names shown in chat come from the server's validated list, not from what a peer claims over the data channel. SVG files aren't previewed inline.
-- **Storage.** Chat is kept in memory only and never written to storage: it is gone when you leave, are removed, refresh or close the tab. The invite token, room key and per-room identity live in sessionStorage so a refresh can rejoin; they are cleared when you leave the call or are removed from it (if the tab is closed without leaving, the browser may keep them for its own "reopen closed tab" feature until the session ends). localStorage holds your display name, TURN preferences and, on the owner's own browser, the rooms they created (including their host links and room keys, which grant host access until they expire). Expired rooms are pruned and the list is cleared on sign-out. Don't use the owner dashboard on a shared computer.
+- **Storage.** Chat is kept in memory only and never written to storage: it is gone when you leave, are removed, refresh or close the tab. The invite token, room key and per-room identity live in sessionStorage so a refresh can rejoin; they are cleared when you leave the call or are removed from it (if the tab is closed without leaving, the browser may keep them for its own "reopen closed tab" feature until the session ends). localStorage holds your display name, TURN preferences, the microphone, camera and speaker you last picked (`vchat_devices`: browser device ids, opaque strings that are specific to this site and that the browser already remembers for it; cleared with the site's data) and, on the owner's own browser, the rooms they created (including their host links and room keys, which grant host access until they expire). Expired rooms are pruned and the list is cleared on sign-out. Don't use the owner dashboard on a shared computer.
 - **Untrusted peers.** Everything received over data channels is size- and rate-limited per participant. Files are capped (3 at a time, 150MB total per sender, 50 files / 300MB per peer per call) and checked chunk by chunk, with a 60s stall timeout. Received images are previewed only after a header check (at most 16 megapixels). Whiteboard and annotation data is capped (3,000 strokes / 600k points). Nobody can rewrite someone else's strokes or file entries. Names are made unique (compared after folding case, accents, compatibility forms and common look-alike letters) and stripped of invisible/bidi characters.
+- **Camera and microphone.** Nothing is opened until you choose a mode that needs it: the pre-join screen starts with everything off, and opens the camera and microphone only when you press "Check camera & mic", pick "Camera & mic" or "Audio only", or join. It only asks for what the mode needs (audio only never asks for the camera), and if the camera can't be used it carries on with the microphone, but never by triggering a second permission prompt (it checks the Permissions API first). Devices are released as soon as they aren't needed: switching to audio only (camera) or chat only (both), turning the camera off, cancelling, leaving the page or an error. Every request is tagged, and a result that arrives after you changed your mind (a slow permission prompt, say) is stopped the moment it arrives. On join, the open tracks are handed to the call instead of being opened again, so they go through the same trust gate as always. Joining with the camera off doesn't hold the camera: the call gets an already-stopped stand-in track from a canvas (no device), and "camera on" opens the real camera. Muting keeps the microphone open but silent, as muting in the call does, so the browser's microphone indicator stays on.
+- **Screen wake lock.** During a call (and while waiting to be admitted) the page asks the browser to keep the screen on, where supported. It's asked for again when the page becomes visible, and released when you leave, are removed, or the call ends with an error.
 - **Hide my IP address.** An optional pre-join setting makes the browser use only the TURN relay (`iceTransportPolicy: relay`), so other participants see the relay's address instead of yours. It needs TURN to be configured.
 - **Server hardening.** In private mode a WebSocket is only accepted with a valid invite or host token, sent as a subprotocol so it never appears in URLs. Invite links carry the token after `#`, which browsers never send to servers. Owner logins are throttled (see above). Room-password guesses are limited to 10 per room and client per 10 minutes, with a backstop of 200 per room; on Cloudflare the client is identified by an HMAC of its IP keyed with `SECRET_KEY`, never the raw address. These throttles live in memory (per process, or per Durable Object/isolate on Cloudflare) and forget clients once their window passes. Configuration fails closed.
 - **No logs.** Room activity is only logged with `DEBUG_LOGS=1`. Workers Logs are disabled in `wrangler.jsonc`. In the Docker setup, Caddy discards all logs (its error log would otherwise include IPs and the token header), coturn's logging is off, and every container uses Docker's `none` logging driver.
@@ -271,7 +280,9 @@ These logs can contain IP addresses, room ids, names and (in Caddy's error log) 
 - Mesh topology: upload bandwidth grows with each participant, so 6 is the practical cap.
 - Screen sharing replaces your camera feed. In audio-only mode there's no video track to swap, so remote peers won't see your screen.
 - Switching microphones while sharing screen audio drops the screen audio until you re-share.
-- Firefox doesn't support choosing the speaker output on all platforms (`setSinkId`).
+- Choosing the speaker (`setSinkId`) works in Chromium browsers and recent Firefox. Safari can't, so the speaker picker isn't shown there and "Test speaker" plays on the default output.
+- The front/back camera flip is offered on touch devices with more than one camera. Phones that can't run two cameras at once briefly release the current one; if the other camera then fails to open, your camera is left off (turn it on again to retry).
+- The screen wake lock needs a browser with the Screen Wake Lock API, and the browser may refuse it (battery saver, for example).
 
 ---
 
