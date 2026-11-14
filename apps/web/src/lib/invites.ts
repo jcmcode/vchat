@@ -119,3 +119,21 @@ export function mailtoLink(invite: MeetingInvite, to = ''): string {
   const subject = `Video call: ${invite.title}${invite.startsAt ? ` — ${new Date(invite.startsAt).toLocaleDateString([], { month: 'short', day: 'numeric' })}` : ''}`;
   return `mailto:${encodeURIComponent(to)}?subject=${encodeURIComponent(subject)}&body=${encodeURIComponent(inviteText(invite))}`;
 }
+
+/** Meeting lengths offered when scheduling (minutes). */
+export const DURATIONS = [15, 30, 45, 60, 90, 120];
+
+/** "45 min", "1 h", "1 h 30". */
+export function durationLabel(minutes: number): string {
+  if (minutes < 60) return `${minutes} min`;
+  const h = Math.floor(minutes / 60);
+  const m = minutes % 60;
+  return m ? `${h} h ${m}` : `${h} h`;
+}
+
+/** A time as the value of an <input type="datetime-local"> (local time, minute precision). */
+export function toDatetimeLocal(ms: number): string {
+  const d = new Date(ms);
+  const pad = (n: number) => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
+}
