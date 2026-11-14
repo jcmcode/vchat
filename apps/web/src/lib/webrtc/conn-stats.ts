@@ -1,6 +1,7 @@
 // Polls getStats() for every open peer connection and publishes a quality reading per peer.
 //
-// One shared timer, running only while at least one connection is open and the page is visible.
+// Only connections that passed the trust gate (verified, or allowed by the user) are measured.
+// One shared timer, running only while at least one such connection is open and the page is visible.
 // The readings stay in this tab's memory: they are never sent to the server or to other
 // participants, and are dropped when a peer leaves or the call ends. The maths is in
 // conn-quality.ts.
@@ -8,7 +9,7 @@
 import { get, writable, type Readable } from 'svelte/store';
 import { peers, onPeerLeft, onRoomLeft, type PeerConnection } from './mesh.js';
 import { isScreenSharing, localStream, videoEnabled } from '../media/manager.js';
-import { classify, readStats, smoothLevel, type ConnSample, type QualityLevel, type StatsCounters } from './conn-quality.js';
+import { classify, pushLevel, readStats, smoothLevel, type ConnSample, type QualityLevel, type StatsCounters } from './conn-quality.js';
 
 export interface PeerQuality extends ConnSample {
   /** Smoothed over the last few samples. */
@@ -16,9 +17,11 @@ export interface PeerQuality extends ConnSample {
 }
 
 export const POLL_INTERVAL_MS = 2500;
+/** A getStats() that hasn't answered by then is skipped this round. */
+const STATS_TIMEOUT_MS = 2000;
 
 const store = writable<Map<string, PeerQuality>>(new Map());
-/** Connection quality per remote peer id (only peers whose connection is open). */
+/** Connection quality per remote peer id (only open, trusted connections). */
 export const connQuality: Readable<Map<string, PeerQuality>> = { subscribe: store.subscribe };
 
 interface Tracked {
@@ -30,12 +33,29 @@ interface Tracked {
 
 const tracked = new Map<string, Tracked>();
 let timer: ReturnType<typeof setInterval> | null = null;
-let polling = false;
+/** Id of the poll in progress (0: none). */
+let inFlight = 0;
+let pollIds = 0;
 /** Bumped when polling stops, so a poll still awaiting getStats() can't publish stale readings. */
 let generation = 0;
 
 function rtcOf(pc: PeerConnection): RTCPeerConnection | null {
   return (pc.peer as unknown as { _pc?: RTCPeerConnection })._pc ?? null;
+}
+
+function measurable(pc: PeerConnection): boolean {
+  return pc.connected && pc.trusted;
+}
+
+/** Resolves to null if `promise` fails or takes longer than `ms`. */
+function within<T>(promise: Promise<T>, ms: number): Promise<T | null> {
+  return new Promise((resolve) => {
+    const t = setTimeout(() => resolve(null), ms);
+    promise.then(
+      (value) => (clearTimeout(t), resolve(value)),
+      () => (clearTimeout(t), resolve(null))
+    );
+  });
 }
 
 function sendingVideo(): boolean {
@@ -50,34 +70,32 @@ async function measure(pc: PeerConnection, video: boolean): Promise<[string, Pee
     t = { rtc, counters: null, history: [] };
     tracked.set(pc.id, t);
   }
-  let report: RTCStatsReport;
-  try {
-    report = await rtc.getStats();
-  } catch {
-    return null;
-  }
-  if (tracked.get(pc.id) !== t) return null; // replaced while we waited
-  const { sample, counters } = readStats(report.values(), t.counters, performance.now());
+  const report = await within(rtc.getStats(), STATS_TIMEOUT_MS);
+  if (!report || tracked.get(pc.id) !== t) return null; // no answer, or replaced while we waited
+  const now = performance.now();
+  const gap = t.counters ? now - t.counters.at : 0;
+  const { sample, counters } = readStats(report.values(), t.counters, now);
   t.counters = counters;
-  t.history = [...t.history, classify(sample, { sendingVideo: video })].slice(-3);
+  t.history = pushLevel(t.history, classify(sample, { sendingVideo: video }), gap);
   return [pc.id, { ...sample, level: smoothLevel(t.history) }];
 }
 
 async function poll(): Promise<void> {
   // Nobody sees the bars while the tab is hidden; the first sample after it's back starts fresh.
-  if (polling || document.visibilityState === 'hidden') return;
-  polling = true;
+  if (inFlight || document.visibilityState === 'hidden') return;
+  const id = ++pollIds;
+  inFlight = id;
   const gen = generation;
   try {
-    const open = Array.from(get(peers).values()).filter((pc) => pc.connected);
+    const open = Array.from(get(peers).values()).filter(measurable);
     const video = sendingVideo();
     const results = await Promise.all(open.map((pc) => measure(pc, video)));
     if (gen !== generation) return;
     const live = get(peers);
-    for (const id of tracked.keys()) if (!live.has(id)) tracked.delete(id);
-    store.set(new Map(results.filter((r): r is [string, PeerQuality] => !!r && live.has(r[0]))));
+    for (const peerId of tracked.keys()) if (!live.has(peerId)) tracked.delete(peerId);
+    store.set(new Map(results.filter((r): r is [string, PeerQuality] => !!r && !!live.get(r[0])?.trusted)));
   } finally {
-    polling = false;
+    if (inFlight === id) inFlight = 0;
   }
 }
 
@@ -85,6 +103,7 @@ function stop(): void {
   if (timer) clearInterval(timer);
   timer = null;
   generation++;
+  inFlight = 0;
   tracked.clear();
   if (get(store).size) store.set(new Map());
 }
@@ -101,7 +120,7 @@ function forget(peerId: string): void {
 if (typeof window !== 'undefined') {
   // Run the timer only while there is something to measure.
   peers.subscribe((map) => {
-    const anyOpen = Array.from(map.values()).some((pc) => pc.connected);
+    const anyOpen = Array.from(map.values()).some(measurable);
     if (anyOpen && !timer) {
       timer = setInterval(() => void poll(), POLL_INTERVAL_MS);
       void poll();

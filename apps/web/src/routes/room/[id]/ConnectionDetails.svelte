@@ -1,6 +1,11 @@
 <script lang="ts">
-  /** Connection details for the person card. Measured on this device only (see conn-stats.ts). */
+  /**
+   * Connection details for the person card. Measured on this device only (see conn-stats.ts).
+   * For a connection that isn't verified, the figures may describe a link to someone in the
+   * middle: they're marked as such, and "Direct" (which would then mean direct to them) isn't shown.
+   */
   import { connQuality } from '$lib/webrtc/conn-stats';
+  import { verification } from '$lib/webrtc/e2e';
   import { formatKbps, formatMs, formatPct, qualityLabel } from '$lib/webrtc/conn-quality';
   import SignalBars from '$lib/ui/SignalBars.svelte';
 
@@ -9,11 +14,14 @@
   $: q = $connQuality.get(peerId);
   $: level = q?.level ?? 'unknown';
   $: video = q?.recvVideo;
+  $: verified = $verification.get(peerId)?.state === 'verified';
 </script>
 
+<!-- Only trusted connections are measured; nothing is shown for one still blocked. -->
+{#if q || verified}
 <section class="conn" aria-label="Connection">
   <div class="conn-head">
-    <span class="conn-title">Connection</span>
+    <span class="conn-title">Connection{verified ? '' : ' (not verified)'}</span>
     <span class="conn-level {level}">
       <SignalBars {level} label="Connection quality: {qualityLabel(level).toLowerCase()}" />
       <span aria-hidden="true">{qualityLabel(level)}</span>
@@ -31,8 +39,10 @@
         <dt>Jitter</dt>
         <dd>{formatMs(q.jitterMs)}</dd>
       {/if}
-      <dt>Route</dt>
-      <dd>{q.relayed === null ? '—' : q.relayed ? 'Relayed (TURN server)' : 'Direct'}</dd>
+      {#if verified}
+        <dt>Route</dt>
+        <dd>{q.relayed === null ? '—' : q.relayed ? 'Relayed (TURN server)' : 'Direct'}</dd>
+      {/if}
       {#if video}
         <dt>Receiving</dt>
         <dd>{video.width}×{video.height}{video.fps !== null ? ` · ${Math.round(video.fps)} fps` : ''}</dd>
@@ -44,6 +54,7 @@
     </dl>
   {/if}
 </section>
+{/if}
 
 <style>
   .conn {

@@ -20,6 +20,7 @@
   export let selectable = false;
 
   const dispatch = createEventDispatcher<{ select: void }>();
+  let qualityShown = false;
 
   function onKey(e: KeyboardEvent) {
     if (selectable && (e.key === 'Enter' || e.key === ' ')) {
@@ -53,7 +54,7 @@
   role={selectable ? 'button' : undefined}
   tabindex={selectable ? 0 : undefined}
   aria-label={selectable ? `${peerConnection.displayName}: message privately or send a file` : undefined}
-  aria-describedby="quality-{peerConnection.id}"
+  aria-describedby={qualityShown ? `quality-${peerConnection.id}` : undefined}
   on:click={() => selectable && dispatch('select')}
   on:keydown={onKey}
 >
@@ -68,7 +69,7 @@
     </div>
   {/if}
   <slot />
-  <TileQuality peerId={peerConnection.id} id="quality-{peerConnection.id}" />
+  <TileQuality peerId={peerConnection.id} id="quality-{peerConnection.id}" bind:shown={qualityShown} />
   <span class="tile-name">
     {#if verification === 'verified'}
       <span class="ver verified" title="Verified end-to-end"><Icon name="shield-check" size={13} /><span class="sr-only">verified</span></span>

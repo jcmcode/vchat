@@ -7,8 +7,11 @@
   export let peerId: string;
   /** Lets the tile point at this as its accessible description. */
   export let id: string | undefined = undefined;
+  /** Whether the bars are rendered (bind to it, so the tile only points at an element that exists). */
+  export let shown = false;
 
   $: q = $connQuality.get(peerId);
+  $: shown = !!q && q.level !== 'unknown';
   $: loss = q ? Math.max(q.lossInPct ?? -1, q.lossOutPct ?? -1) : -1;
   $: label = q
     ? `Connection ${qualityLabel(q.level).toLowerCase()}` +
@@ -18,7 +21,7 @@
     : '';
 </script>
 
-{#if q && q.level !== 'unknown'}
+{#if q && shown}
   <span class="tile-quality">
     <SignalBars level={q.level} {label} {id} />
   </span>

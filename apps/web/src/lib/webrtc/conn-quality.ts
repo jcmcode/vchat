@@ -4,6 +4,10 @@
 // does the polling. The numbers are computed and shown on this device only: they are never sent to
 // the signaling server or to other participants. Candidate statistics include IP addresses; only
 // the candidate *type* (relay or not) is read, and no address is kept.
+//
+// Some of these figures come from the other side (RTCP receiver reports: their loss and jitter),
+// so a peer can make its own link look bad. Implausible values are ignored, and a single link
+// is never taken as proof that *your* connection is poor (see connectionHint).
 
 export type QualityLevel = 'good' | 'fair' | 'poor' | 'unknown';
 
@@ -42,6 +46,10 @@ type Stat = Record<string, unknown>;
 export const MIN_PACKETS_FOR_LOSS = 20;
 /** Deltas spanning a longer gap (tab hidden, a stalled poll) describe the past, not now. */
 export const MAX_SAMPLE_GAP_MS = 10_000;
+/** Jitter above this (ms) isn't a real measurement (e.g. a forged receiver report): ignored. */
+export const MAX_PLAUSIBLE_JITTER_MS = 1000;
+/** Round trips above this (ms) aren't plausible on a working call: ignored. */
+export const MAX_PLAUSIBLE_RTT_MS = 10_000;
 
 /**
  * Thresholds: a metric at or below `good` is good, at or below `fair` is fair, above is poor.
@@ -61,6 +69,12 @@ function num(v: unknown): number | null {
 
 function str(v: unknown): string | null {
   return typeof v === 'string' ? v : null;
+}
+
+/** A jitter or round-trip value in seconds, or null if missing, negative or above `maxMs`. */
+function plausibleSeconds(v: unknown, maxMs: number): number | null {
+  const n = num(v);
+  return n !== null && n >= 0 && n * 1000 <= maxMs ? n : null;
 }
 
 function kindOf(s: Stat): string {
@@ -118,13 +132,13 @@ export function readStats(
   const relayed = localType || remoteType ? localType === 'relay' || remoteType === 'relay' : null;
   const bitrate = num(pair?.availableOutgoingBitrate);
   const outgoingKbps = bitrate !== null && bitrate >= 0 ? bitrate / 1000 : null;
-  let rtt = num(pair?.currentRoundTripTime);
-  if (rtt === null || rtt < 0) {
+  let rtt = plausibleSeconds(pair?.currentRoundTripTime, MAX_PLAUSIBLE_RTT_MS);
+  if (rtt === null) {
     // Fallback (e.g. Firefox): the RTCP round trip measured per outgoing stream.
     const rtts = stats
       .filter((s) => s.type === 'remote-inbound-rtp')
-      .map((s) => num(s.roundTripTime))
-      .filter((v): v is number => v !== null && v >= 0);
+      .map((s) => plausibleSeconds(s.roundTripTime, MAX_PLAUSIBLE_RTT_MS))
+      .filter((v): v is number => v !== null);
     rtt = rtts.length ? rtts.reduce((a, b) => a + b, 0) / rtts.length : null;
   }
 
@@ -148,8 +162,8 @@ export function readStats(
         inLost += Math.max(0, lost - p.lost);
       }
     }
-    const jitter = num(s.jitter);
-    if (kind === 'audio' && jitter !== null && jitter >= 0) audioJitter.push(jitter);
+    const jitter = plausibleSeconds(s.jitter, MAX_PLAUSIBLE_JITTER_MS);
+    if (kind === 'audio' && jitter !== null) audioJitter.push(jitter);
     const width = num(s.frameWidth);
     const height = num(s.frameHeight);
     if (kind === 'video' && width && height && width > 0 && height > 0) {
@@ -170,8 +184,8 @@ export function readStats(
   let outLost = 0;
   for (const s of stats) {
     if (s.type !== 'remote-inbound-rtp') continue;
-    const jitter = num(s.jitter);
-    if (kindOf(s) === 'audio' && jitter !== null && jitter >= 0) audioJitter.push(jitter);
+    const jitter = plausibleSeconds(s.jitter, MAX_PLAUSIBLE_JITTER_MS);
+    if (kindOf(s) === 'audio' && jitter !== null) audioJitter.push(jitter);
     const lost = num(s.packetsLost);
     if (lost === null) continue;
     const key = streamKey(s);
@@ -180,8 +194,9 @@ export function readStats(
     const pSent = base?.outbound.get(key);
     const pLost = base?.remoteLost.get(key);
     if (sent === undefined || pSent === undefined || pLost === undefined || sent < pSent) continue;
+    // They can't have lost more than we sent: a report claiming so is capped (loss stays within 0..1).
     outSent += sent - pSent;
-    outLost += Math.max(0, lost - pLost);
+    outLost += Math.min(sent - pSent, Math.max(0, lost - pLost));
   }
 
   const pct = (lost: number, total: number) => Math.min(100, Math.max(0, (100 * lost) / total));
@@ -241,10 +256,24 @@ export function smoothLevel(history: QualityLevel[]): QualityLevel {
   return sorted.length === 3 ? sorted[1] : sorted[0];
 }
 
-/** Most of our links are poor (more than half of those measured): likely our own network. */
-export function isLocalConnectionPoor(levels: QualityLevel[]): boolean {
-  const known = levels.filter((l) => l !== 'unknown');
-  return known.length > 0 && known.filter((l) => l === 'poor').length * 2 > known.length;
+/** Add a sample's level to a link's recent history. After a long gap, older levels are dropped. */
+export function pushLevel(history: QualityLevel[], level: QualityLevel, gapMs: number, maxGapMs = MAX_SAMPLE_GAP_MS): QualityLevel[] {
+  return [...(gapMs > maxGapMs ? [] : history), level].slice(-3);
+}
+
+export type ConnectionHint = { kind: 'local' } | { kind: 'peer'; peerId: string } | null;
+
+/**
+ * Which hint to show, from the levels of your (trusted) links. "Your connection is poor" only
+ * when at least two links were measured and more than half are poor: one peer with a bad network
+ * (or one making its link look bad) must never tell you that *your* connection is poor. With a
+ * single measured link, a poor one is about that link ("Connection to <name> is poor").
+ */
+export function connectionHint(links: Iterable<[string, QualityLevel]>): ConnectionHint {
+  const known = Array.from(links).filter(([, level]) => level !== 'unknown');
+  if (known.length === 1) return known[0][1] === 'poor' ? { kind: 'peer', peerId: known[0][0] } : null;
+  const poor = known.filter(([, level]) => level === 'poor').length;
+  return known.length >= 2 && poor * 2 > known.length ? { kind: 'local' } : null;
 }
 
 // ── Formatting for the UI ─────────────────────────────────────────────────────

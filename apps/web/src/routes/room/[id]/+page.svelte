@@ -758,6 +758,8 @@
     </div>
   {/if}
 
+  <ConnectionHint />
+
   {#if mediaError}
     <div class="banner danger" role="alert">
       {mediaError}
@@ -847,7 +849,6 @@
       {/if}
 
       <ReactionOverlay reactions={$reactionsStore} />
-      <ConnectionHint />
 
       {#if showDeviceSettings}
         <DeviceSettings />

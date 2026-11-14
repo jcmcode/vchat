@@ -2,10 +2,11 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
   classify,
+  connectionHint,
   formatKbps,
   formatMs,
   formatPct,
-  isLocalConnectionPoor,
+  pushLevel,
   readStats,
   smoothLevel,
   type ConnSample,
@@ -227,14 +228,63 @@ test('smoothing: one odd sample does not flip the result', () => {
   assert.equal(smoothLevel(['poor', 'unknown', 'poor']), 'poor');
 });
 
-test('"your connection is poor" when more than half of measured links are poor', () => {
-  assert.equal(isLocalConnectionPoor([]), false);
-  assert.equal(isLocalConnectionPoor(['unknown', 'unknown']), false);
-  assert.equal(isLocalConnectionPoor(['poor']), true);
-  assert.equal(isLocalConnectionPoor(['poor', 'good']), false);
-  assert.equal(isLocalConnectionPoor(['poor', 'poor', 'good']), true);
-  assert.equal(isLocalConnectionPoor(['poor', 'unknown', 'fair']), false);
-  assert.equal(isLocalConnectionPoor(['poor', 'unknown', 'unknown']), true);
+test('"your connection is poor" needs two or more measured links, more than half of them poor', () => {
+  assert.equal(connectionHint([]), null);
+  assert.equal(connectionHint([['a', 'unknown'], ['b', 'unknown']]), null);
+  assert.equal(connectionHint([['a', 'poor'], ['b', 'good']]), null);
+  assert.deepEqual(connectionHint([['a', 'poor'], ['b', 'poor']]), { kind: 'local' });
+  assert.deepEqual(connectionHint([['a', 'poor'], ['b', 'poor'], ['c', 'good']]), { kind: 'local' });
+  assert.equal(connectionHint([['a', 'poor'], ['b', 'fair'], ['c', 'good']]), null);
+  assert.equal(connectionHint([['a', 'poor'], ['b', 'unknown'], ['c', 'fair']]), null);
+});
+
+test('one measured link never says *your* connection is poor: it names that link', () => {
+  // 1:1 call: the other person's bad uplink (or forged reports) is about them.
+  assert.deepEqual(connectionHint([['a', 'poor']]), { kind: 'peer', peerId: 'a' });
+  assert.deepEqual(connectionHint([['a', 'poor'], ['b', 'unknown']]), { kind: 'peer', peerId: 'a' });
+  assert.equal(connectionHint([['a', 'fair']]), null);
+  assert.equal(connectionHint([['a', 'good'], ['b', 'unknown']]), null);
+});
+
+test('history: the last three levels, cleared after a long gap', () => {
+  assert.deepEqual(pushLevel([], 'good', 0), ['good']);
+  assert.deepEqual(pushLevel(['poor', 'poor', 'fair'], 'good', 2500), ['poor', 'fair', 'good']);
+  assert.deepEqual(pushLevel(['poor', 'poor', 'poor'], 'good', 60_000), ['good'], 'stale levels from before the tab was hidden are dropped');
+  assert.equal(smoothLevel(pushLevel(['poor', 'poor'], 'good', 60_000)), 'good');
+});
+
+test('implausible jitter and round trips (e.g. forged receiver reports) are ignored', () => {
+  const forged = readStats(
+    report({ inAudio: { received: 1, lost: 0, jitter: 0.02 }, outAudio: { sent: 1, remoteLost: 0, jitter: 1e6 } }),
+    null,
+    0
+  );
+  assert.equal(forged.sample.jitterMs, 20);
+  const allForged = readStats(report({ outAudio: { sent: 1, remoteLost: 0, jitter: 5 } }), null, 0);
+  assert.equal(allForged.sample.jitterMs, null);
+  assert.equal(classify(allForged.sample), 'unknown');
+  // A one-second jitter is still a (terrible) measurement.
+  assert.equal(readStats(report({ outAudio: { sent: 1, remoteLost: 0, jitter: 1 } }), null, 0).sample.jitterMs, 1000);
+  assert.equal(readStats(report({ rtt: 1e9 }), null, 0).sample.rttMs, null);
+  assert.equal(readStats(report({ rtt: -1 }), null, 0).sample.rttMs, null);
+  const rtcp: Stat[] = [{ type: 'remote-inbound-rtp', kind: 'audio', ssrc: 1, roundTripTime: 1e7 }, { type: 'remote-inbound-rtp', kind: 'video', ssrc: 2, roundTripTime: 0.08 }];
+  assert.equal(readStats(rtcp, null, 0).sample.rttMs, 80);
+});
+
+test('reported outgoing loss is capped at what we sent (a loss fraction within 0..1)', () => {
+  const a = readStats(report({ outAudio: { sent: 1000, remoteLost: 0 } }), null, 0);
+  const b = readStats(report({ outAudio: { sent: 1100, remoteLost: 1e9 } }), a.counters, 2500);
+  assert.equal(b.sample.lossOutPct, 100);
+  // Combined with an honest stream, the forged one can't exceed its own share.
+  const stats = (sentA: number, lostA: number, sentB: number, lostB: number): Stat[] => [
+    { id: 'o1', type: 'outbound-rtp', kind: 'audio', ssrc: 1, packetsSent: sentA },
+    { id: 'r1', type: 'remote-inbound-rtp', kind: 'audio', ssrc: 1, packetsLost: lostA },
+    { id: 'o2', type: 'outbound-rtp', kind: 'video', ssrc: 2, packetsSent: sentB },
+    { id: 'r2', type: 'remote-inbound-rtp', kind: 'video', ssrc: 2, packetsLost: lostB },
+  ];
+  const c = readStats(stats(0, 0, 0, 0), null, 0);
+  const d = readStats(stats(100, 1e9, 900, 0), c.counters, 2500);
+  assert.equal(d.sample.lossOutPct, 10);
 });
 
 test('formatting', () => {

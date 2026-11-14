@@ -1,44 +1,59 @@
 <script lang="ts">
-  /** A quiet hint when most of your connections are poor (likely your own network). */
+  /**
+   * A quiet one-line hint about poor connections (trusted links only; see connectionHint). It sits
+   * in the page flow with the other notices, so it never covers the stage or its toolbars.
+   */
+  import { peers } from '$lib/webrtc/mesh';
   import { connQuality } from '$lib/webrtc/conn-stats';
-  import { isLocalConnectionPoor } from '$lib/webrtc/conn-quality';
+  import { connectionHint, type QualityLevel } from '$lib/webrtc/conn-quality';
   import SignalBars from '$lib/ui/SignalBars.svelte';
 
-  $: poor = isLocalConnectionPoor(Array.from($connQuality.values(), (q) => q.level));
+  $: hint = connectionHint(Array.from($connQuality, ([id, q]): [string, QualityLevel] => [id, q.level]));
+  $: peerName = hint?.kind === 'peer' ? $peers.get(hint.peerId)?.displayName ?? null : null;
 </script>
 
 <div class="conn-hint-live" role="status">
-  {#if poor}
-    <span class="conn-hint">
+  {#if hint?.kind === 'local'}
+    <p class="conn-hint">
       <SignalBars level="poor" />
       Your connection is poor. Video may freeze or drop.
-    </span>
+    </p>
+  {:else if peerName !== null}
+    <p class="conn-hint">
+      <SignalBars level="poor" />
+      <span class="text">Connection to <span class="name">{peerName}</span> is poor.</span>
+    </p>
   {/if}
 </div>
 
 <style>
   .conn-hint-live {
-    position: absolute;
-    top: var(--space-3);
-    left: 50%;
-    transform: translateX(-50%);
-    z-index: 20;
-    max-width: calc(100% - 2 * var(--space-4));
-    pointer-events: none;
+    flex-shrink: 0;
   }
 
   .conn-hint {
-    display: inline-flex;
+    display: flex;
     align-items: center;
+    justify-content: center;
     gap: var(--space-2);
-    padding: 4px 12px;
-    border-radius: var(--radius-pill);
-    background: rgba(11, 13, 18, 0.72);
-    -webkit-backdrop-filter: blur(6px);
-    backdrop-filter: blur(6px);
-    color: #fff;
+    padding: 3px var(--space-4);
     font-size: var(--text-xs);
-    font-weight: 500;
-    text-align: center;
+    color: var(--text-muted);
+    border-bottom: 1px solid var(--border-subtle);
+    flex-shrink: 0;
+  }
+
+  .text {
+    display: inline-flex;
+    gap: 0.25em;
+    min-width: 0;
+  }
+
+  .name {
+    max-width: 16em;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    color: var(--text);
   }
 </style>
