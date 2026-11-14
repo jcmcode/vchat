@@ -21,6 +21,8 @@ export interface DocxInput {
   boxes: DocxTextBox[];
   /** Board text color that should map to the document's default (automatic) color. */
   defaultColor?: string;
+  /** Heading above the text paragraphs; null for none. Defaults to "Text on the board". */
+  textHeading?: string | null;
 }
 
 const NS_W = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main';
@@ -142,7 +144,8 @@ export function buildDocumentParts(input: DocxInput): { documentXml: string; num
   let body = `<w:p><w:pPr><w:pStyle w:val="Title"/></w:pPr><w:r><w:t xml:space="preserve">${xmlEscape(input.title)}</w:t></w:r></w:p>`;
   if (input.image) body += imageXml(input.image);
   if (input.boxes.length) {
-    body += '<w:p><w:pPr><w:pStyle w:val="Heading1"/></w:pPr><w:r><w:t>Text on the board</w:t></w:r></w:p>';
+    const heading = input.textHeading === undefined ? 'Text on the board' : input.textHeading;
+    if (heading) body += `<w:p><w:pPr><w:pStyle w:val="Heading1"/></w:pPr><w:r><w:t>${xmlEscape(heading)}</w:t></w:r></w:p>`;
     input.boxes.forEach((box, i) => {
       if (i > 0) body += '<w:p/>';
       body += boxXml(box, numbering, input.defaultColor);
