@@ -1104,7 +1104,7 @@ test('email invite: a schedule adds a When line and a valid METHOD:REQUEST invit
   assert.equal(prop('DTSTART'), `DTSTART:${iso(startsAt)}`);
   assert.equal(prop('DTEND'), `DTEND:${iso(startsAt + 90 * 60_000)}`);
   assert.equal(prop('SUMMARY'), 'SUMMARY:Planning\\, review\\; budget \\\\ next — café ☕ ünïcödé ñ');
-  assert.equal(prop('DESCRIPTION'), `DESCRIPTION:Join: ${link}\\nPasscode: ${code}`);
+  assert.equal(prop('DESCRIPTION'), `DESCRIPTION:Your code: ${code.slice(0, 3)} ${code.slice(3)}\\nOpen the link below at meeting time and enter this code.\\n\\nJoin: ${link}`);
   assert.equal(prop('URL'), `URL:${link}`);
   assert.equal(prop('LOCATION'), `LOCATION:${link}`);
   assert.equal(prop('ORGANIZER'), 'ORGANIZER;CN=vchat:mailto:invites@example.com');
@@ -1112,11 +1112,14 @@ test('email invite: a schedule adds a When line and a valid METHOD:REQUEST invit
   assert.ok(lines.includes('STATUS:CONFIRMED') && lines.includes('SEQUENCE:0'));
   assert.ok(lines.includes('BEGIN:VALARM') && lines.includes('ACTION:DISPLAY') && lines.includes('TRIGGER:-PT10M'));
 
-  // The guest's own code is in the calendar file, in the description only, labelled as the passcode
-  // (ignoring the link and timestamps, which hold random digits).
+  // The guest's own code is in the calendar file: first in the description (before the long link,
+  // which previews cut off) and in the reminder, nowhere else (ignoring the link and timestamps,
+  // which hold random digits).
+  const spaced = `${code.slice(0, 3)} ${code.slice(3)}`;
   const scrubbed = lines.filter((l) => !/^(UID|DTSTAMP|DTSTART|DTEND):/.test(l)).join('\n').split(link).join('');
-  assert.equal(scrubbed.split(code).length, 2, 'the code appears exactly once');
-  assert.ok(prop('DESCRIPTION')!.endsWith(`\\nPasscode: ${code}`));
+  assert.equal(scrubbed.split(spaced).length, 3, 'the code appears twice');
+  assert.ok(prop('DESCRIPTION')!.startsWith(`DESCRIPTION:Your code: ${spaced}`));
+  assert.ok(lines.includes(`DESCRIPTION:Video call starting. Your code: ${spaced}`));
 });
 
 test('email invite: schedule warnings (ignored when invalid, noted when the meeting outlasts the invite)', async () => {
@@ -1236,7 +1239,7 @@ test('email invite: the host message is in the email (escaped) and the calendar 
   assert.ok(mail.html.indexOf('Message from the host:') > mail.html.indexOf("You're invited to"));
   assert.ok(mail.html.indexOf('Message from the host:') < mail.html.indexOf('Join the call'));
 
-  // Calendar: above the Join line, RFC 5545 escaped and folded, then the passcode.
+  // Calendar: the code first, then the message, RFC 5545 escaped and folded, then the Join line.
   const code = codeIn(mail.text.split('Your code:')[1]);
   const link = linkIn(mail.text);
   const ics = Buffer.from(mail.attachments[0].content, 'base64').toString('utf8');
@@ -1244,7 +1247,7 @@ test('email invite: the host message is in the email (escaped) and the calendar 
   const description = ics.replace(/\r\n /g, '').split('\r\n').find((l) => l.startsWith('DESCRIPTION:'));
   assert.equal(
     description,
-    `DESCRIPTION:Agenda <b>&amp\\; "notes"</b>\\; budget\\, Q3 \\\\ café\\n\\nBring 'ideas' ☕\\n\\nJoin: ${link}\\nPasscode: ${code}`
+    `DESCRIPTION:Your code: ${code.slice(0, 3)} ${code.slice(3)}\\nOpen the link below at meeting time and enter this code.\\n\\nAgenda <b>&amp\\; "notes"</b>\\; budget\\, Q3 \\\\ café\\n\\nBring 'ideas' ☕\\n\\nJoin: ${link}`
   );
 });
 

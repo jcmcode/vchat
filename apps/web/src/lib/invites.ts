@@ -45,8 +45,10 @@ function icsDate(ms: number): string {
 
 function description(invite: MeetingInvite): string {
   return [
+    // First: the link is long, and calendar previews cut the notes off soon after it.
+    invite.password ? `Password: ${invite.password}\nOpen the link below at meeting time and enter this password.` : '',
     `Join the video call: ${invite.link}`,
-    invite.hasPassword ? 'The room password will be sent to you separately.' : '',
+    invite.hasPassword && !invite.password ? 'The room password will be sent to you separately.' : '',
     'End-to-end encrypted. No account needed — just open the link in your browser.',
   ]
     .filter(Boolean)
