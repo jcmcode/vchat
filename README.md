@@ -18,6 +18,7 @@ Your own private, end-to-end encrypted video calls. Deploy it on your domain, si
   - Named rooms (the host can rename during a call), host approval, and automatic reconnection
   - **Picture-in-picture**: pop the call out into a small always-on-top window to keep seeing people (and mute, turn the camera off or leave) while you're in another tab or app. Chromium shows everyone; Safari shows one video
   - **Connection quality** bars on each person, and round trip, packet loss and whether the connection is direct or relayed in their card. Measured in your browser and never sent anywhere
+  - **Host controls**: lock the call so nobody new can join (even with an invite), end it for everyone, and get a chime, a flashing tab title and, if you turn it on, a system notification when someone is waiting to join (it never shows who)
 
 ## How it works for you
 

@@ -16,6 +16,7 @@ import {
   Room,
   WS_PROTOCOL,
   authorizeJoin,
+  endedCalls,
   socketRole,
   handleApi,
   ipKey,
@@ -294,6 +295,16 @@ function reapIfEmpty(roomId: string): void {
   if (room && room.isEmpty() && !pendingEnters.get(roomId)) rooms.delete(roomId);
 }
 
+/**
+ * The host ended the call: members were told and closed by the Room. Close the room's other
+ * sockets too (never entered, at the password prompt, denied…), without saying why.
+ */
+function closeRoomSockets(roomId: string): void {
+  for (const client of wss.clients) {
+    if (sockets.get(client)?.roomId === roomId && client.readyState === client.OPEN) client.close(1000, 'Closing');
+  }
+}
+
 function leaveRoom(ws: WebSocket): void {
   const info = sockets.get(ws);
   if (!info) return;
@@ -361,6 +372,8 @@ async function handleMessage(ws: WebSocket, msg: ClientMessage): Promise<void> {
       else if (msg.type === 'admit-peer') room.admitPeer(ws, msg.peerId);
       else if (msg.type === 'deny-peer') room.denyPeer(ws, msg.peerId);
       else if (msg.type === 'remove-peer') room.removePeer(ws, msg.peerId);
+      else if (msg.type === 'lock-room' || msg.type === 'unlock-room') room.setLocked(ws, msg.type === 'lock-room');
+      else if (msg.type === 'end-room' && room.endRoom(ws)) closeRoomSockets(info.roomId);
       reapIfEmpty(info.roomId);
     }
   }
@@ -432,6 +445,7 @@ const housekeeping = setInterval(() => {
     reapIfEmpty(id);
     peers += room.peers().length;
   }
+  endedCalls.sweep();
   sweepApiState();
   if (DEBUG_LOGS && ++ticks % 12 === 0 && rooms.size > 0) {
     console.log(`[stats] ${rooms.size} room(s), ${peers} peer(s)`);
