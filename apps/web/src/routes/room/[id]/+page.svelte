@@ -92,7 +92,7 @@
     roomUrl,
     apiUrl,
   } from '$lib/stores/room';
-  import { whiteboardOpen, whiteboardNotice, openWhiteboard, closeWhiteboard } from '$lib/collab/whiteboard';
+  import { whiteboardOpen, whiteboardNotice, boardKind, openWhiteboard, closeWhiteboard, type BoardKind } from '$lib/collab/whiteboard';
   import { clearScreen, annotationTool } from '$lib/collab/annotations';
   import { gamesOpen, gameNotice, openGames, closeGames } from '$lib/games/games';
   import { GAME_NAMES } from '$lib/games/session-model';
@@ -816,9 +816,9 @@
     else showWhiteboard();
   }
 
-  function showWhiteboard() {
+  function showWhiteboard(kind?: BoardKind) {
     closeGames();
-    openWhiteboard();
+    openWhiteboard(kind);
   }
 
   function toggleGames() {
@@ -1307,11 +1307,12 @@
       </div>
     {/if}
 
-    {#if $whiteboardNotice && !$whiteboardOpen}
+    {#if $whiteboardNotice && !($whiteboardOpen && $boardKind === $whiteboardNotice.kind)}
+      {@const noticeKind = $whiteboardNotice.kind}
       <div class="banner info" role="status">
-        <Icon name="whiteboard" size={16} />
-        <span>{$whiteboardNotice.name} opened the whiteboard.</span>
-        <button class="banner-btn" on:click={showWhiteboard}>Open it</button>
+        <Icon name={noticeKind === 'paper' ? 'file-text' : 'whiteboard'} size={16} />
+        <span>{$whiteboardNotice.name} opened the {noticeKind === 'paper' ? 'document' : 'whiteboard'}.</span>
+        <button class="banner-btn" on:click={() => showWhiteboard(noticeKind)}>Open it</button>
         <button class="banner-dismiss" on:click={() => whiteboardNotice.set(null)} aria-label="Dismiss">
           <Icon name="x" size={14} />
         </button>
@@ -1337,7 +1338,9 @@
           {#if stage}
             <section class="stage" bind:this={stageEl} aria-label={stage === 'whiteboard' ? 'Whiteboard' : stage === 'games' ? 'Games' : stage === 'pinned' ? 'Pinned participant' : 'Shared screen'}>
               {#if stage === 'whiteboard'}
-                <Whiteboard on:close={closeWhiteboard} />
+                {#key $boardKind}
+                  <Whiteboard kind={$boardKind} on:close={closeWhiteboard} />
+                {/key}
               {:else if stage === 'games'}
                 <GamesPanel on:close={closeGames} />
               {:else if stage === 'local-screen'}

@@ -1,11 +1,34 @@
 <script lang="ts">
-  // Shared infinite whiteboard. Drawing data is in shared world coordinates; the view (pan/zoom)
-  // is yours alone. Pan: scroll / two-finger scroll, Hand tool, Space+drag, middle mouse, two
+  // Shared infinite whiteboard, or the shared Document (the same tools on stacked A4 pages).
+  // Drawing data is in shared world coordinates; the view (pan/zoom) is yours alone. Pan: scroll / two-finger scroll, Hand tool, Space+drag, middle mouse, two
   // fingers on touch. Zoom: Ctrl/Cmd+wheel, trackpad or touch pinch, the zoom buttons.
   import { onDestroy, onMount, createEventDispatcher } from 'svelte';
   import Icon from '$lib/ui/Icon.svelte';
   import TextEditor, { type TextChange } from './whiteboard/TextEditor.svelte';
+  import { boards, showBoard, type BoardKind, type TextFields } from '$lib/collab/whiteboard';
+  import { exportDocx, exportPaperDocx, exportPaperPdf, exportPdf, exportPng } from '$lib/collab/export';
+  import { drawStroke, itemBounds, prepareCanvas, worldView } from '$lib/collab/render';
+  import { BOX_DEFAULT_WIDTH, WORLD, WORLD_LIMIT, contentBounds, focusBounds, newStrokeId } from '$lib/collab/strokes';
   import {
+    MAX_PAGES,
+    PAGE_GAP,
+    PAGE_H,
+    PAGE_MARGIN,
+    PAGE_W,
+    documentHeight,
+    pageAt,
+    pageTop,
+    pagesForContent,
+  } from '$lib/collab/paper';
+  import { measuredTextBounds } from '$lib/collab/render';
+  import type { StrokeSender } from '$lib/collab/stroke-sender';
+
+  /** Which shared board to show. The parent re-creates this component when it changes. */
+  export let kind: BoardKind = 'board';
+
+  const dispatch = createEventDispatcher<{ close: void }>();
+  const api = boards[kind];
+  const {
     board,
     boardVersion,
     boardStatus,
@@ -22,15 +45,12 @@
     undoLast,
     clearAll,
     localPeerId,
-    type TextFields,
-  } from '$lib/collab/whiteboard';
-  import { exportDocx, exportPdf, exportPng } from '$lib/collab/export';
-  import { drawStroke, itemBounds, prepareCanvas, worldView } from '$lib/collab/render';
-  import { BOX_DEFAULT_WIDTH, WORLD, WORLD_LIMIT, focusBounds, newStrokeId } from '$lib/collab/strokes';
-  import { measuredTextBounds } from '$lib/collab/render';
-  import type { StrokeSender } from '$lib/collab/stroke-sender';
-
-  const dispatch = createEventDispatcher<{ close: void }>();
+  } = api;
+  const isPaper = kind === 'paper';
+  const KINDS: { id: BoardKind; icon: string; label: string; title: string }[] = [
+    { id: 'board', icon: 'whiteboard', label: 'Board', title: 'Infinite whiteboard' },
+    { id: 'paper', icon: 'file-text', label: 'Document', title: 'A4 document' },
+  ];
 
   type WbTool = 'pen' | 'highlighter' | 'text' | 'eraser' | 'hand';
   const COLORS = ['#111827', '#ef4444', '#f59e0b', '#10b981', '#3b82f6', '#8b5cf6'];
@@ -60,7 +80,7 @@
     { id: 'hand', icon: 'hand', label: 'Hand (pan)', key: 'H' },
   ];
 
-  let tool: WbTool = 'pen';
+  let tool: WbTool = isPaper ? 'text' : 'pen';
   let color = COLORS[0];
   let sizeIndex = 1;
   let textSize = TEXT_SIZES[1].size;
@@ -81,9 +101,41 @@
   let camY = 0;
   let zoom = 1;
 
+  // ── Pages (document only) ──
+  /** Blank pages you added (local until someone writes on them). */
+  let addedPages = savedView.pages ?? 1;
+  /** Pages shown: enough for everything on the document, and at least the ones you added. */
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars
+  const pageCount = (_version: number, added: number) =>
+    isPaper ? Math.max(added, pagesForContent(contentBounds(board, measuredTextBounds))) : 1;
+  $: pages = pageCount($boardVersion, addedPages);
+
+  function addPage() {
+    if (pages >= MAX_PAGES) {
+      showNotice(`A document can have up to ${MAX_PAGES} pages.`);
+      return;
+    }
+    addedPages = pages + 1;
+    savedView.pages = addedPages;
+    pages = addedPages;
+    camY = pageTop(addedPages - 1) - 24 / zoom;
+    clampCam();
+  }
+
   const clamp = (v: number, min: number, max: number) => Math.min(Math.max(v, min), max);
 
   function clampCam() {
+    if (isPaper) {
+      // Scroll like a document viewer: stop a little past the pages' edges, and keep the pages
+      // centred when they're smaller than the view.
+      const vw = viewW / zoom;
+      const vh = viewH / zoom;
+      const m = 40 / zoom;
+      const h = documentHeight(pages);
+      camX = clamp(camX, Math.min(-m, (PAGE_W - vw) / 2), Math.max(PAGE_W - vw + m, (PAGE_W - vw) / 2));
+      camY = clamp(camY, Math.min(-m, (h - vh) / 2), Math.max(h - vh + m, (h - vh) / 2));
+      return;
+    }
     const lim = WORLD_LIMIT * 1.1;
     camX = clamp(camX, -lim, lim);
     camY = clamp(camY, -lim, lim);
@@ -109,7 +161,19 @@
     zoomAround(viewW / 2, viewH / 2, 1);
   }
 
+  /** Document: page width fills the view, on the page you're looking at (or `page`). */
+  function fitPageWidth(page?: number) {
+    if (viewW <= 0 || viewH <= 0) return;
+    const centerY = camY + viewH / 2 / zoom;
+    const i = page ?? clamp(Math.floor(centerY / (PAGE_H + PAGE_GAP)), 0, pages - 1);
+    zoom = clamp((viewW - 48) / PAGE_W, MIN_ZOOM, 1.25);
+    camX = PAGE_W / 2 - viewW / 2 / zoom;
+    camY = pageTop(i) - 24 / zoom;
+    clampCam();
+  }
+
   function fitContent() {
+    if (isPaper) return fitPageWidth();
     const b = focusBounds(board, measuredTextBounds);
     if (!b || viewW <= 0 || viewH <= 0) {
       zoom = 1;
@@ -154,6 +218,38 @@
     const maxX = camX + w / zoom;
     const maxY = camY + h / zoom;
     const hidden = editing?.id;
+    if (isPaper) {
+      // White A4 sheets on the desk; everything is clipped to the pages (like the PDF export).
+      ctx.save();
+      ctx.shadowColor = 'rgba(15, 23, 42, 0.18)';
+      ctx.shadowBlur = 12;
+      ctx.shadowOffsetY = 2;
+      ctx.fillStyle = '#ffffff';
+      const clipPath = new Path2D();
+      for (let i = 0; i < pages; i++) {
+        const top = pageTop(i);
+        if (top > maxY || top + PAGE_H < minY) continue;
+        const r: [number, number, number, number] = [(0 - camX) * zoom, (top - camY) * zoom, PAGE_W * zoom, PAGE_H * zoom];
+        ctx.fillRect(...r);
+        clipPath.rect(...r);
+      }
+      ctx.restore();
+      if (pages > 1) {
+        ctx.save();
+        ctx.fillStyle = '#6b7280';
+        ctx.font = '12px system-ui, sans-serif';
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'middle';
+        for (let i = 0; i < pages; i++) {
+          const y = pageTop(i) + PAGE_H + PAGE_GAP / 2;
+          if (y < minY || y > maxY) continue;
+          ctx.fillText(`${i + 1} / ${pages}`, (PAGE_W / 2 - camX) * zoom, (y - camY) * zoom);
+        }
+        ctx.restore();
+      }
+      ctx.save();
+      ctx.clip(clipPath);
+    }
     for (const s of board.strokes.values()) {
       if (s.id === hidden) continue;
       const b = itemBounds(s);
@@ -174,10 +270,11 @@
         ctx.restore();
       }
     }
+    if (isPaper) ctx.restore();
   }
 
   $: $boardVersion, onBoardChanged();
-  $: camX, camY, zoom, tool, viewW, viewH, requestDraw();
+  $: camX, camY, zoom, tool, viewW, viewH, pages, requestDraw();
 
   // Dot grid that moves with the view (CSS background, so it costs nothing to redraw).
   function gridStep(z: number): number {
@@ -188,7 +285,7 @@
   }
   const mod = (a: number, n: number) => ((a % n) + n) % n;
   $: grid = gridStep(zoom);
-  $: gridStyle = `background-size: ${grid}px ${grid}px; background-position: ${mod(-camX * zoom - grid / 2, grid)}px ${mod(-camY * zoom - grid / 2, grid)}px;`;
+  $: gridStyle = isPaper ? '' : `background-size: ${grid}px ${grid}px; background-position: ${mod(-camX * zoom - grid / 2, grid)}px ${mod(-camY * zoom - grid / 2, grid)}px;`;
 
   let resizeObserver: ResizeObserver;
   onMount(() => {
@@ -196,6 +293,8 @@
     viewH = wrap.clientHeight;
     if (savedView.cam) {
       ({ x: camX, y: camY, zoom } = savedView.cam);
+    } else if (isPaper) {
+      fitPageWidth(0);
     } else if (board.strokes.size > 0) {
       fitContent();
     } else {
@@ -218,6 +317,7 @@
 
   onDestroy(() => {
     savedView.cam = { x: camX, y: camY, zoom };
+    if (isPaper) savedView.pages = addedPages;
     if (sender) finishStroke(sender);
     if (editing) finishEditing();
     resizeObserver?.disconnect();
@@ -368,7 +468,9 @@
     activeType = e.pointerType;
     modeStartedAt = now;
 
-    if (middle || spaceDown || tool === 'hand') {
+    // On the document, dragging the desk around the pages pans (you can only write on a page).
+    const offPage = isPaper && !penEraser && tool !== 'eraser' && pageAt(p.x, p.y, pages) < 0;
+    if (middle || spaceDown || tool === 'hand' || offPage) {
       e.preventDefault();
       mode = 'pan';
       panLast = { x: e.clientX, y: e.clientY };
@@ -471,14 +573,22 @@
 
   function beginDraft(x: number, y: number) {
     const size = textSize;
+    let boxX = Math.round(x);
+    let boxWidth = BOX_DEFAULT_WIDTH;
+    if (isPaper) {
+      // On a page, text starts at the left margin (or where you clicked) and runs to the right margin.
+      boxX = clamp(boxX, PAGE_MARGIN, PAGE_W - PAGE_MARGIN - 160);
+      if (boxX < PAGE_MARGIN + 24) boxX = PAGE_MARGIN;
+      boxWidth = PAGE_W - PAGE_MARGIN - boxX;
+    }
     editing = {
       id: newStrokeId(localPeerId()),
       created: false,
       text: '',
       color,
       size,
-      boxWidth: BOX_DEFAULT_WIDTH,
-      x: Math.round(x),
+      boxWidth,
+      x: boxX,
       // Put the first line's middle where you clicked.
       y: Math.round(y - (size * 1.35) / 2),
       seenV: 0,
@@ -649,16 +759,19 @@
     if (exportOpen && exportMenu && !exportMenu.contains(e.target as Node)) exportOpen = false;
   }
 
-  async function doExport(kind: 'png' | 'pdf' | 'docx') {
+  async function doExport(format: 'png' | 'pdf' | 'docx') {
     exportOpen = false;
     flushSave();
     exporting = true;
     try {
-      if (kind === 'pdf') await exportPdf(board);
-      else if (kind === 'docx') await exportDocx(board);
+      if (isPaper) {
+        if (format === 'pdf') await exportPaperPdf(board, pages);
+        else await exportPaperDocx(board);
+      } else if (format === 'pdf') await exportPdf(board);
+      else if (format === 'docx') await exportDocx(board);
       else await exportPng(board);
     } catch {
-      showNotice('Export failed. The board may be too large for this browser.');
+      showNotice(isPaper ? 'Export failed.' : 'Export failed. The board may be too large for this browser.');
     } finally {
       exporting = false;
     }
@@ -692,8 +805,24 @@
   on:click={onWindowClick}
 />
 
-<section class="whiteboard" aria-label="Shared whiteboard">
-  <div class="toolbar" role="toolbar" aria-label="Whiteboard tools">
+<section class="whiteboard" aria-label={isPaper ? 'Shared document' : 'Shared whiteboard'}>
+  <div class="toolbar" role="toolbar" aria-label={isPaper ? 'Document tools' : 'Whiteboard tools'}>
+    <div class="group" role="group" aria-label="Board type">
+      <div class="seg">
+        {#each KINDS as k}
+          <button
+            class="seg-btn"
+            class:active={kind === k.id}
+            on:click={() => showBoard(k.id)}
+            title={k.title}
+            aria-pressed={kind === k.id}
+          >
+            <Icon name={k.icon} size={16} /><span class="lbl">{k.label}</span>
+          </button>
+        {/each}
+      </div>
+    </div>
+
     <div class="group" role="group" aria-label="Tool">
       {#each TOOLS as t}
         <button
@@ -742,6 +871,14 @@
       {/each}
     </div>
 
+    {#if isPaper}
+      <div class="group" role="group" aria-label="Pages">
+        <button class="tool labeled" on:click={addPage} title="Add a page at the end" disabled={pages >= MAX_PAGES}>
+          <Icon name="plus" size={16} /><span class="lbl">Page</span>
+        </button>
+      </div>
+    {/if}
+
     <div class="group" role="group" aria-label="Edit">
       <button class="tool" on:click={handleUndo} title="Undo your last mark (Ctrl/Cmd+Z)" aria-label="Undo" aria-keyshortcuts="Control+Z Meta+Z">
         <Icon name="undo" size={18} />
@@ -750,7 +887,7 @@
         class="tool"
         class:danger={confirmingClear}
         on:click={handleClear}
-        title="Clear the board for everyone"
+        title={isPaper ? 'Clear the document for everyone' : 'Clear the board for everyone'}
         aria-label={confirmingClear ? 'Clear for everyone?' : 'Clear'}
       >
         <Icon name="trash" size={18} />
@@ -765,7 +902,7 @@
           class:open={exportOpen}
           on:click={() => (exportOpen = !exportOpen)}
           disabled={exporting}
-          title="Export the board"
+          title={isPaper ? 'Export the document' : 'Export the board'}
           aria-haspopup="menu"
           aria-expanded={exportOpen}
         >
@@ -773,25 +910,34 @@
         </button>
         {#if exportOpen}
           <div class="menu" role="menu">
-            <button class="menu-item" role="menuitem" on:click={() => doExport('pdf')} title="Download as PDF">
-              <Icon name="file-text" size={16} /> PDF document
-            </button>
-            <button class="menu-item" role="menuitem" on:click={() => doExport('docx')} title="Download as an editable Word document (picture + text)">
-              <Icon name="file-doc" size={16} /> Word document (.docx)
-            </button>
-            <button class="menu-item" role="menuitem" on:click={() => doExport('png')} title="Download as PNG image">
-              <Icon name="image" size={16} /> PNG image
-            </button>
+            {#if isPaper}
+              <button class="menu-item" role="menuitem" on:click={() => doExport('pdf')} title="Download as an A4 PDF, one page per page">
+                <Icon name="file-text" size={16} /> PDF (A4 pages)
+              </button>
+              <button class="menu-item" role="menuitem" on:click={() => doExport('docx')} title="Download the text as an editable Word document">
+                <Icon name="file-doc" size={16} /> Word document (.docx)
+              </button>
+            {:else}
+              <button class="menu-item" role="menuitem" on:click={() => doExport('pdf')} title="Download as PDF">
+                <Icon name="file-text" size={16} /> PDF document
+              </button>
+              <button class="menu-item" role="menuitem" on:click={() => doExport('docx')} title="Download as an editable Word document (picture + text)">
+                <Icon name="file-doc" size={16} /> Word document (.docx)
+              </button>
+              <button class="menu-item" role="menuitem" on:click={() => doExport('png')} title="Download as PNG image">
+                <Icon name="image" size={16} /> PNG image
+              </button>
+            {/if}
           </div>
         {/if}
       </div>
-      <button class="tool" on:click={() => dispatch('close')} title="Close whiteboard (stays shared)" aria-label="Close whiteboard">
+      <button class="tool" on:click={() => dispatch('close')} title="Close (stays shared)" aria-label={isPaper ? 'Close document' : 'Close whiteboard'}>
         <Icon name="x" size={18} />
       </button>
     </div>
   </div>
 
-  <div class="board-wrap" bind:this={wrap} style={gridStyle}>
+  <div class="board-wrap" class:paper={isPaper} bind:this={wrap} style={gridStyle}>
     <canvas
       bind:this={canvas}
       class="board"
@@ -800,7 +946,7 @@
       class:grab={tool === 'hand' || spaceDown}
       class:grabbing={panning}
       tabindex="-1"
-      aria-label="Whiteboard canvas. Scroll to pan, Ctrl or Cmd plus scroll to zoom."
+      aria-label="{isPaper ? 'Document pages' : 'Whiteboard canvas'}. Scroll to pan, Ctrl or Cmd plus scroll to zoom."
       on:pointerdown={onPointerDown}
       on:pointermove={onPointerMove}
       on:pointerup={onPointerUp}
@@ -838,7 +984,7 @@
       <button class="zbtn" on:click={() => zoomBy(1.25)} title="Zoom in (+)" aria-label="Zoom in" aria-keyshortcuts="+">
         <Icon name="zoom-in" size={16} />
       </button>
-      <button class="zbtn" on:click={fitContent} title="Fit to content (1)" aria-label="Fit to content" aria-keyshortcuts="1">
+      <button class="zbtn" on:click={fitContent} title={isPaper ? 'Fit page width (1)' : 'Fit to content (1)'} aria-label={isPaper ? 'Fit page width' : 'Fit to content'} aria-keyshortcuts="1">
         <Icon name="fit" size={16} />
       </button>
     </div>
@@ -1055,6 +1201,51 @@
     background-image: radial-gradient(circle, #d3d7df 1px, transparent 1.3px);
     overflow: hidden;
     touch-action: none;
+  }
+
+  .board-wrap.paper {
+    /* The desk around the pages. */
+    background-color: #e5e7eb;
+    background-image: none;
+  }
+
+  .seg {
+    display: inline-flex;
+    padding: 2px;
+    gap: 2px;
+    border-radius: var(--radius);
+    background: var(--bg-hover);
+  }
+
+  .seg-btn {
+    height: 30px;
+    display: inline-flex;
+    align-items: center;
+    gap: 0.35rem;
+    padding: 0 0.6rem;
+    border: none;
+    border-radius: var(--radius-sm);
+    background: transparent;
+    color: var(--text-muted);
+    font: inherit;
+    font-size: var(--text-sm);
+    font-weight: 600;
+    cursor: pointer;
+  }
+
+  .seg-btn:hover {
+    color: var(--text);
+  }
+
+  .seg-btn.active {
+    background: var(--bg-surface);
+    color: var(--text);
+    box-shadow: var(--shadow-sm);
+  }
+
+  .seg-btn:focus-visible {
+    outline: 2px solid var(--accent-ring);
+    outline-offset: 1px;
   }
 
   .board {
