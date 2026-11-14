@@ -16,7 +16,8 @@ export type SignalingEventType =
   | 'host-changed'
   | 'replaced'
   | 'lock-changed'
-  | 'room-ended';
+  | 'room-ended'
+  | 'reconnect-needed';
 
 export interface SignalingEvent {
   type: SignalingEventType | string;
@@ -54,7 +55,15 @@ const REFUSED_CLOSE_CODE = 4003;
 const ENDED_CLOSE_CODE = 4004;
 /** The host locked the room, so this new join attempt was refused. */
 const LOCKED_CLOSE_CODE = 4005;
+/** The call this connection was waiting to join is no longer available (it was ended). */
+const UNAVAILABLE_CLOSE_CODE = 4006;
 const PONG_TIMEOUT_MS = 10_000;
+/**
+ * Out of touch with the server for longer than this (a sleeping laptop, a long outage), we don't
+ * walk back into the call on our own: it may have ended or changed, and our camera and mic are
+ * live. Matches how long the server remembers an ended call (core/ended.ts).
+ */
+export const LONG_OFFLINE_MS = 60_000;
 
 export class SignalingClient {
   private ws: WebSocket | null = null;
@@ -69,8 +78,21 @@ export class SignalingClient {
   private intent: RoomIntent | null = null;
   /** The host ended the call: this client is finished for good. */
   private ended = false;
+  /** Last time we heard from the server while taking part (0 = never). */
+  private lastAlive = 0;
+  /** Back after a long time offline: wait for the user before re-entering (see LONG_OFFLINE_MS). */
+  private held = false;
 
   constructor(private readonly url: string) {}
+
+  /** After a long time offline the user chose to go back in. */
+  resumeAfterLongOffline(): void {
+    if (!this.held) return;
+    this.held = false;
+    this.lastAlive = Date.now();
+    // If the socket is down right now, the next connection re-enters as usual.
+    if (this.ws?.readyState === WebSocket.OPEN && this.intent) this.sendEnter(this.intent.isCreator);
+  }
 
   private markEnded(): void {
     this.ended = true;
@@ -93,8 +115,16 @@ export class SignalingClient {
       this.reconnectAttempts = 0;
       this.startKeepalive();
       this.emit({ type: 'connected' });
+      if (!this.intent) return;
+      // Back after a long time out of touch: ask first (see LONG_OFFLINE_MS). Short blips re-enter.
+      if (this.held || (this.intent.admitted && this.lastAlive > 0 && Date.now() - this.lastAlive > LONG_OFFLINE_MS)) {
+        this.held = true;
+        this.emit({ type: 'reconnect-needed' });
+        return;
+      }
       // Re-enter the room after a reconnect. The server lets us straight back in thanks to our secret.
-      if (this.intent) this.sendEnter(this.intent.isCreator);
+      this.lastAlive = Date.now();
+      this.sendEnter(this.intent.isCreator);
     };
 
     ws.onmessage = (event) => {
@@ -104,6 +134,7 @@ export class SignalingClient {
       } catch {
         return;
       }
+      if (!this.held) this.lastAlive = Date.now();
       if (msg.type === 'pong') {
         if (this.pongTimer) clearTimeout(this.pongTimer);
         this.pongTimer = null;
@@ -152,12 +183,18 @@ export class SignalingClient {
         this.emit({ type: 'replaced' });
         return;
       }
-      if (event.code === REMOVED_CLOSE_CODE || event.code === REFUSED_CLOSE_CODE || event.code === LOCKED_CLOSE_CODE) {
+      if (
+        event.code === REMOVED_CLOSE_CODE ||
+        event.code === REFUSED_CLOSE_CODE ||
+        event.code === LOCKED_CLOSE_CODE ||
+        event.code === UNAVAILABLE_CLOSE_CODE
+      ) {
         // The server has already said why ('removed' or an error message); don't knock again.
         this.shouldReconnect = false;
         this.intent = null;
         if (event.code === REMOVED_CLOSE_CODE) this.emit({ type: 'removed' });
         if (event.code === LOCKED_CLOSE_CODE) this.emit({ type: 'error', message: 'Room is locked' });
+        if (event.code === UNAVAILABLE_CLOSE_CODE) this.emit({ type: 'error', message: 'Call no longer available' });
         return;
       }
       this.scheduleReconnect();

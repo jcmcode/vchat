@@ -113,18 +113,34 @@ export const hostPeerIdStore = writable<string | null>(null);
 export const localPeerIdStore = writable<string>('');
 /** The host has locked the room: the server refuses anyone new (as reported by the server). */
 export const roomLocked = writable<boolean>(false);
-/** The call was ended for everyone: by the host, or by you as the host. Cleared on the next join. */
+/** The call was ended for everyone: by the host, or by you as the host. Cleared on leaving and joining. */
 export const callEnded = writable<'host' | 'you' | null>(null);
 /** We're in the room right now (admitted on this connection; false while reconnecting). */
 export const roomJoined = writable<boolean>(false);
-/** Why the server refused our last lock/unlock/end request ('' if it didn't). */
+/** Why the server refused our last host request (lock/unlock/end/remove; '' if it didn't). */
 export const hostActionError = writable<string>('');
+/** Back after a long time offline: we wait for the user to choose to go back in (resumeConnection). */
+export const reconnectPrompt = writable<boolean>(false);
+/** How long to wait for the server to confirm a lock change or the end of the call. */
+export const HOST_ACTION_TIMEOUT_MS = 6000;
 
 const HOST_ACTION_ERRORS: Record<string, string> = {
   'Only the host can lock the room': "Couldn't lock the call: you're not the host any more.",
   'Only the host can unlock the room': "Couldn't unlock the call: you're not the host any more.",
   'Only the host can end the call': "Couldn't end the call: you're not the host any more.",
+  'Only the host can remove peers': "Couldn't remove them: you're not the host any more.",
+  "The room's creator can't be removed": "The person who created this room can't be removed.",
+  "The owner can't be removed": "The room's owner can't be removed.",
 };
+
+/** Refusals that won't change by trying again: they end our part in the call, even before admission. */
+const ENDS_THE_CALL = new Set(['Room is locked', 'Call no longer available']);
+
+/** Clear a room error left on screen (and "call ended"), e.g. before showing another room. */
+export function clearRoomError(): void {
+  roomError.set('');
+  callEnded.set(null);
+}
 
 // ── Extension points for collaboration features ─────────────────────────────
 // Whiteboard, annotations etc. register their own data-channel message types here, so they ride
@@ -340,6 +356,8 @@ const FATAL_ERRORS: Record<string, string> = {
   'Too many password attempts': 'Too many wrong passwords for this room. Try again in a few minutes.',
   'Removed by host': 'The host removed you from this call.',
   'Room is locked': 'This call is locked by the host, so nobody new can join. Ask the host to unlock it, then open the link again.',
+  'Call no longer available': 'This call is no longer available.',
+  'Too many new rooms': 'Too many new rooms were opened from your network. Try again in a few minutes.',
 };
 
 /** "Can't reach the call server" clears itself on reconnect; every other room error ends the call. */
@@ -406,6 +424,15 @@ let localSpeakingCleanup: (() => void) | null = null;
 let joinGeneration = 0;
 /** We (as host) asked the server to end the call, so its `room-ended` is our own doing. */
 let endRequested = false;
+let endRequestTimer: ReturnType<typeof setTimeout> | null = null;
+/** We were the host of a locked room when our connection dropped: lock it again if it came back open. */
+let relockOnRejoin = false;
+
+function clearEndRequest(): void {
+  endRequested = false;
+  if (endRequestTimer) clearTimeout(endRequestTimer);
+  endRequestTimer = null;
+}
 
 // Anything a participant sends us is untrusted. Bound size and rate per peer so a misbehaving
 // participant can't freeze or crash everyone else's tab.
@@ -554,7 +581,9 @@ export async function joinRoom(opts: JoinOptions): Promise<void> {
   callEnded.set(null);
   roomJoined.set(false);
   hostActionError.set('');
-  endRequested = false;
+  reconnectPrompt.set(false);
+  clearEndRequest();
+  relockOnRejoin = false;
   knownNames.clear();
   serverNames.clear();
   claimedNames.clear();
@@ -605,7 +634,7 @@ export async function joinRoom(opts: JoinOptions): Promise<void> {
     // After this event has been delivered to every listener.
     queueMicrotask(() => {
       if (generation !== joinGeneration) return;
-      leaveRoom();
+      leaveRoom({ keepError: true });
       for (const handler of forcedOutHandlers) handler();
     });
   };
@@ -620,21 +649,30 @@ export async function joinRoom(opts: JoinOptions): Promise<void> {
   on('lock-changed', (event) => {
     roomLocked.set(event.locked === true);
     hostActionError.set('');
+    relockOnRejoin = false;
   });
   on('disconnected', () => roomJoined.set(false));
+  // Back after a long time offline: the signaling client waits for the user (resumeConnection).
+  on('reconnect-needed', () => reconnectPrompt.set(true));
+  // Rejoined as host, but the room came back unlocked (it emptied, or the server restarted): we
+  // locked it, so lock it again. (The server answers room-peers, then lock-changed if it's still
+  // locked, then host-changed.)
+  on('host-changed', (event) => {
+    if (relockOnRejoin && event.hostPeerId === localPeerId && !get(roomLocked)) signalingClient?.setRoomLocked(true);
+    relockOnRejoin = false;
+  });
   on('error', (event) => {
     const hostError = HOST_ACTION_ERRORS[String(event.message)];
     if (hostError) hostActionError.set(hostError);
-    if (event.message === 'Only the host can end the call') endRequested = false;
-    // Refused because the host locked the room. We never got in: release the camera and forget the
-    // invite in this tab, as being removed does (the client won't knock again either).
-    if (event.message === 'Room is locked') forceOut(FATAL_ERRORS['Room is locked']);
+    if (event.message === 'Only the host can end the call') clearEndRequest();
   });
 
   on('room-peers', (event) => {
     admissionState.set('none');
     admitted.set(true);
     roomError.set('');
+    reconnectPrompt.set(false);
+    relockOnRejoin = get(roomLocked) && get(hostStatus);
     roomLocked.set(false); // the server follows up with lock-changed if the room is locked
     roomJoined.set(true);
     const existingPeers = event.peers as { id: string; displayName: string }[];
@@ -706,8 +744,15 @@ export async function joinRoom(opts: JoinOptions): Promise<void> {
   on('error', (event) => {
     const message = String(event.message ?? '');
     const friendly = FATAL_ERRORS[message] ?? (message.startsWith('Invalid roomId') ? 'That room code is not valid.' : '');
-    if (friendly) roomError.set(friendly);
-    else console.warn('Signaling error:', message);
+    if (!friendly) {
+      console.warn('Signaling error:', message);
+      return;
+    }
+    // Once in the call, a fatal error (the invite expired by the time we reconnected, the room is
+    // full…) ends it like a removal: connections, remote audio, picture-in-picture, wake lock and
+    // devices all go now. So do refusals that won't change (locked, no longer available).
+    if (ENDS_THE_CALL.has(message) || (get(admitted) && !isTransientRoomError(friendly))) forceOut(friendly);
+    else roomError.set(friendly);
   });
 
   // Tell peers when we mute/unmute or turn the camera on/off. They accept 2 of these a second, so
@@ -743,8 +788,13 @@ export function submitRoomPassword(password: string): void {
   signalingClient?.retryWithPassword(password);
 }
 
-export function leaveRoom(): void {
+/**
+ * End our part in the call and forget it. Any room error left on screen goes too, so it can't cover
+ * the next room opened in this tab; only a forced exit (`keepError`) leaves its message up.
+ */
+export function leaveRoom(opts: { keepError?: boolean } = {}): void {
   joinGeneration++;
+  if (!opts.keepError) clearRoomError();
   if (iceRefreshTimer) clearTimeout(iceRefreshTimer);
   iceRefreshTimer = null;
   for (const cleanup of speakingDetectorCleanups.values()) cleanup();
@@ -796,7 +846,9 @@ export function leaveRoom(): void {
   roomLocked.set(false);
   roomJoined.set(false);
   hostActionError.set('');
-  endRequested = false;
+  reconnectPrompt.set(false);
+  clearEndRequest();
+  relockOnRejoin = false;
   typingPeers.set(new Set());
   reactions.set([]);
   speakingPeers.set(new Set());
@@ -841,9 +893,18 @@ export function setRoomLocked(locked: boolean): boolean {
 /** Host only (enforced by the server): end the call for everyone. Returns false if not connected. */
 export function endCallForEveryone(): boolean {
   hostActionError.set('');
+  clearEndRequest();
   if (!signalingClient || !get(roomJoined)) return false;
   endRequested = signalingClient.endRoom();
+  // No answer in time (the host menu says so): a later room-ended isn't taken as our own doing.
+  if (endRequested) endRequestTimer = setTimeout(clearEndRequest, HOST_ACTION_TIMEOUT_MS);
   return endRequested;
+}
+
+/** Back after a long time offline: the user chose to go back into the call. */
+export function resumeConnection(): void {
+  reconnectPrompt.set(false);
+  signalingClient?.resumeAfterLongOffline();
 }
 
 /**
