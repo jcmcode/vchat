@@ -15,13 +15,13 @@
 
   const GAMES: Array<{ kind: GameKind; blurb: string }> = [
     { kind: 'chess', blurb: 'The classic. Full rules, check to checkmate.' },
-    { kind: 'pool', blurb: '8-ball. Aim, set your power and shoot.' },
+    { kind: 'pool2', blurb: '8-ball. Aim, set your power and shoot.' },
     { kind: 'connect4', blurb: 'Drop discs, get four in a row.' },
   ];
   const SEATS: Record<GameKind, [string, string]> = {
     chess: ['White', 'Black'],
     connect4: ['Red', 'Yellow'],
-    pool: ['', ''],
+    pool2: ['', ''],
   };
   const REASONS: Record<string, string> = {
     checkmate: 'by checkmate',
@@ -72,7 +72,7 @@
   $: awayId = session && !result ? session.players.find((id) => !here.has(id)) ?? null : null;
   $: turn = session ? turnOf(session) : 0;
   $: canMove = !!session && inPlay && seat === turn;
-  $: if (session?.kind !== 'pool') {
+  $: if (session?.kind !== 'pool2') {
     rolling = false;
     poolView = null;
   }
@@ -87,13 +87,19 @@
 
   function seatLabel(i: number): string {
     if (!session) return '';
-    if (session.kind !== 'pool') return SEATS[session.kind][i];
+    if (session.kind !== 'pool2') return SEATS[session.kind][i];
     const group = (poolView ?? (session.state as PoolState)).groups[i];
     return group === 'solid' ? 'Solids' : group === 'stripe' ? 'Stripes' : '';
   }
 
+  /** Pool: 'solid' or 'stripe' once this seat's group is decided. */
+  function poolGroup(i: number): string | null {
+    if (session?.kind !== 'pool2') return null;
+    return (poolView ?? (session.state as PoolState)).groups[i];
+  }
+
   function poolLeft(i: number): number | null {
-    if (session?.kind !== 'pool') return null;
+    if (session?.kind !== 'pool2') return null;
     const state = poolView ?? (session.state as PoolState);
     const group = state.groups[i];
     return group ? remaining(state, group).length : null;
@@ -118,7 +124,7 @@
   }
 
   function poolDetail(..._deps: unknown[]): string {
-    if (session?.kind !== 'pool' || rolling || result) return '';
+    if (session?.kind !== 'pool2' || rolling || result) return '';
     const state = poolView ?? (session.state as PoolState);
     if (state.breakShot) return 'Break shot.';
     const parts: string[] = [];
@@ -184,7 +190,7 @@
       <div class="players">
         {#each session.players as id, i}
           <span class="chip" class:turn={!result && !rolling && turn === i} class:winner={result?.winner === i && !rolling}>
-            <span class="dot {session.kind} s{i}" aria-hidden="true"></span>
+            <span class="dot {session.kind} s{i} {poolGroup(i) ?? ''}" aria-hidden="true"></span>
             <span class="chip-name">{names[i]}</span>
             {#if seatLabel(i)}<span class="chip-seat">{seatLabel(i)}{poolLeft(i) !== null ? ` · ${poolLeft(i)} left` : ''}</span>{/if}
           </span>
@@ -228,7 +234,7 @@
         <Connect4Board state={connect4State} {seat} {canMove} />
       {:else if chessState}
         <ChessBoard state={chessState} {seat} {canMove} />
-      {:else if session.kind === 'pool'}
+      {:else if session.kind === 'pool2'}
         {#key session.id}
           <PoolTable {session} {canMove} bind:rolling bind:view={poolView} />
         {/key}
@@ -287,7 +293,7 @@
               <span class="art {game.kind}" aria-hidden="true">
                 {#if game.kind === 'chess'}
                   <span>{'♞︎'}</span>
-                {:else if game.kind === 'pool'}
+                {:else if game.kind === 'pool2'}
                   <span class="eight"><b>8</b></span>
                 {:else}
                   <span class="discs"><i></i><i></i><i></i><i></i></span>
@@ -403,8 +409,19 @@
     background: #f6c927;
   }
 
-  .dot.pool {
+  .dot.pool2 {
     background: #1f7d50;
+  }
+
+  /* A little solid or striped ball once the table isn't open any more. */
+  .dot.pool2.solid {
+    background: radial-gradient(circle at 50% 50%, #f7f5ee 0 22%, #f7c614 24%);
+  }
+
+  .dot.pool2.stripe {
+    background:
+      radial-gradient(circle at 50% 50%, #f7f5ee 0 22%, transparent 24%),
+      linear-gradient(#f6f3ea 0 22%, #f7c614 22% 78%, #f6f3ea 78%);
   }
 
   .watching {
@@ -698,7 +715,7 @@
     font-family: 'Segoe UI Symbol', 'Apple Symbols', 'Noto Sans Symbols2', 'DejaVu Sans', sans-serif;
   }
 
-  .art.pool {
+  .art.pool2 {
     background: #1f7d50;
   }
 
