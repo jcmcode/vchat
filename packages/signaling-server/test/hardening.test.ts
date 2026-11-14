@@ -775,7 +775,7 @@ test('emailed invite: per-guest code, `to` reaches the host, nothing secret in t
   }
   assert.equal(res.status, 200);
   // The older single `email` field still works.
-  const out = (await res.json()) as Record<string, unknown>;
+  const { invites: personal, ...out } = (await res.json()) as Record<string, unknown>;
   assert.deepEqual(out, { ok: true, sent: ['guest@example.com'], failed: [], expiresAt: created.expiresAt, warnings: [] });
   assert.equal(resend.calls.length, 1);
   assert.equal(resend.calls[0].body.attachments, undefined);
@@ -792,6 +792,8 @@ test('emailed invite: per-guest code, `to` reaches the host, nothing secret in t
   assert.ok(link.startsWith(`${SITE}/room/${created.roomId}#invite=`));
   assert.ok(link.endsWith(`&k=${key}`));
   const token = link.split('#invite=')[1].split('&')[0];
+  // The owner gets each person's code and link token back, matching the email.
+  assert.deepEqual(personal, [{ email: 'guest@example.com', token, code }]);
   const p = await verifyToken(SECRET, token);
   assert.ok(p.ok && p.payload.to === 'guest@example.com' && p.payload.role === 'guest' && p.payload.approval);
   assert.equal(p.ok && p.payload.exp * 1000, created.expiresAt);
@@ -832,7 +834,7 @@ test('emailed invite: per-guest code, `to` reaches the host, nothing secret in t
   }
   assert.equal(failed.status, 200);
   const failedBody = await failed.json();
-  assert.deepEqual(failedBody, { ok: true, sent: [], failed: [{ email: 'g3@example.com', reason: 'send-failed' }], expiresAt: created.expiresAt, warnings: [] });
+  assert.deepEqual(failedBody, { ok: true, sent: [], failed: [{ email: 'g3@example.com', reason: 'send-failed' }], invites: [], expiresAt: created.expiresAt, warnings: [] });
   assert.ok(!JSON.stringify(failedBody).includes('provider detail'));
 
   // Not configured: 503.
@@ -918,7 +920,9 @@ test('email invite: several recipients each get their own email, token and code,
   const emails = ['A@Example.com', 'b@example.com', 'c@example.org'];
   const { status, out, calls } = await sendInvites(cookie, { roomId: room.roomId, inviteToken: room.inviteToken, emails });
   assert.equal(status, 200);
-  assert.deepEqual(out, { ok: true, sent: ['a@example.com', 'b@example.com', 'c@example.org'], failed: [], expiresAt: room.expiresAt, warnings: [] });
+  const { invites: personal, ...rest } = out as Record<string, unknown>;
+  assert.deepEqual(rest, { ok: true, sent: ['a@example.com', 'b@example.com', 'c@example.org'], failed: [], expiresAt: room.expiresAt, warnings: [] });
+  assert.deepEqual((personal as { email: string }[]).map((i) => i.email), ['a@example.com', 'b@example.com', 'c@example.org']);
   assert.equal(calls.length, 3);
 
   const tokens: string[] = [];
@@ -946,10 +950,9 @@ test('email invite: several recipients each get their own email, token and code,
       invalid: true,
     });
   }
-  // Nothing secret in the response.
-  const raw = JSON.stringify(out);
-  for (const t of tokens) assert.ok(!raw.includes(t));
-  for (const c of codes) assert.ok(!raw.includes(c));
+  // The signed-in owner gets back each person's own code and token (to help them get in later),
+  // and nothing else secret: no other person's details mixed up, no room password.
+  assert.deepEqual(personal, tokens.map((token, i) => ({ email: ['a@example.com', 'b@example.com', 'c@example.org'][i], token, code: codes[i] })));
 });
 
 test('email invite: addresses are deduplicated, invalid ones reported, more than 20 or none valid is a 400', async () => {

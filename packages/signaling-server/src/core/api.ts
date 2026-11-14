@@ -9,7 +9,8 @@
 //   POST /api/admin/login/verify        -> sets owner session cookie        email sign-in only
 //   POST /api/admin/logout
 //   POST /api/admin/rooms               -> new room + invite/host links     owner only
-//   POST /api/admin/rooms/email-invite  -> emails personal invites (+ codes, message, calendar file)  owner only, Resend
+//   POST /api/admin/rooms/email-invite  -> emails personal invites (+ codes, message, calendar file),
+//                                          returns each one's code and link token  owner only, Resend
 //   POST /api/invite/check              -> checks an invite's passcode/room password before joining  public
 //
 // Modes:
@@ -823,6 +824,9 @@ export async function handleApi(request: Request, env: ServerEnv, opts: ApiOptio
       const host = new URL(origin).hostname;
       const organizer = parseSender(env.EMAIL_FROM!);
       const sent: string[] = [];
+      // What the owner needs to help someone get in later (their code, their personal link). Only
+      // ever returned to the signed-in owner, who can already let anyone in.
+      const personal: { email: string; token: string; code?: string }[] = [];
       let retryAfter = 0;
       // Keep the request short: pace sends to the provider's rate and stop after a time budget, so
       // a slow provider can't make the request time out (and the owner resend, duplicating invites).
@@ -885,6 +889,7 @@ export async function handleApi(request: Request, env: ServerEnv, opts: ApiOptio
               ...(schedule ? { schedule, ics } : {}),
             }));
           sent.push(email);
+          personal.push({ email, token, ...(code ? { code } : {}) });
         } catch (err) {
           const at = invitesSent.lastIndexOf(stamp);
           if (at >= 0) invitesSent.splice(at, 1); // nothing was delivered: don't count it
@@ -893,7 +898,7 @@ export async function handleApi(request: Request, env: ServerEnv, opts: ApiOptio
         }
       }
       return json(
-        { ok: true, sent, failed, expiresAt: p.exp * 1000, warnings },
+        { ok: true, sent, failed, invites: personal, expiresAt: p.exp * 1000, warnings },
         retryAfter ? { headers: { 'Retry-After': String(retryAfter) } } : {}
       );
     }

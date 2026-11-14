@@ -3,10 +3,9 @@
   import { goto } from '$app/navigation';
   import Icon from '$lib/ui/Icon.svelte';
   import { generateRoomKey } from '$lib/webrtc/e2e-proof';
-  import { downloadIcs, inviteText, mailtoLink, type MeetingInvite } from '$lib/invites';
   import type { When } from '$lib/when';
   import WhenPicker from '$lib/ui/WhenPicker.svelte';
-  import InviteForm from './InviteForm.svelte';
+  import RoomCard from './RoomCard.svelte';
   import {
     apiUrl,
     fetchServerConfig,
@@ -14,9 +13,10 @@
     pruneSavedRooms,
     clearSavedRooms,
     saveRooms,
-    inviteUrl,
     setRoomToken,
     setRoomKey,
+    withInvites,
+    type PersonalInvite,
     type ServerConfig,
     type SavedRoom,
   } from '$lib/stores/room';
@@ -36,9 +36,6 @@
   let loginCode = '';
   let codeSentTo = '';
 
-  // Emailed invites (sent by the server through Resend): which room's form is open.
-  let invitingRoomId = '';
-
   let label = '';
   let roomPassword = '';
   let approval = true;
@@ -49,9 +46,25 @@
   let createError = '';
 
   let rooms: SavedRoom[] = [];
-  /** The room just created, plus its password (shown once, never stored). */
-  let created: { room: SavedRoom; password: string } | null = null;
-  let copiedKey = '';
+  /** The room just created: shown first, open and highlighted. */
+  let freshId = '';
+  let showOptions = false;
+  let usePassword = false;
+  $: expiryLabel = EXPIRY_OPTIONS.find((o) => o.hours === expiresInHours)?.label ?? `${expiresInHours} hours`;
+  $: optionsSummary = [
+    approval ? 'you let people in' : 'people join directly',
+    usePassword ? 'password' : 'no password',
+    when.startsAt != null ? 'scheduled' : null,
+    `link works for ${expiryLabel}`,
+  ]
+    .filter(Boolean)
+    .join(' · ');
+
+  function togglePassword(e: Event) {
+    usePassword = (e.currentTarget as HTMLInputElement).checked;
+    if (usePassword && !roomPassword) generatePassword();
+    if (!usePassword) roomPassword = '';
+  }
 
   const EXPIRY_OPTIONS = [
     { hours: 1, label: '1 hour' },
@@ -156,10 +169,6 @@
     loginError = '';
   }
 
-  function openInviteForm(room: SavedRoom) {
-    invitingRoomId = invitingRoomId === room.roomId ? '' : room.roomId;
-  }
-
   /** Emailed invites went out for a meeting time (or none): keep it on the saved room. */
   function updateSchedule(e: CustomEvent<{ roomId: string; startsAt?: number; durationMinutes?: number }>) {
     const { roomId, startsAt, durationMinutes: minutes } = e.detail;
@@ -174,7 +183,13 @@
     };
     rooms = rooms.map(apply);
     saveRooms(rooms);
-    if (created) created = { ...created, room: apply(created.room) };
+  }
+
+  /** Personal invites went out: keep each person's code and link with the room. */
+  function rememberInvites(e: CustomEvent<{ roomId: string; invites: PersonalInvite[] }>) {
+    const { roomId, invites } = e.detail;
+    rooms = rooms.map((r) => (r.roomId === roomId ? withInvites(r, invites) : r));
+    saveRooms(rooms);
   }
 
   async function logout() {
@@ -212,7 +227,7 @@
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         credentials: 'same-origin',
-        body: JSON.stringify({ label, password: roomPassword, approval, expiresInHours: hours }),
+        body: JSON.stringify({ label, password: usePassword ? roomPassword : '', approval, expiresInHours: hours }),
       });
       const body = await res.json().catch(() => ({}));
       if (!res.ok) {
@@ -231,64 +246,19 @@
         createdAt: Date.now(),
         // End-to-end key: made here in your browser, only ever shared inside the invite link.
         key: generateRoomKey(),
+        ...(usePassword && roomPassword ? { password: roomPassword } : {}),
         ...(startsAt && Number.isFinite(startsAt) ? { startsAt, durationMinutes } : {}),
       };
       rooms = [room, ...rooms];
       saveRooms(rooms);
-      created = { room, password: roomPassword };
+      freshId = room.roomId;
       label = '';
       roomPassword = '';
+      usePassword = false;
+      showOptions = false;
       when = { ...when, startsAt: null };
     } finally {
       creating = false;
-    }
-  }
-
-  /** The invite link, including the room's end-to-end key after "#". */
-  function linkFor(room: SavedRoom): string {
-    return inviteUrl(room.roomId, room.inviteToken, room.key);
-  }
-
-  function inviteFor(room: SavedRoom): MeetingInvite {
-    return {
-      title: room.label || 'Video call',
-      link: linkFor(room),
-      startsAt: room.startsAt,
-      durationMinutes: room.durationMinutes,
-      hasPassword: room.hasPassword,
-    };
-  }
-
-  function inviteMessage(room: SavedRoom): string {
-    return inviteText(inviteFor(room));
-  }
-
-  function emailInvite(room: SavedRoom) {
-    window.location.href = mailtoLink(inviteFor(room));
-  }
-
-  function formatSchedule(room: SavedRoom): string {
-    if (!room.startsAt) return '';
-    return new Date(room.startsAt).toLocaleString([], { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' });
-  }
-
-  async function copy(text: string, key: string) {
-    try {
-      await navigator.clipboard.writeText(text);
-      copiedKey = key;
-      setTimeout(() => {
-        if (copiedKey === key) copiedKey = '';
-      }, 2000);
-    } catch {
-      // clipboard unavailable (e.g. insecure context)
-    }
-  }
-
-  async function share(room: SavedRoom) {
-    try {
-      await navigator.share({ title: room.label || 'Video call', text: inviteMessage(room) });
-    } catch {
-      // cancelled
     }
   }
 
@@ -301,18 +271,9 @@
   function removeRoom(room: SavedRoom) {
     rooms = rooms.filter((r) => r.roomId !== room.roomId);
     saveRooms(rooms);
-    if (created?.room.roomId === room.roomId) created = null;
+    if (freshId === room.roomId) freshId = '';
   }
 
-  function expiresIn(ts: number): string {
-    const mins = Math.round((ts - Date.now()) / 60000);
-    if (mins < 60) return `${Math.max(mins, 0)} min`;
-    const hours = Math.round(mins / 60);
-    if (hours < 48) return `${hours} h`;
-    return `${Math.round(hours / 24)} days`;
-  }
-
-  const canShare = typeof navigator !== 'undefined' && 'share' in navigator;
 </script>
 
 <svelte:head>
@@ -410,117 +371,80 @@
       <form class="panel form" on:submit|preventDefault={createRoom}>
         <h2><Icon name="plus" size={18} /> New room</h2>
         <div>
-          <label class="field-label" for="label">Name (optional)</label>
-          <input id="label" class="input" type="text" bind:value={label} placeholder="e.g. Family call" maxlength="60" />
-        </div>
-        <div>
-          <label class="field-label" for="roompw">Password (optional)</label>
+          <label class="field-label" for="label">Name <span class="muted">(optional)</span></label>
           <div class="row">
-            <input id="roompw" class="input" type="text" bind:value={roomPassword} placeholder="Password (optional)" autocomplete="off" />
-            <button type="button" class="btn secondary" on:click={generatePassword}>Generate</button>
+            <input id="label" class="input" type="text" bind:value={label} placeholder="e.g. Family call" maxlength="60" />
+            <button class="btn primary" type="submit" disabled={creating || (usePassword && !roomPassword)}>{creating ? 'Creating…' : 'Create room'}</button>
           </div>
         </div>
-        <label class="toggle-row">
-          <input type="checkbox" bind:checked={approval} />
-          <span>Guests wait for my approval</span>
-        </label>
-        <WhenPicker id="when" legend="When (optional, for calendar invites)" bind:value={when} />
-        <label class="select-row">
-          <span>Invite link expires after{when.startsAt != null ? ' (at least until the meeting ends)' : ''}</span>
-          <select class="input" bind:value={expiresInHours}>
-            {#each EXPIRY_OPTIONS as opt}
-              <option value={opt.hours}>{opt.label}</option>
-            {/each}
-          </select>
-        </label>
+
+        <button type="button" class="options-toggle" aria-expanded={showOptions} aria-controls="room-options" on:click={() => (showOptions = !showOptions)}>
+          <span class="options-summary">
+            <strong>Options</strong>
+            <span class="muted">{optionsSummary}</span>
+          </span>
+          <span class="chev" class:up={showOptions}><Icon name="chevron-down" size={16} /></span>
+        </button>
+
+        {#if showOptions}
+          <div class="options" id="room-options">
+            <label class="option">
+              <input type="checkbox" bind:checked={approval} />
+              <span>
+                <strong>I let people in</strong>
+                <small>{approval ? 'People wait in a lobby until you let them in. Recommended.' : 'Anyone with the link (and password, if set) joins straight away.'}</small>
+              </span>
+            </label>
+            <div>
+              <label class="option">
+                <input type="checkbox" checked={usePassword} on:change={togglePassword} />
+                <span>
+                  <strong>Require a password</strong>
+                  <small>{usePassword ? "People need this as well as the link. It's shown with the room's invite link later." : 'The link alone is enough.'}</small>
+                </span>
+              </label>
+              {#if usePassword}
+                <div class="row pw-row">
+                  <input class="input mono" type="text" bind:value={roomPassword} aria-label="Room password" autocomplete="off" spellcheck="false" />
+                  <button type="button" class="btn secondary small" on:click={generatePassword}>New one</button>
+                </div>
+              {/if}
+            </div>
+            <WhenPicker id="when" legend="Meeting time (optional, for calendar invites)" bind:value={when} />
+            <label class="select-row">
+              <span>The link works for{when.startsAt != null ? ' (at least until the meeting ends)' : ''}</span>
+              <select class="input" bind:value={expiresInHours}>
+                {#each EXPIRY_OPTIONS as opt}
+                  <option value={opt.hours}>{opt.label}</option>
+                {/each}
+              </select>
+            </label>
+          </div>
+        {/if}
         {#if createError}<span class="error" role="alert">{createError}</span>{/if}
-        <button class="btn primary" type="submit" disabled={creating}>{creating ? 'Creating…' : 'Create room'}</button>
       </form>
 
-      {#if created}
-        <section class="panel created fade-in" aria-live="polite">
-          <h3><Icon name="check" size={18} /> Room ready{created.room.label ? `: ${created.room.label}` : ''}</h3>
-          <label class="sr-only" for="invitelink">Invite link</label>
-          <input id="invitelink" class="input link" readonly value={linkFor(created.room)} on:focus={(e) => e.currentTarget.select()} />
-          <div class="actions">
-            <button class="btn secondary small" class:done={copiedKey === 'link'} on:click={() => created && copy(linkFor(created.room), 'link')}>
-              <Icon name={copiedKey === 'link' ? 'check' : 'copy'} size={16} />
-              {copiedKey === 'link' ? 'Copied!' : 'Copy link'}
-            </button>
-            <button class="btn secondary small" class:done={copiedKey === 'msg'} on:click={() => created && copy(inviteMessage(created.room), 'msg')}>
-              <Icon name={copiedKey === 'msg' ? 'check' : 'message'} size={16} />
-              {copiedKey === 'msg' ? 'Copied!' : 'Copy invite message'}
-            </button>
-            {#if config?.emailInvites}
-              <button class="btn secondary small" on:click={() => created && openInviteForm(created.room)} title="Email someone their own invite link and code">
-                <Icon name="send" size={16} /> Email invite
-              </button>
-            {:else}
-              <button class="btn secondary small" on:click={() => created && emailInvite(created.room)} title="Opens your own email app with the invite drafted">
-                <Icon name="send" size={16} /> Email invite
-              </button>
-            {/if}
-            <button class="btn secondary small" on:click={() => created && downloadIcs(inviteFor(created.room))} title="Download a calendar event (.ics) with the link — attach it to an email or open it to add to your calendar">
-              <Icon name="calendar" size={16} /> Calendar file
-            </button>
-            {#if canShare}
-              <button class="btn secondary small" on:click={() => created && share(created.room)}><Icon name="share" size={16} /> Share…</button>
-            {/if}
-            <button class="btn primary small" on:click={() => created && startCall(created.room)}><Icon name="video" size={16} /> Start call</button>
-          </div>
-          {#if invitingRoomId === created.room.roomId}
-            {#key created.room.roomId}
-              <InviteForm room={created.room} on:unauthorized={() => (authenticated = false)} on:schedule={updateSchedule} />
-            {/key}
-          {/if}
-          {#if created.password}
-            <p class="pw">
-              <span class="muted">Password:</span> <code>{created.password}</code>
-              <button class="link-btn" on:click={() => created && copy(created.password, 'pw')}>{copiedKey === 'pw' ? 'Copied!' : 'Copy'}</button>
-            </p>
-            <p class="muted small-text">Send it separately from the link (e.g. by text). It isn't saved anywhere, so note it now.</p>
-          {/if}
-          <p class="muted small-text"><Icon name="shield" size={12} /> The link contains this room's end-to-end key. Anyone with the link can join (subject to your password and approval), so share it only with the people you're inviting.</p>
-        </section>
-      {/if}
-
       {#if rooms.length > 0}
-        <section class="panel rooms">
-          <h3>Your rooms</h3>
-          <p class="muted small-text">Kept only in this browser. Anyone with a room's invite link can use it until it expires.</p>
-          <ul>
-            {#each rooms as room (room.roomId)}
-              <li class="room-row">
-                <div class="room-meta">
-                  <strong>{room.label || room.roomId}</strong>
-                  <span class="chips">
-                    <span class="chip"><Icon name="lock" size={12} /> expires in {expiresIn(room.expiresAt)}</span>
-                    {#if room.hasPassword}<span class="chip">password</span>{/if}
-                    {#if room.approval}<span class="chip">approval</span>{/if}
-                    {#if room.startsAt}<span class="chip accent"><Icon name="calendar" size={12} /> {formatSchedule(room)}</span>{/if}
-                  </span>
-                </div>
-                <div class="actions">
-                  <button class="btn secondary small" class:done={copiedKey === room.roomId} on:click={() => copy(linkFor(room), room.roomId)}>
-                    <Icon name={copiedKey === room.roomId ? 'check' : 'copy'} size={16} />
-                    {copiedKey === room.roomId ? 'Copied!' : 'Copy link'}
-                  </button>
-                  {#if config?.emailInvites}
-                    <button class="btn ghost small icon" class:active={invitingRoomId === room.roomId} on:click={() => openInviteForm(room)} title="Email someone an invite" aria-label="Email someone an invite"><Icon name="send" size={16} /></button>
-                  {:else}
-                    <button class="btn ghost small icon" on:click={() => emailInvite(room)} title="Email invite" aria-label="Email invite"><Icon name="send" size={16} /></button>
-                  {/if}
-                  <button class="btn ghost small icon" on:click={() => downloadIcs(inviteFor(room))} title="Calendar file (.ics)" aria-label="Download calendar file"><Icon name="calendar" size={16} /></button>
-                  <button class="btn primary small" on:click={() => startCall(room)}>Start</button>
-                  <button class="btn ghost danger small icon" on:click={() => removeRoom(room)} title="Remove from this list" aria-label="Remove from this list"><Icon name="trash" size={16} /></button>
-                </div>
-                {#if invitingRoomId === room.roomId && created?.room.roomId !== room.roomId}
-                  <InviteForm {room} on:unauthorized={() => (authenticated = false)} on:schedule={updateSchedule} />
-                {/if}
-              </li>
-            {/each}
-          </ul>
+        <section class="rooms" aria-labelledby="rooms-title">
+          <div class="rooms-head">
+            <h3 id="rooms-title">Your rooms</h3>
+            <span class="muted small-text">Kept only in this browser</span>
+          </div>
+          {#each rooms as room (room.roomId)}
+            <RoomCard
+              {room}
+              emailInvites={!!config?.emailInvites}
+              fresh={room.roomId === freshId}
+              on:start={(e) => startCall(e.detail)}
+              on:remove={(e) => removeRoom(e.detail)}
+              on:unauthorized={() => (authenticated = false)}
+              on:schedule={updateSchedule}
+              on:sent={rememberInvites}
+            />
+          {/each}
         </section>
+      {:else}
+        <p class="muted small-text empty">Make a room, then use <strong>Invite people</strong> to send the link.</p>
       {/if}
     {/if}
   </div>
@@ -637,7 +561,6 @@
     min-width: 0;
   }
 
-  .toggle-row,
   .select-row {
     display: flex;
     align-items: center;
@@ -647,101 +570,124 @@
     min-height: 36px;
   }
 
-  .toggle-row {
-    cursor: pointer;
-  }
 
-  .toggle-row input[type='checkbox'] {
-    width: 18px;
-    height: 18px;
-    accent-color: var(--accent);
-  }
 
   .select-row .input {
     width: auto;
     margin-left: auto;
   }
 
-  .created {
-    display: flex;
-    flex-direction: column;
-    gap: var(--space-3);
-    border-color: var(--accent);
-    background: linear-gradient(var(--accent-soft), transparent 60%), var(--bg-surface);
-  }
 
-  .created h3 {
-    color: var(--success);
-  }
 
-  .link {
-    font-family: var(--font-mono);
-    font-size: var(--text-sm);
-    min-height: 48px;
-    color: var(--text);
-    border-color: var(--border-strong);
-  }
 
-  .actions {
-    display: flex;
-    flex-wrap: wrap;
-    gap: var(--space-2);
-    align-items: center;
-  }
 
-  .btn.done {
-    color: var(--success);
-    border-color: var(--success);
-  }
 
-  .pw {
-    display: flex;
-    align-items: center;
-    flex-wrap: wrap;
-    gap: var(--space-2);
-    font-size: var(--text-sm);
-  }
 
-  .pw code {
-    font-size: var(--text-base);
-  }
 
-  ul {
-    list-style: none;
-    margin-top: var(--space-3);
-  }
 
-  .room-row {
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-    gap: var(--space-3);
-    padding: var(--space-3) 0;
-    border-top: 1px solid var(--border-subtle);
-    flex-wrap: wrap;
-  }
 
-  .room-meta {
-    display: flex;
-    flex-direction: column;
-    gap: var(--space-1);
-    min-width: 0;
-  }
-
-  .room-meta strong {
-    overflow: hidden;
-    text-overflow: ellipsis;
-    font-weight: 600;
-  }
-
-  .chips {
-    display: flex;
-    flex-wrap: wrap;
-    gap: var(--space-1);
-  }
 
   .muted {
     color: var(--text-muted);
+  }
+
+  .mono {
+    font-family: var(--font-mono, monospace);
+  }
+
+  .options-toggle {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: var(--space-3);
+    width: 100%;
+    padding: var(--space-2) var(--space-3);
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--radius);
+    background: var(--bg-elevated);
+    color: var(--text);
+    font: inherit;
+    font-size: var(--text-sm);
+    text-align: left;
+    cursor: pointer;
+  }
+
+  .options-toggle:hover {
+    border-color: var(--border-strong);
+  }
+
+  .options-summary {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    min-width: 0;
+  }
+
+  .chev {
+    display: inline-flex;
+    color: var(--text-muted);
+    transition: transform var(--dur-fast) var(--ease);
+  }
+
+  .chev.up {
+    transform: rotate(180deg);
+  }
+
+  .options {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-4);
+  }
+
+  .option {
+    display: flex;
+    align-items: flex-start;
+    gap: var(--space-3);
+    cursor: pointer;
+  }
+
+  .option input[type='checkbox'] {
+    width: 18px;
+    height: 18px;
+    margin-top: 2px;
+    flex-shrink: 0;
+    accent-color: var(--accent);
+  }
+
+  .option > span {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    min-width: 0;
+    flex: 1;
+  }
+
+  .option small {
+    color: var(--text-muted);
+    font-size: var(--text-sm);
+  }
+
+  .pw-row {
+    margin: var(--space-2) 0 0 calc(18px + var(--space-3));
+  }
+
+  .rooms {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-3);
+  }
+
+  .rooms-head {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: var(--space-3);
+    padding: 0 var(--space-1);
+  }
+
+  .empty {
+    text-align: center;
+    margin: 0;
   }
 
   .small-text {

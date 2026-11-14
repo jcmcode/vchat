@@ -1,7 +1,7 @@
 <script lang="ts">
   import { createEventDispatcher } from 'svelte';
   import Icon from '$lib/ui/Icon.svelte';
-  import { apiUrl, type SavedRoom } from '$lib/stores/room';
+  import { apiUrl, type PersonalInvite, type SavedRoom } from '$lib/stores/room';
   import WhenPicker from '$lib/ui/WhenPicker.svelte';
   import { durationLabel } from '$lib/invites';
   import { formatRange, type When } from '$lib/when';
@@ -14,6 +14,8 @@
     unauthorized: void;
     /** Invites went out for this schedule (or none): the dashboard keeps it on the room. */
     schedule: { roomId: string; startsAt?: number; durationMinutes?: number };
+    /** Personal invites that went out (each person's code and link), for the dashboard to keep. */
+    sent: { roomId: string; invites: PersonalInvite[] };
   }>();
 
   type FailReason = 'invalid' | 'rate-limited' | 'send-failed';
@@ -183,6 +185,15 @@
         return { email, ok: false, reason: failed.get(key) ?? 'send-failed' };
       });
       warnings = strings(body.warnings).filter((w): w is Warning => w in WARNINGS);
+      const now = Date.now();
+      const personal: PersonalInvite[] = [];
+      if (Array.isArray(body.invites)) {
+        for (const i of body.invites as { email?: unknown; token?: unknown; code?: unknown }[]) {
+          if (typeof i?.email !== 'string' || typeof i.token !== 'string') continue;
+          personal.push({ email: i.email, token: i.token, ...(typeof i.code === 'string' ? { code: i.code } : {}), sentAt: now });
+        }
+      }
+      if (personal.length > 0) dispatch('sent', { roomId: room.roomId, invites: personal });
       // Keep what failed for another try; the sent ones are done.
       recipients = recipients.filter((r) => !sent.has(r.toLowerCase()));
       capNotice = false;
@@ -200,8 +211,7 @@
   }
 </script>
 
-<form class="invite-form" on:submit|preventDefault={send} aria-labelledby="{uid}-title">
-  <h4 id="{uid}-title"><Icon name="send" size={16} /> Email invites</h4>
+<form class="invite-form" on:submit|preventDefault={send} aria-label="Email invites">
 
   <div>
     <label class="field-label" for="{uid}-emails">Send to</label>
@@ -347,24 +357,10 @@
 
 <style>
   .invite-form {
-    flex-basis: 100%;
     min-width: 0;
     display: flex;
     flex-direction: column;
     gap: var(--space-4);
-    padding: var(--space-4);
-    margin-top: var(--space-2);
-    border: 1px solid var(--border-subtle);
-    border-radius: var(--radius);
-    background: var(--bg-elevated);
-  }
-
-  h4 {
-    display: flex;
-    align-items: center;
-    gap: var(--space-2);
-    font-size: var(--text-base);
-    font-weight: 600;
   }
 
   .recipients {

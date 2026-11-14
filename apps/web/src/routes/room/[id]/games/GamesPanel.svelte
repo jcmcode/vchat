@@ -43,20 +43,23 @@
     'wrong-ball': 'Wrong ball hit first',
   };
 
-  let opponentId = '';
   let confirmResign = false;
   let confirmTimer: ReturnType<typeof setTimeout> | null = null;
   // Pool plays each shot out before showing its result.
   let rolling = false;
   let poolView: PoolState | null = null;
+  /** You picked a game and are now choosing who to play it with. */
+  let choosing: GameKind | null = null;
 
   $: session = $gameSession;
   $: me = $localPeerIdStore;
-  $: others = Array.from($peers.values()).filter((p) => p.trusted);
-  // With one other person they're the opponent; in a group you choose (nobody is picked for you).
-  $: if (!others.some((p) => p.id === opponentId)) opponentId = others.length === 1 ? others[0].id : '';
-  $: opponentName = others.find((p) => p.id === opponentId)?.displayName ?? '';
-
+  // Everyone else in the call. Only people whose connection is verified can be invited; the rest
+  // are shown as still connecting (so the picker never claims you're alone when you aren't).
+  $: everyone = Array.from($peers.values());
+  $: others = everyone.filter((p) => p.trusted);
+  $: connecting = everyone.filter((p) => !p.trusted);
+  // The person you're choosing for left (or everyone did): back to the games.
+  $: if (choosing && everyone.length === 0) choosing = null;
   function initial(name: string): string {
     return Array.from(name.trim())[0]?.toUpperCase() ?? '?';
   }
@@ -124,8 +127,18 @@
     return parts.join(' ');
   }
 
-  function start(kind: GameKind) {
-    if (opponentId) inviteToGame(kind, opponentId);
+  /** Pick a game: with one other person it goes straight to them; otherwise choose who next. */
+  function pickGame(kind: GameKind) {
+    if (waiting) return;
+    if (others.length === 1 && connecting.length === 0) {
+      invite1(kind, others[0].id);
+      return;
+    }
+    choosing = kind;
+  }
+
+  function invite1(kind: GameKind, peerId: string) {
+    if (inviteToGame(kind, peerId)) choosing = null;
   }
 
   $: invite = $outgoingInvite;
@@ -223,35 +236,32 @@
     </div>
   {:else}
     <div class="picker">
-      {#if others.length === 0}
-        <p class="lead">Games are for two. Once someone else joins the call, you can start one here.</p>
-      {:else if others.length === 1}
-        <p class="lead">Pick a game to play with <strong>{others[0].displayName}</strong>.</p>
-      {:else}
+      {#if choosing}
         <div class="choose">
-          <p class="lead" id="choose-label">
-            {#if opponentName}
-              Playing with <strong>{opponentName}</strong>. Pick a game; everyone else can watch.
-            {:else}
-              Who do you want to play with?
-            {/if}
-          </p>
-          <div class="people" role="radiogroup" aria-labelledby="choose-label">
+          <p class="lead" id="choose-label">Who do you want to play <strong>{GAME_NAMES[choosing]}</strong> with?</p>
+          <div class="people" role="group" aria-labelledby="choose-label">
             {#each others as p (p.id)}
-              <button
-                class="person"
-                class:chosen={p.id === opponentId}
-                role="radio"
-                aria-checked={p.id === opponentId}
-                aria-label={p.displayName}
-                on:click={() => (opponentId = p.id)}
-              >
+              <button class="person" on:click={() => choosing && invite1(choosing, p.id)} title="Invite {p.displayName} to play {GAME_NAMES[choosing]}">
                 <span class="avatar" aria-hidden="true">{initial(p.displayName)}</span>
                 <span class="person-name">{p.displayName}</span>
               </button>
             {/each}
+            {#each connecting as p (p.id)}
+              <button class="person" disabled title="Still connecting securely to {p.displayName}">
+                <span class="avatar" aria-hidden="true">{initial(p.displayName)}</span>
+                <span class="person-name">{p.displayName}</span>
+                <span class="person-state">connecting…</span>
+              </button>
+            {/each}
           </div>
+          <button class="btn" on:click={() => (choosing = null)}>Back to games</button>
         </div>
+      {:else if everyone.length === 0}
+        <p class="lead">Games are for two. Once someone else joins the call, pick a game here and invite them.</p>
+      {:else if others.length === 0}
+        <p class="lead">Connecting securely to {everyone.length === 1 ? everyone[0].displayName : 'the others'}… You can invite {everyone.length === 1 ? 'them' : 'someone'} in a moment.</p>
+      {:else}
+        <p class="lead">Pick a game, then choose who to play with. Everyone else can watch.</p>
       {/if}
       {#if invite && !invite.rematch}
         <div class="invite-status" class:answered={!waiting} role="status">
@@ -264,29 +274,31 @@
           <button class="btn" on:click={cancelInvite}>{waiting ? 'Cancel' : 'OK'}</button>
         </div>
       {/if}
-      <div class="cards">
-        {#each GAMES as game}
-          <button
-            class="card"
-            class:asked={waiting && invite?.kind === game.kind && invite?.to === opponentId}
-            disabled={!opponentId || waiting}
-            title={opponentId ? `Invite ${opponentName} to play ${GAME_NAMES[game.kind]}` : 'Choose who to play with first'}
-            on:click={() => start(game.kind)}
-          >
-            <span class="art {game.kind}" aria-hidden="true">
-              {#if game.kind === 'chess'}
-                <span>{'♞︎'}</span>
-              {:else if game.kind === 'pool'}
-                <span class="eight"><b>8</b></span>
-              {:else}
-                <span class="discs"><i></i><i></i><i></i><i></i></span>
-              {/if}
-            </span>
-            <span class="card-name">{GAME_NAMES[game.kind]}</span>
-            <span class="card-blurb">{game.blurb}</span>
-          </button>
-        {/each}
-      </div>
+      {#if !choosing}
+        <div class="cards">
+          {#each GAMES as game}
+            <button
+              class="card"
+              class:asked={waiting && invite?.kind === game.kind}
+              disabled={others.length === 0 || waiting}
+              title={others.length === 0 ? 'Someone else needs to be in the call first' : `Play ${GAME_NAMES[game.kind]}`}
+              on:click={() => pickGame(game.kind)}
+            >
+              <span class="art {game.kind}" aria-hidden="true">
+                {#if game.kind === 'chess'}
+                  <span>{'♞︎'}</span>
+                {:else if game.kind === 'pool'}
+                  <span class="eight"><b>8</b></span>
+                {:else}
+                  <span class="discs"><i></i><i></i><i></i><i></i></span>
+                {/if}
+              </span>
+              <span class="card-name">{GAME_NAMES[game.kind]}</span>
+              <span class="card-blurb">{game.blurb}</span>
+            </button>
+          {/each}
+        </div>
+      {/if}
       <p class="foot">Games go straight between the people in the call, end-to-end encrypted like everything else.</p>
     </div>
   {/if}
@@ -597,9 +609,19 @@
     background: var(--bg-hover);
   }
 
-  .person.chosen {
-    border-color: var(--accent);
-    background: var(--accent-soft);
+  .person:disabled {
+    cursor: default;
+    opacity: 0.6;
+  }
+
+  .person:disabled:hover {
+    border-color: var(--border);
+    background: var(--bg-surface);
+  }
+
+  .person-state {
+    font-weight: 400;
+    color: var(--text-muted);
   }
 
   .avatar {
@@ -615,7 +637,7 @@
     font-weight: 700;
   }
 
-  .person.chosen .avatar {
+  .person:not(:disabled):hover .avatar {
     background: var(--accent);
     color: var(--accent-text);
   }

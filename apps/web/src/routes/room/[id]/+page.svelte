@@ -85,6 +85,7 @@
     getRoomToken,
     readToken,
     inviteUrl,
+    parseInviteLink,
     getSavedRooms,
     setRoomKey,
     getRoomKey,
@@ -154,7 +155,13 @@
    * The landing page, shown before the call: a passcode (step 1, guests with a protected invite),
    * then name + how to join (step 2). 'done' once joining; guests then wait in the lobby.
    */
-  let landing: 'loading' | 'passcode' | 'name' | 'done' = 'loading';
+  let landing: 'loading' | 'missing' | 'passcode' | 'name' | 'done' = 'loading';
+  /** 'missing': the invite link pasted on the recovery screen, and what's wrong with it. */
+  let pastedLink = '';
+  let pastedError = '';
+  /** The full invite link for this tab (to open the invite in another browser). */
+  let ownInviteLink = '';
+  let ownLinkCopied = false;
   let hasPasscodeStep = false;
   /** The passcode is an emailed 6-digit code (personal invite), not a room password. */
   let passcodeIsCode = false;
@@ -245,6 +252,48 @@
       mediaError = describeMediaError(err);
     } finally {
       retryingMedia = false;
+    }
+  }
+
+  /** A reason the invite can't be used (expired, not valid), or null if it looks fine or we can't tell. */
+  async function checkInviteStillGood(token: string): Promise<string | null> {
+    try {
+      const res = await fetch(apiUrl('/api/invite/check'), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ roomId, token, code: '' }),
+      });
+      if (res.status !== 400) return null;
+      const body = (await res.json().catch(() => ({}))) as { error?: unknown };
+      const reason = typeof body.error === 'string' ? body.error : 'Invalid invite';
+      return friendlyJoinError(reason) ?? friendlyJoinError('Invalid invite') ?? "This invite link isn't valid.";
+    } catch {
+      return null; // offline or an older server: joining checks the invite anyway
+    }
+  }
+
+  /** Recovery screen: the whole invite link was pasted. Keep it for this tab and start again. */
+  function usePastedLink() {
+    const parsed = parseInviteLink(pastedLink);
+    if (!parsed) {
+      pastedError = "That isn't a complete invite link. Copy the whole link from your invite (it's long and contains “#invite=”).";
+      return;
+    }
+    setRoomToken(parsed.roomId, parsed.token);
+    if (parsed.key) setRoomKey(parsed.roomId, parsed.key);
+    forgetRoomPassword(parsed.roomId);
+    // A full reload runs the normal invite flow (passcode, name) for that room.
+    window.location.href = `/room/${parsed.roomId}`;
+  }
+
+  /** Opening the invite in another browser: copy the whole link (the address bar no longer has it). */
+  async function copyOwnInviteLink() {
+    try {
+      await navigator.clipboard.writeText(ownInviteLink);
+      ownLinkCopied = true;
+      setTimeout(() => (ownLinkCopied = false), 2500);
+    } catch {
+      ownLinkCopied = false;
     }
   }
 
@@ -349,6 +398,12 @@
   let destroyed = false;
 
   let shareUrl = '';
+  /** The room password that goes with shareUrl, when this tab knows it (the owner, or a guest who typed it). */
+  let sharePassword = '';
+  /** Just copied the link: remind that the password is needed too (with a copy button). */
+  let pwHint = false;
+  let pwCopied = false;
+  let pwHintTimer: ReturnType<typeof setTimeout> | null = null;
 
   // ── End-to-end verification summary (header badge) ──
   // Every peer counts (a connection that hasn't opened yet is still being checked).
@@ -499,18 +554,35 @@
     if (tokenInfo.role === 'guest' && token && !personalInvite) shareUrl = inviteUrl(roomId, token, roomKey);
     else if (tokenInfo.role === 'host') {
       const saved = getSavedRooms().find((r) => r.roomId === roomId);
-      if (saved) shareUrl = inviteUrl(roomId, saved.inviteToken, saved.key ?? roomKey);
+      if (saved) {
+        shareUrl = inviteUrl(roomId, saved.inviteToken, saved.key ?? roomKey);
+        sharePassword = saved.password ?? '';
+      }
     } else if (config.mode === 'open') shareUrl = roomUrl(roomId, roomKey);
 
     if (config.mode === 'private' && !token) {
-      roomError.set(
-        config.misconfigured
-          ? "The server isn't set up correctly. Tell the owner."
-          : 'This is a private server. You need an invite link from the owner to join.'
-      );
+      if (config.misconfigured) {
+        roomError.set("The server isn't set up correctly. Tell the owner.");
+        return;
+      }
+      // Usually the address bar was copied after the invite was opened (the invite part is removed
+      // from it), or only part of the link made it. Ask for the whole link instead of giving up.
+      landing = 'missing';
       return;
     }
     if (destroyed) return;
+
+    // Guests: catch an expired or broken invite now, not after choosing a name and camera. (An
+    // empty code is never counted as a guess; a protected invite just answers "code needed".)
+    if (config.mode === 'private' && tokenInfo.role === 'guest') {
+      const problem = await checkInviteStillGood(token!);
+      if (destroyed) return;
+      if (problem) {
+        roomError.set(problem);
+        return;
+      }
+      ownInviteLink = inviteUrl(roomId, token!, roomKey);
+    }
 
     // Guests (not hosts, and not open-mode rooms) wait in the lobby instead of the call.
     lobbyGate = config.mode === 'private' && tokenInfo.role === 'guest';
@@ -525,6 +597,9 @@
       await new Promise<void>((resolve) => (resolvePasscode = resolve));
       if (destroyed) return;
     }
+
+    // A guest who shares their (room-password) link can see the password they used to pass it on.
+    if (shareUrl && tokenInfo.role === 'guest' && tokenInfo.hasPassword) sharePassword = recallRoomPassword(roomId) ?? '';
 
     // Step 2 (pre-join): confirm your name and choose video, audio only or chat only.
     // Skipped when coming from the home page, where those choices were just made.
@@ -783,13 +858,29 @@
     }
     copied = ok;
     copyFailed = !ok;
+    if (ok && sharePassword) {
+      pwHint = true;
+      pwCopied = false;
+      if (pwHintTimer) clearTimeout(pwHintTimer);
+      pwHintTimer = setTimeout(() => (pwHint = false), 12_000);
+    }
     if (copyTimer) clearTimeout(copyTimer);
     copyTimer = setTimeout(() => {
       copied = false;
       copyFailed = false;
     }, ok ? 2000 : 4000);
   }
+  async function copySharePassword() {
+    try {
+      await navigator.clipboard.writeText(sharePassword);
+      pwCopied = true;
+    } catch {
+      pwCopied = false;
+    }
+  }
+
   onDestroy(() => {
+    if (pwHintTimer) clearTimeout(pwHintTimer);
     if (copyTimer) clearTimeout(copyTimer);
   });
 
@@ -893,6 +984,36 @@
         <p class="landing-loading" role="status">
           <span class="landing-spinner" aria-hidden="true"></span> Loading…
         </p>
+      {:else if landing === 'missing'}
+        <form class="step" on:submit|preventDefault={usePastedLink} aria-labelledby="missing-title" novalidate>
+          <h2 id="missing-title">Open your full invite link</h2>
+          <p class="step-sub" id="missing-help">
+            This address is missing the invite part. That happens when the address bar is copied after the
+            invite was opened. Go back to your invite (email or message) and open the link from there, or paste
+            the whole link here.
+          </p>
+          <label class="sr-only" for="missing-input">Invite link</label>
+          <!-- svelte-ignore a11y-autofocus -->
+          <input
+            id="missing-input"
+            class="input"
+            type="url"
+            autocomplete="off"
+            autocapitalize="off"
+            spellcheck="false"
+            placeholder="https://…/room/…#invite=…"
+            bind:value={pastedLink}
+            on:input={() => (pastedError = '')}
+            aria-invalid={pastedError ? 'true' : undefined}
+            aria-describedby={pastedError ? 'missing-error' : 'missing-help'}
+            autofocus
+          />
+          {#if pastedError}<p id="missing-error" class="step-error" role="alert">{pastedError}</p>{/if}
+          <div class="dialog-actions">
+            <button type="button" class="btn ghost" on:click={() => goto('/')}>Cancel</button>
+            <button type="submit" class="btn primary" disabled={!pastedLink.trim()}>Continue</button>
+          </div>
+        </form>
       {:else if landing === 'passcode'}
         <form class="step" on:submit|preventDefault={handleSubmitPasscode} aria-labelledby="passcode-title" novalidate>
           <h2 id="passcode-title">Enter your passcode</h2>
@@ -934,6 +1055,12 @@
             />
           {/if}
           {#if passcodeError}<p id="passcode-error" class="step-error" role="alert">{passcodeError}</p>{/if}
+          {#if ownInviteLink}
+            <p class="other-browser">
+              Want to join from a different browser or app?
+              <button type="button" class="link-btn" on:click={copyOwnInviteLink}>{ownLinkCopied ? 'Link copied. Paste it there.' : 'Copy your invite link'}</button>
+            </p>
+          {/if}
           <div class="dialog-actions">
             <button type="button" class="btn ghost" on:click={() => goto('/')}>Cancel</button>
             <button type="submit" class="btn primary" disabled={!passcodeReady || checkingPasscode}>
@@ -949,6 +1076,12 @@
           on:join={handlePrejoinJoin}
           on:cancel={() => goto('/')}
         />
+        {#if ownInviteLink && !hasPasscodeStep}
+          <p class="other-browser">
+            Want to join from a different browser or app?
+            <button type="button" class="link-btn" on:click={copyOwnInviteLink}>{ownLinkCopied ? 'Link copied. Paste it there.' : 'Copy your invite link'}</button>
+          </p>
+        {/if}
       {/if}
     </section>
   </main>
@@ -1088,11 +1221,26 @@
           <span class="e2e-label">{e2eLabel}</span>
         </span>
         {#if shareUrl}
-          <button class="btn small copy-btn" class:copied class:failed={copyFailed} on:click={copyLink} title="Copy a link others can use to join">
-            <Icon name={copied ? 'check' : copyFailed ? 'x' : 'link'} size={15} />
-            <span class="copy-label">{copied ? 'Copied!' : copyFailed ? "Couldn't copy" : 'Copy invite link'}</span>
-            <span class="sr-only" aria-live="polite">{copied ? 'Invite link copied' : copyFailed ? "Couldn't copy the invite link" : ''}</span>
-          </button>
+          <span class="copy-wrap">
+            <button class="btn small copy-btn" class:copied class:failed={copyFailed} on:click={copyLink} title="Copy a link others can use to join">
+              <Icon name={copied ? 'check' : copyFailed ? 'x' : 'link'} size={15} />
+              <span class="copy-label">{copied ? 'Copied!' : copyFailed ? "Couldn't copy" : 'Copy invite link'}</span>
+              <span class="sr-only" aria-live="polite">{copied ? 'Invite link copied' : copyFailed ? "Couldn't copy the invite link" : ''}</span>
+            </button>
+            {#if pwHint && sharePassword}
+              <div class="pw-hint card fade-in" role="status">
+                <p>Link copied. They'll also need the password:</p>
+                <div class="pw-hint-row">
+                  <code>{sharePassword}</code>
+                  <button class="btn small" on:click={copySharePassword}>
+                    <Icon name={pwCopied ? 'check' : 'copy'} size={14} />
+                    {pwCopied ? 'Copied' : 'Copy password'}
+                  </button>
+                  <button class="btn small icon-only" aria-label="Close" on:click={() => (pwHint = false)}><Icon name="x" size={14} /></button>
+                </div>
+              </div>
+            {/if}
+          </span>
         {/if}
         <div class="peer-count" title="Participants">
           <Icon name="users" size={16} />
@@ -1320,6 +1468,12 @@
                     <Icon name={copied ? 'check' : 'link'} size={16} />
                     {copied ? 'Copied!' : 'Copy invite link'}
                   </button>
+                  {#if sharePassword}
+                    <p class="tile-pw">
+                      They'll also need the password <code>{sharePassword}</code>
+                      <button class="link-btn" on:click={copySharePassword}>{pwCopied ? 'Copied' : 'Copy'}</button>
+                    </p>
+                  {/if}
                   {#if copyFailed}
                     <p role="alert">Couldn't copy it. Select the link below and copy it yourself:</p>
                     <span class="invite-link">{shareUrl}</span>
@@ -1696,6 +1850,68 @@
   .step-error {
     color: var(--danger);
     font-size: var(--text-sm);
+  }
+
+  .copy-wrap {
+    position: relative;
+    display: inline-flex;
+  }
+
+  .pw-hint {
+    position: absolute;
+    top: calc(100% + 8px);
+    right: 0;
+    z-index: 60;
+    width: max-content;
+    max-width: min(320px, calc(100vw - 32px));
+    padding: var(--space-3);
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-2);
+    font-size: var(--text-sm);
+    box-shadow: var(--shadow-lg);
+  }
+
+  .pw-hint p {
+    margin: 0;
+    color: var(--text-muted);
+  }
+
+  .pw-hint-row {
+    display: flex;
+    align-items: center;
+    gap: var(--space-2);
+  }
+
+  .pw-hint code,
+  .tile-pw code {
+    font-family: var(--font-mono, monospace);
+    font-size: var(--text-base);
+    white-space: nowrap;
+    padding: 2px 8px;
+    border-radius: var(--radius-sm);
+    background: var(--bg-elevated);
+    border: 1px solid var(--border-subtle);
+  }
+
+  .icon-only {
+    width: 30px;
+    padding: 0;
+    justify-content: center;
+  }
+
+  .tile-pw {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    justify-content: center;
+    gap: var(--space-2);
+  }
+
+  .other-browser {
+    margin: 0;
+    font-size: var(--text-sm);
+    color: var(--text-muted);
   }
 
   .landing-loading {
