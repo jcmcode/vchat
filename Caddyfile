@@ -6,10 +6,11 @@
 		output discard
 	}
 
-	# TURN over TLS on port 443 (caddy/turn-tls-on/). docker-compose.yml sets TURN_TLS=on when
-	# TURN_TLS_DOMAIN is set, and these two imports then load that folder's files. Otherwise the
-	# folder name below is "turn-tls-", which doesn't exist; because the path is a pattern (the *),
-	# it matches nothing and imports nothing, and Caddy runs exactly as it would without it.
+	# TURN over TLS on port 443 (caddy/turn-tls-on/), an opt-in add-on. docker-compose.turn-tls.yml
+	# sets TURN_TLS=on and builds an image that contains that folder; these two imports then load
+	# its files. Otherwise the folder name below is "turn-tls-", which doesn't exist (and the stock
+	# image has no turn-tls-on folder either); because the path is a pattern (the *), it matches
+	# nothing and imports nothing, and Caddy runs exactly as it would without these lines.
 	import turn-tls-{$TURN_TLS}/global*.caddy
 }
 

@@ -1,5 +1,5 @@
-# Site for the TURN-over-TLS hostname. The Caddyfile imports this file only when TURN_TLS_DOMAIN is
-# set. It exists so Caddy obtains and renews a certificate for the name (over HTTP on port 80, or
+# Site for the TURN-over-TLS hostname. The Caddyfile imports this file only when TURN_TLS=on. It
+# exists so Caddy obtains and renews a certificate for the name (over HTTP on port 80, or
 # TLS-ALPN on 443). TURN clients never reach it: global.caddy hands their connections to coturn.
 {$TURN_TLS_DOMAIN} {
 	tls {$ACME_EMAIL}

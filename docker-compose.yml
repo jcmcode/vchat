@@ -1,6 +1,7 @@
-# vchat on one server: Caddy (HTTPS + static app, and TURN over TLS on port 443), the signaling
-# server, and a coturn relay. No container keeps logs (logging driver "none"); see DOCS.md →
-# "Debugging with logs" to turn them on temporarily.
+# vchat on one server: Caddy (HTTPS + static app), the signaling server, and a coturn relay.
+# No container keeps logs (logging driver "none"); see DOCS.md → "Debugging with logs" to turn them
+# on temporarily. The relay on port 443 (TURN over TLS) is an opt-in add-on on top of this file:
+# docker-compose.turn-tls.yml.
 services:
   web:
     build:
@@ -12,13 +13,6 @@ services:
     environment:
       - DOMAIN=${DOMAIN}
       - ACME_EMAIL=${ACME_EMAIL}
-      # TURN over TLS on port 443 (caddy/turn-tls-on/), on when TURN_TLS_DOMAIN is set. Caddy passes
-      # those connections to coturn at TURN_TLS_UPSTREAM: deploy.sh sets it to the address on this
-      # server that outside traffic to the relay arrives at, because coturn relays from the address
-      # a client connected to. Without it, Caddy connects through the domain, like a browser would.
-      - TURN_TLS=${TURN_TLS_DOMAIN:+on}
-      - TURN_TLS_DOMAIN=${TURN_TLS_DOMAIN:-}
-      - TURN_TLS_UPSTREAM=${TURN_TLS_UPSTREAM:-${DOMAIN}:3478}
     volumes:
       - caddy_data:/data
       - caddy_config:/config
@@ -44,9 +38,8 @@ services:
       - ALLOWED_ORIGIN=https://${DOMAIN}
       # STUN from our own coturn, so browsers contact no third party.
       - STUN_URLS=stun:${DOMAIN}:3478
-      # Short-lived TURN credentials for coturn (TURN REST API / use-auth-secret). With
-      # TURN_TLS_DOMAIN set, browsers are also offered TURN over TLS on port 443 (through Caddy).
-      - TURN_URLS=turn:${DOMAIN}:3478?transport=udp,turn:${DOMAIN}:3478?transport=tcp${TURN_TLS_DOMAIN:+,turns:${TURN_TLS_DOMAIN}:443?transport=tcp}
+      # Short-lived TURN credentials for coturn (TURN REST API / use-auth-secret)
+      - TURN_URLS=turn:${DOMAIN}:3478?transport=udp,turn:${DOMAIN}:3478?transport=tcp
       - TURN_SECRET=${TURN_SECRET}
       # Private mode: the owner signs in at /admin and sends invite links. If ADMIN_PASSWORD is
       # missing, empty or short, the server reports a configuration error instead of running open
@@ -71,6 +64,7 @@ services:
       driver: none
 
   coturn:
+    # Pinned by digest; DOCS.md → "Updating pinned images" explains how to move it forward.
     image: coturn/coturn:4.19.0@sha256:0a3c026baaab092c79c9005823a72747bd09bf211071d537bb0865d95eae4638
     network_mode: host
     volumes:
