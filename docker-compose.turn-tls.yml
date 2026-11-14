@@ -1,11 +1,15 @@
 # Relay on port 443 (TURN over TLS through Caddy), on top of docker-compose.yml. Compose loads it
-# when COMPOSE_FILE in .env lists it, which deploy.sh sets only while the relay on port 443 is on
-# and its checks passed. See README.md → "Relay on port 443" and DOCS.md → "TURN over TLS on port 443".
+# when COMPOSE_FILE lists it: deploy.sh passes that in the environment while it builds and checks,
+# and writes it to .env only once every check passed, right before starting the containers.
+# See README.md → "Relay on port 443" and DOCS.md → "TURN over TLS on port 443".
 services:
   web:
     build:
       # Caddy built with the layer4 plugin (Dockerfile.web), instead of the stock image.
       target: web-turn-tls
+    # A name of its own, so the default web image stays as it is and deploy.sh can go back to it
+    # without building anything. deploy.sh builds it locally.
+    image: vchat-web-turn-tls
     environment:
       # Makes the Caddyfile import caddy/turn-tls-on/.
       - TURN_TLS=on
