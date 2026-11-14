@@ -26,7 +26,6 @@
   let tab: 'link' | 'email' = 'link';
   let copied = '';
   let showPassword = false;
-  let confirmRemove = false;
 
   const canShare = typeof navigator !== 'undefined' && 'share' in navigator;
   $: link = inviteUrl(room.roomId, room.inviteToken, room.key);
@@ -62,15 +61,6 @@
     } catch {
       // cancelled
     }
-  }
-
-  function remove() {
-    if (!confirmRemove) {
-      confirmRemove = true;
-      setTimeout(() => (confirmRemove = false), 4000);
-      return;
-    }
-    dispatch('remove', room);
   }
 
   function expiresIn(ts: number): string {
@@ -118,6 +108,14 @@
         <span class="chev" class:up={open}><Icon name="chevron-down" size={14} /></span>
       </button>
       <button class="btn primary" on:click={() => dispatch('start', room)}><Icon name="video" size={16} /> Start call</button>
+      <button
+        class="btn ghost icon delete"
+        title="Delete room"
+        aria-label="Delete {title}"
+        on:click={() => dispatch('remove', room)}
+      >
+        <Icon name="trash" size={16} />
+      </button>
     </div>
   </header>
 
@@ -245,12 +243,6 @@
           <p class="hint">If someone can't get in, send them their link and code by text.</p>
         </div>
       {/if}
-
-      <div class="foot">
-        <button class="link-btn danger" on:click={remove}>
-          {confirmRemove ? 'Click again to remove it from this list' : 'Remove from this list'}
-        </button>
-      </div>
     </div>
   {/if}
 </article>
@@ -496,26 +488,24 @@
     white-space: nowrap;
   }
 
-  .foot {
-    display: flex;
-    justify-content: flex-end;
-  }
-
-  .link-btn.danger {
+  .btn.delete:hover:not(:disabled) {
     color: var(--danger);
-    font-size: var(--text-sm);
+    background: var(--danger-soft);
   }
 
   @media (max-width: 480px) {
     .room {
       padding: var(--space-4);
     }
-    .main-actions,
-    .main-actions .btn {
+    .main-actions {
       width: 100%;
     }
     .main-actions .btn {
+      flex: 1 1 auto;
       justify-content: center;
+    }
+    .main-actions .btn.icon {
+      flex: 0 0 var(--control-h);
     }
   }
 </style>
