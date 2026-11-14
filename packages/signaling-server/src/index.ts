@@ -284,12 +284,22 @@ function getOrCreateRoom(roomId: string): Room<WebSocket> {
 }
 
 /**
- * Forget a room once nobody is in it and no create/join for it is still in flight. A room the host
- * just ended is kept (empty) for a minute, so it can refuse stragglers instead of being re-created.
+ * Rooms the host just ended, kept (empty) for a minute so they can turn stragglers away instead of
+ * being re-created. Capped, so churning through rooms (open mode) can't pile them up in memory.
  */
+const MAX_ENDED_ROOMS = 1000;
+const endedRooms = new Set<string>();
+
+/** Forget a room once nobody is in it and no create/join for it is still in flight. */
 function reapIfEmpty(roomId: string): void {
   const room = rooms.get(roomId);
-  if (room && room.isEmpty() && !pendingEnters.get(roomId) && !room.recentlyEnded()) rooms.delete(roomId);
+  if (!room || !room.isEmpty() || pendingEnters.get(roomId)) return;
+  if (room.recentlyEnded() && (endedRooms.has(roomId) || endedRooms.size < MAX_ENDED_ROOMS)) {
+    endedRooms.add(roomId);
+    return;
+  }
+  endedRooms.delete(roomId);
+  rooms.delete(roomId);
 }
 
 function leaveRoom(ws: WebSocket): void {
@@ -432,6 +442,7 @@ const housekeeping = setInterval(() => {
     reapIfEmpty(id);
     peers += room.peers().length;
   }
+  for (const id of endedRooms) if (!rooms.get(id)?.recentlyEnded()) endedRooms.delete(id);
   sweepApiState();
   if (DEBUG_LOGS && ++ticks % 12 === 0 && rooms.size > 0) {
     console.log(`[stats] ${rooms.size} room(s), ${peers} peer(s)`);
