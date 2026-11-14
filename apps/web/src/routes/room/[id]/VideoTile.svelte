@@ -3,6 +3,9 @@
   import { peerMediaState, type PeerConnection } from '$lib/webrtc/mesh';
   import type { Verification } from '$lib/webrtc/e2e';
   import { selectedAudioOutput } from '$lib/media/manager';
+  import { peerAudioPrefs } from '$lib/ui/participant-prefs';
+  import { playbackFor } from '$lib/ui/participants';
+  import { raisedHands } from '$lib/collab/hands';
   import Icon from '$lib/ui/Icon.svelte';
 
   export let peerConnection: PeerConnection;
@@ -41,6 +44,14 @@
       .setSinkId($selectedAudioOutput)
       .catch(() => {});
   }
+
+  // Volume and "Mute for me" from the person card: only how they play on this device.
+  $: playback = playbackFor($peerAudioPrefs.get(peerConnection.id));
+  $: if (videoEl) {
+    videoEl.volume = playback.volume;
+    videoEl.muted = playback.muted;
+  }
+  $: handRaised = $raisedHands.has(peerConnection.id);
 </script>
 
 <!-- svelte-ignore a11y-no-noninteractive-tabindex -->
@@ -51,7 +62,7 @@
   class:selectable
   role={selectable ? 'button' : undefined}
   tabindex={selectable ? 0 : undefined}
-  aria-label={selectable ? `${peerConnection.displayName}: message privately or send a file` : undefined}
+  aria-label={selectable ? `${peerConnection.displayName}${handRaised ? ', hand raised' : ''}${playback.muted ? ', muted for you' : ''}: message, send a file, volume or pin` : undefined}
   on:click={() => selectable && dispatch('select')}
   on:keydown={onKey}
 >
@@ -66,6 +77,9 @@
     </div>
   {/if}
   <slot />
+  {#if handRaised}
+    <span class="hand-badge" title="Hand raised"><Icon name="hand" size={15} /><span class="sr-only">hand raised</span></span>
+  {/if}
   <span class="tile-name">
     {#if verification === 'verified'}
       <span class="ver verified" title="Verified end-to-end"><Icon name="shield-check" size={13} /><span class="sr-only">verified</span></span>
@@ -75,6 +89,9 @@
     <span class="name-text">{peerConnection.displayName}{presenting ? ' · presenting' : ''}</span>
     {#if media?.audio === false}
       <span class="muted-dot" title="Muted"><Icon name="mic-off" size={13} /><span class="sr-only">muted</span></span>
+    {/if}
+    {#if playback.muted}
+      <span class="silenced" title="Muted for you"><Icon name="volume-x" size={13} /><span class="sr-only">muted for you</span></span>
     {/if}
   </span>
 </div>
@@ -198,5 +215,24 @@
     display: inline-flex;
     flex-shrink: 0;
     color: #f87171;
+  }
+
+  .silenced {
+    display: inline-flex;
+    flex-shrink: 0;
+    color: #fbbf24;
+  }
+
+  .hand-badge {
+    position: absolute;
+    top: var(--space-2);
+    left: var(--space-2);
+    display: inline-flex;
+    padding: 5px;
+    border-radius: var(--radius-pill);
+    background: var(--warning);
+    color: #1a1300;
+    box-shadow: var(--shadow-sm);
+    pointer-events: none;
   }
 </style>

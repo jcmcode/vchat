@@ -88,6 +88,13 @@
   import ReactionPicker from './ReactionPicker.svelte';
   import Whiteboard from './Whiteboard.svelte';
   import AnnotationLayer from './AnnotationLayer.svelte';
+  import { localHandRaised, toggleHand } from '$lib/collab/hands';
+  import { pinnedPeerId, unpinPeer } from '$lib/ui/participant-prefs';
+  import { selectStage } from '$lib/ui/participants';
+  import PersonControls from './PersonControls.svelte';
+  import HandToasts from './HandToasts.svelte';
+  import KeyboardShortcuts from './KeyboardShortcuts.svelte';
+  import ShortcutsHelp from './ShortcutsHelp.svelte';
 
   type JoinMode = 'video' | 'audio' | 'chat';
 
@@ -97,6 +104,7 @@
   let showChat = false;
   let showDeviceSettings = false;
   let showReactionPicker = false;
+  let showShortcuts = false;
   let peerList: PeerConnection[] = [];
   let localVideoEl: HTMLVideoElement;
   let localScreenEl: HTMLVideoElement;
@@ -156,16 +164,16 @@
   $: roomId = ($page.params.id ?? '').toLowerCase();
   $: peerList = Array.from($peers.values());
 
-  // ── Stage: whiteboard or a shared screen takes the main area; tiles move to a strip ──
-  $: remoteSharer = [...$sharingPeers].find((id) => $peers.has(id)) ?? null;
-  $: stage = $whiteboardOpen
-    ? 'whiteboard'
-    : $isScreenSharing
-      ? 'local-screen'
-      : remoteSharer
-        ? 'remote-screen'
-        : null;
-  $: stagePeer = stage === 'remote-screen' && remoteSharer ? $peers.get(remoteSharer) ?? null : null;
+  // ── Stage: whiteboard, a shared screen or the person you pinned takes the main area; tiles move to a strip ──
+  $: layout = selectStage({
+    whiteboardOpen: $whiteboardOpen,
+    localSharing: $isScreenSharing,
+    sharingPeers: $sharingPeers,
+    peerIds: $peers.keys(),
+    pinned: $pinnedPeerId,
+  });
+  $: stage = layout.stage;
+  $: stagePeer = layout.stagePeerId ? $peers.get(layout.stagePeerId) ?? null : null;
   $: stripPeers = stagePeer ? peerList.filter((p) => p.id !== stagePeer?.id) : peerList;
   $: gridCols = getGridCols(peerList.length + 1);
 
@@ -181,7 +189,7 @@
     for (const id of prevSharers) if (!$sharingPeers.has(id)) clearScreen(id);
     prevSharers = new Set($sharingPeers);
   }
-  $: if (!stage || stage === 'whiteboard') annotationTool.set('none');
+  $: if (stage !== 'local-screen' && stage !== 'remote-screen') annotationTool.set('none');
 
   // onMount is async: the user can leave (or the page can unmount) while we await a prompt.
   let destroyed = false;
@@ -544,6 +552,8 @@
     if ($connectionState === 'connected') wasConnected = true;
   }
   $: showReconnecting = wasConnected && $connectionState === 'disconnected';
+  // Keyboard shortcuts work in the call itself, not on the pre-join, password, waiting or error screens.
+  $: shortcutsEnabled = !showPrejoin && !$roomError && $admissionState === 'none' && (mediaReady || chatOnly);
 </script>
 
 {#if showPrejoin}
@@ -776,7 +786,7 @@
     <div class="call-col">
       <main class="call-area" class:has-stage={!!stage}>
         {#if stage}
-          <section class="stage" aria-label={stage === 'whiteboard' ? 'Whiteboard' : 'Shared screen'}>
+          <section class="stage" aria-label={stage === 'whiteboard' ? 'Whiteboard' : stage === 'pinned' ? 'Pinned participant' : 'Shared screen'}>
             {#if stage === 'whiteboard'}
               <Whiteboard on:close={closeWhiteboard} />
             {:else if stage === 'local-screen'}
@@ -788,6 +798,20 @@
                   <AnnotationLayer videoEl={localScreenEl} screen={$localPeerIdStore} />
                 {/if}
               </div>
+            {:else if stage === 'pinned' && stagePeer}
+              {#key stagePeer.id}
+                <VideoTile
+                  peerConnection={stagePeer}
+                  speaking={$speakingPeers.has(stagePeer.id)}
+                  contain
+                  verification={$verification.get(stagePeer.id)?.state}
+                  selectable
+                  on:select={() => (selectedPeerId = stagePeer?.id ?? null)}
+                />
+              {/key}
+              <button class="unpin-btn" on:click={unpinPeer} title="Put {stagePeer.displayName} back with everyone else">
+                <Icon name="pin" size={14} /> Unpin
+              </button>
             {:else if stagePeer}
               {#key stagePeer.id}
                 <VideoTile
@@ -813,6 +837,9 @@
               <div class="no-video">
                 <span class="avatar">{displayName.charAt(0).toUpperCase()}</span>
               </div>
+            {/if}
+            {#if $localHandRaised}
+              <span class="hand-badge" title="Your hand is raised"><Icon name="hand" size={15} /><span class="sr-only">Your hand is raised</span></span>
             {/if}
             <span class="tile-name">
               <span class="name-text">{displayName} (you){chatOnly ? ' · chat only' : ''}</span>
@@ -846,8 +873,10 @@
       <ReactionOverlay reactions={$reactionsStore} />
 
       {#if showDeviceSettings}
-        <DeviceSettings />
+        <DeviceSettings on:shortcuts={() => { showDeviceSettings = false; showShortcuts = true; }} />
       {/if}
+
+      <HandToasts />
 
       {#if showReactionPicker}
         <ReactionPicker on:react={(e) => { sendReaction(e.detail); showReactionPicker = false; }} />
@@ -932,6 +961,18 @@
             <span class="ctrl-label">React</span>
           </button>
 
+          <button
+            class="ctrl-btn"
+            class:active={$localHandRaised}
+            aria-pressed={$localHandRaised}
+            on:click={toggleHand}
+            title={$localHandRaised ? 'Lower your hand' : 'Raise your hand'}
+            aria-keyshortcuts="Control+Alt+H Control+Meta+H"
+          >
+            <Icon name="hand" size={22} />
+            <span class="ctrl-label">Hand</span>
+          </button>
+
           {#if !chatOnly}
             <button
               class="ctrl-btn"
@@ -981,6 +1022,11 @@
             </button>
             <input type="file" bind:this={personFileInput} on:change={sendFileToPerson} hidden />
           </div>
+          <PersonControls
+            peer={selectedPeer}
+            onStage={stage === 'pinned' && stagePeer?.id === selectedPeer.id}
+            on:pinned={() => (selectedPeerId = null)}
+          />
           {#if $verification.get(selectedPeer.id)?.code}
             <div class="safety-code">
               <span class="muted">Safety code</span>
@@ -1014,6 +1060,17 @@
     {/if}
   </div>
 </div>
+
+<KeyboardShortcuts
+  enabled={shortcutsEnabled}
+  {chatOnly}
+  whiteboardOpen={$whiteboardOpen}
+  on:chat={() => { showChat = !showChat; }}
+  on:help={() => { showShortcuts = !showShortcuts; }}
+/>
+{#if showShortcuts}
+  <ShortcutsHelp on:close={() => (showShortcuts = false)} />
+{/if}
 
 <style>
   .room {
@@ -1385,6 +1442,50 @@
     display: inline-flex;
     color: #f87171;
     flex-shrink: 0;
+  }
+
+  /* Raised hand on your own tile (VideoTile has the same for others) */
+  .hand-badge {
+    position: absolute;
+    top: var(--space-2);
+    left: var(--space-2);
+    display: inline-flex;
+    padding: 5px;
+    border-radius: var(--radius-pill);
+    background: var(--warning);
+    color: #1a1300;
+    box-shadow: var(--shadow-sm);
+    pointer-events: none;
+  }
+
+  /* Unpin, over the pinned person on the stage */
+  .unpin-btn {
+    position: absolute;
+    right: var(--space-2);
+    bottom: var(--space-2);
+    z-index: 3;
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 4px 10px;
+    border: 0;
+    border-radius: var(--radius-pill);
+    background: rgba(11, 13, 18, 0.62);
+    -webkit-backdrop-filter: blur(6px);
+    backdrop-filter: blur(6px);
+    color: #fff;
+    font-size: var(--text-xs);
+    font-weight: 500;
+    cursor: pointer;
+  }
+
+  .unpin-btn:hover {
+    background: rgba(11, 13, 18, 0.82);
+  }
+
+  .unpin-btn:focus-visible {
+    outline: 2px solid var(--accent-ring);
+    outline-offset: 2px;
   }
 
   /* ── Controls ───────────────────────────────────────────────────────── */
