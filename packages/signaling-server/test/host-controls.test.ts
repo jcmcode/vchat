@@ -4,8 +4,11 @@ import assert from 'node:assert/strict';
 import {
   CLOSE_ENDED,
   CLOSE_LOCKED,
+  CLOSE_UNAVAILABLE,
   ENDED_GRACE_MS,
   EndedCalls,
+  LOCK_GRACE_MS,
+  ROOM_CREATE_MAX_PER_CLIENT,
   Room,
   endedCalls,
   normalizeMeta,
@@ -42,17 +45,21 @@ const HOST = { role: 'host' as const, approval: false };
 const GUEST_OPEN = { role: 'guest' as const, approval: false };
 const GUEST_APPROVAL = { role: 'guest' as const, approval: true };
 
-async function privateRoom(id = 'priv') {
+// Ended-call and lock memories are per process and keyed by room id: give each room its own id.
+let seq = 0;
+const uid = (base: string) => `${base}${++seq}`;
+
+async function privateRoom(id = uid('priv')) {
   const room = new Room<Conn>(id, transport);
   const h = new Conn('h');
   await room.enter(h, who('h'), HOST);
   return { room, h };
 }
 
-async function openRoom(id = 'open', password?: string) {
+async function openRoom(id = uid('open'), password?: string) {
   const room = new Room<Conn>(id, transport);
   const h = new Conn('h');
-  await room.create(h, who('h', password ? { password } : {}));
+  await room.create(h, who('h', { clientId: uid('client'), ...(password ? { password } : {}) }));
   return { room, h };
 }
 
@@ -223,7 +230,7 @@ test('lock: stays locked when the host leaves (fail closed); only the returning 
   assert.ok(later.types().includes('room-peers'));
 });
 
-test('lock: stays locked while invited guests wait for an absent owner; forgotten once the room empties', async () => {
+test('lock: stays locked while invited guests wait for an absent owner; after the room empties, for a minute', async () => {
   const { room, h } = await privateRoom();
   const w = new Conn('w');
   await room.enter(w, who('w'), GUEST_APPROVAL);
@@ -232,11 +239,74 @@ test('lock: stays locked while invited guests wait for an absent owner; forgotte
   assert.equal(room.meta.locked, true);
   room.leave(w);
   assert.ok(room.isEmpty());
-  assert.equal(room.meta.locked, false);
+  assert.equal(room.meta.locked, false); // the room's own state is gone…
 
+  // …but it comes back locked: a new guest is refused while the owner is away.
   const g = new Conn('g');
   await room.enter(g, who('g'), GUEST_OPEN);
-  assert.ok(g.types().includes('room-peers'));
+  assert.equal(g.last().message, 'Room is locked');
+  assert.equal(g.closedWith, CLOSE_LOCKED);
+
+  // After the grace period it's simply gone.
+  await withClock(LOCK_GRACE_MS + 1, async () => {
+    const g2 = new Conn('g2');
+    await room.enter(g2, who('g2'), GUEST_OPEN);
+    assert.ok(g2.types().includes('room-peers'));
+    assert.equal(room.meta.locked, false);
+  });
+});
+
+test('lock: an owner alone whose connection blips finds the room still locked, and is told', async () => {
+  const { room, h } = await privateRoom();
+  room.setLocked(h, true);
+  h.open = false;
+  room.leave(h); // Wi-Fi blip: the room empties
+  assert.ok(room.isEmpty());
+
+  const stranger = new Conn('s');
+  await room.enter(stranger, who('s'), GUEST_OPEN);
+  assert.equal(stranger.last().message, 'Room is locked');
+
+  const h2 = new Conn('h2');
+  await room.enter(h2, who('h'), HOST);
+  assert.equal(room.meta.locked, true);
+  const types = h2.types();
+  assert.ok(types.indexOf('lock-changed') > types.indexOf('room-peers'));
+  // Unlocking forgets the remembered lock too.
+  room.setLocked(h2, false);
+  h2.open = false;
+  room.leave(h2);
+  const later = new Conn('later');
+  await room.enter(later, who('later'), GUEST_OPEN);
+  assert.ok(later.types().includes('room-peers'));
+});
+
+test('lock: open mode — the creator re-creating an emptied locked room gets it back locked; strangers cannot', async () => {
+  const { room, h } = await openRoom();
+  room.setLocked(h, true);
+  h.open = false;
+  room.leave(h);
+
+  const s = new Conn('s');
+  await room.create(s, who('stranger', { clientId: uid('client') }));
+  assert.equal(s.last().message, 'Room is locked');
+  assert.ok(room.isEmpty());
+
+  const h2 = new Conn('h2');
+  await room.create(h2, who('h', { clientId: uid('client') }));
+  assert.deepEqual(h2.types(), ['room-created', 'room-peers', 'lock-changed', 'host-changed']);
+  assert.equal(room.meta.locked, true);
+});
+
+test('lock: ending the call does not leave the lock behind', async () => {
+  const { room, h } = await privateRoom();
+  const g = new Conn('g');
+  await room.enter(g, who('g'), GUEST_OPEN);
+  room.setLocked(h, true);
+  room.endRoom(h);
+  const fresh = new Conn('f');
+  await room.enter(fresh, who('fresh'), GUEST_OPEN);
+  assert.ok(fresh.types().includes('room-peers'));
 });
 
 test('lock: open mode — the host passes on, the lock stays; the last one out clears it', async () => {
@@ -475,16 +545,26 @@ test('end: a re-join still hashing when the call ends does not bring the room ba
   assert.ok(priv.isEmpty());
 });
 
-test('end: a flood of create+end cycles cannot stop a real call from being remembered (oldest dropped)', async () => {
-  for (let i = 0; i < 5_100; i++) {
-    const r = new Room<Conn>(`churn${i}`, transport);
+test('end: one client churning through rooms is slowed down, and solo calls leave nothing to flush with', async () => {
+  // One client can only create so many rooms.
+  const client = uid('flooder');
+  let refused: Conn | null = null;
+  for (let i = 0; i <= ROOM_CREATE_MAX_PER_CLIENT; i++) {
     const c = new Conn();
-    await r.create(c, who('z'));
+    await new Room<Conn>(uid('churn'), transport).create(c, who('z', { clientId: client }));
+    if (c.last().type === 'error') refused = c;
+  }
+  assert.deepEqual(refused?.last(), { type: 'error', message: 'Too many new rooms' });
+
+  // Even across many clients, a call that only ever had its host in it isn't remembered.
+  const before = endedCalls.size;
+  for (let i = 0; i < 5_100; i++) {
+    const r = new Room<Conn>(uid('solo'), transport);
+    const c = new Conn();
+    await r.create(c, who('z', { clientId: uid('client') }));
     r.endRoom(c);
   }
-  assert.ok(endedCalls.size <= 5_000);
-  assert.equal(endedCalls.has('churn0'), false, 'the oldest entries went first');
-  assert.equal(endedCalls.has('churn5099'), true);
+  assert.equal(endedCalls.size, before);
 
   const { room, h } = await openRoom('legit');
   const p = new Conn('p');
@@ -495,6 +575,104 @@ test('end: a flood of create+end cycles cannot stop a real call from being remem
   await room.create(straggler, who('p'));
   assert.equal(straggler.last().type, 'room-ended');
   assert.ok(room.isEmpty());
+});
+
+test('end: a second call ended within the minute does not erase the first one', async () => {
+  const { room, h } = await openRoom();
+  const b = new Conn('b');
+  await room.join(b, who('b'));
+  room.admitPeer(h, 'b');
+  b.open = false;
+  room.leave(b); // b's laptop goes to sleep
+  room.endRoom(h);
+
+  // Someone else opens the same room and ends it again (with a guest, so it's remembered too).
+  const d = new Conn('d');
+  await room.create(d, who('d', { clientId: uid('client') }));
+  const e = new Conn('e');
+  await room.join(e, who('e'));
+  room.admitPeer(d, 'e');
+  room.endRoom(d);
+
+  const b2 = new Conn('b2');
+  await room.join(b2, who('b'));
+  assert.equal(b2.last().type, 'room-ended');
+  const e2 = new Conn('e2');
+  await room.join(e2, who('e'));
+  assert.equal(e2.last().type, 'room-ended');
+});
+
+test('EndedCalls: marking a room again merges identities and restarts the clock', () => {
+  const calls = new EndedCalls(10, 100, 1000);
+  calls.mark('r', [{ peerId: 'a', secretHash: 'ha' }], 0);
+  calls.mark('r', [{ peerId: 'b', secretHash: 'hb' }], 500);
+  assert.equal(calls.wasIn('r', 'a', 'ha', 1400), true);
+  assert.equal(calls.wasIn('r', 'b', 'hb', 1400), true);
+  // An expired entry isn't merged into a new one.
+  calls.mark('s', [{ peerId: 'a', secretHash: 'ha' }], 0);
+  calls.mark('s', [{ peerId: 'b', secretHash: 'hb' }], 2000);
+  assert.equal(calls.wasIn('s', 'a', 'ha', 2100), false);
+  calls.forget('r');
+  assert.equal(calls.has('r', 1400), false);
+});
+
+test('emails: room metadata keeps a keyed hash of an invite address, never the address', async () => {
+  const room = new Room<Conn>(uid('mail'), transport);
+  const h = new Conn('h');
+  await room.enter(h, who('h'), HOST);
+  const personal = { role: 'guest' as const, approval: true, email: 'someone.with.a.long.address@example.com', emailKey: 'k'.repeat(22) };
+  const g = new Conn('g');
+  await room.enter(g, who('g'), personal);
+  // The host still sees the address while they wait.
+  assert.equal(h.last('admission-request').email, personal.email);
+  room.admitPeer(h, 'g');
+  assert.equal(room.meta.admitted.g.e, personal.emailKey);
+  assert.equal([...room.members.values()].find((s) => s.peerId === 'g')?.email, undefined);
+  room.removePeer(h, 'g');
+  assert.equal(room.meta.removed[0].e, personal.emailKey);
+  assert.ok(!JSON.stringify(room.meta).includes('example.com'));
+  // Barred by the hash: the same invite on a fresh tab is still refused.
+  const back = new Conn('back');
+  await room.enter(back, who('g2'), personal);
+  assert.equal(back.last().type, 'removed');
+
+  // Without a keyed hash (core used directly), a plain hash is stored instead.
+  const r2 = new Room<Conn>(uid('mail'), transport);
+  const h2 = new Conn('h2');
+  await r2.enter(h2, who('h'), HOST);
+  const g2 = new Conn('g2');
+  await r2.enter(g2, who('g'), { role: 'guest', approval: false, email: 'plain@example.com' });
+  assert.match(r2.meta.admitted.g.e ?? '', /^[0-9a-f]{22}$/);
+});
+
+test('emails: a Cloudflare attachment at the caps stays under 16 KiB with hashed addresses', async () => {
+  const v8 = await import('node:v8');
+  const pid = (i: number) => `p${i}`.padEnd(30, 'x');
+  const h = 'a'.repeat(32);
+  const e = 'k'.repeat(22); // what metadata now holds instead of a ~60-character address
+  const admitted: Record<string, unknown> = {};
+  for (let i = 0; i < 72; i++) admitted[pid(i)] = { h, r: i < 8 ? 'host' : 'guest', ...(i >= 8 ? { e } : {}) };
+  const bar = (n: number, off: number) => Array.from({ length: n }, (_, i) => ({ p: pid(i + off), h, u: Date.now(), e }));
+  const meta = {
+    hostPeerId: pid(0),
+    passwordHash: 'f'.repeat(64),
+    passwordSalt: 'f'.repeat(32),
+    admitted,
+    removed: bar(32, 100),
+    denied: bar(16, 200),
+    locked: true,
+    creator: { p: pid(0), h },
+    createdAt: Date.now(),
+  };
+  const state = { peerId: pid(1), displayName: '一'.repeat(30), status: 'peer', secretHash: h, role: 'guest', emailKey: e };
+  const attachment = { roomId: 'abcdefgh', state, client: 'x'.repeat(22), connectedAt: Date.now(), idleSince: Date.now(), meta, mv: 123456 };
+  const size = v8.serialize(attachment).length;
+  assert.ok(size < 16 * 1024, `${size} bytes`);
+});
+
+test('CLOSE_UNAVAILABLE is a distinct no-retry code', () => {
+  assert.equal(CLOSE_UNAVAILABLE, 4006);
+  assert.notEqual(CLOSE_UNAVAILABLE, CLOSE_ENDED);
 });
 
 test('EndedCalls: bounded by entries and identities, expires, and never stores empty secrets', () => {

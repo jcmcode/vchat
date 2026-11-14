@@ -998,7 +998,11 @@ test('email invite: passcode:false gives a token with no code and approval force
   // Joins with no code…
   const decision = await authorizeJoin(inviteEnv, { roomId: room.roomId, token }, { clientId: 'np1' });
   assert.ok(decision.ok);
-  assert.deepEqual(decision.ok && decision.grant, { role: 'guest', approval: true, label: undefined, email: 'lobby@example.com' });
+  const { emailKey, ...grant } = decision.ok ? decision.grant : ({} as never);
+  assert.deepEqual(grant, { role: 'guest', approval: true, label: undefined, email: 'lobby@example.com' });
+  // Room metadata keeps a keyed hash of the address, never the address.
+  assert.match(emailKey ?? '', /^[A-Za-z0-9_-]{22}$/);
+  assert.ok(!emailKey?.includes('lobby'));
   // …and lands in the waiting queue, even before the host is there.
   const r = new Room<Conn>(room.roomId, transport);
   const g = new Conn();

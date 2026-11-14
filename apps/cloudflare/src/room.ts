@@ -10,6 +10,7 @@
 import { DurableObject } from 'cloudflare:workers';
 import {
   CLOSE_INVALID_INVITE,
+  CLOSE_UNAVAILABLE,
   PING_MESSAGE,
   PONG_MESSAGE,
   RateLimiter,
@@ -139,8 +140,12 @@ export class SignalingRoom extends DurableObject<Env> {
   private persist(ws: WebSocket, att: Attachment): void {
     try {
       ws.serializeAttachment({ ...att, meta: this.meta, mv: this.metaVersion } satisfies Attachment);
-    } catch {
-      // socket already closed — attachment is discarded anyway
+    } catch (err) {
+      // Usually the socket is already closed (its attachment is discarded anyway). Otherwise the
+      // attachment was refused (e.g. over the 16 KiB limit) and this state won't survive hibernation.
+      if (this.env.DEBUG_LOGS === '1' && ws.readyState === OPEN) {
+        console.log(`Attachment not saved: ${err instanceof Error ? err.message : 'unknown error'}`);
+      }
     }
   }
 
@@ -273,7 +278,9 @@ export class SignalingRoom extends DurableObject<Env> {
         // Members were told and closed by the Room. Close every other socket too (never entered,
         // password prompt, denied…), so no connection is left to keep a stale object around.
         if (room.endRoom(ws)) {
-          for (const other of this.ctx.getWebSockets()) if (other.readyState === OPEN) transport.close(other, 1000, 'Closing');
+          for (const other of this.ctx.getWebSockets()) {
+            if (other.readyState === OPEN) transport.close(other, CLOSE_UNAVAILABLE, 'Unavailable');
+          }
         }
         break;
     }
