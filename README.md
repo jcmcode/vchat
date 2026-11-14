@@ -133,7 +133,9 @@ With Docker, add the same three lines to `.env` (docker-compose passes them on),
 
 ## Deploy with Docker
 
-Works on any Linux server with Docker (1GB RAM is plenty; Ubuntu 22.04+ recommended) and a domain pointing at it.
+Works on any Linux server with Docker (Docker Compose 2.20 or newer; 1GB RAM is plenty; Ubuntu 22.04+ recommended) and a domain pointing at it.
+
+**DNS:** an A record for your domain pointing at the server, and a second one for the relay, `turn.your-domain` by default (see [Relay on port 443](#relay-on-port-443)). Set both to "DNS only" if your DNS provider can proxy traffic (Cloudflare's orange cloud).
 
 ```bash
 curl -fsSL https://get.docker.com | sh      # if Docker isn't installed
@@ -142,23 +144,29 @@ cd vchat
 sudo bash deploy.sh
 ```
 
-The script asks for your domain, an email for HTTPS certificates, the server's public IP (it suggests the one your domain points at) and an **owner password**. It then generates the signing and relay secrets, configures the firewall (it shows the SSH port(s) it will keep open and asks you to confirm), builds and starts everything, and checks that `https://your-domain/api/config` answers. Re-running it is safe, and existing invite links keep working.
+The script asks for your domain, an email for HTTPS certificates, the server's public IP (it suggests the one your domain points at), a hostname for the relay on port 443 (default `turn.your-domain`, or `none`) and an **owner password**. It then generates the signing and relay secrets, configures the firewall (it shows the SSH port(s) it will keep open and asks you to confirm), builds everything (the first build compiles Caddy, which takes a few minutes), checks the web server configuration before replacing the running containers, starts everything, and checks that `https://your-domain/api/config` and the relay on port 443 answer. Re-running it is safe: existing invite links keep working, and settings you added to `.env` yourself are kept.
 
 Then sign in at `https://your-domain/admin`.
 
 **What runs:**
 
-- **web**: Caddy serving the app with automatic HTTPS, with all logging discarded
+- **web**: Caddy serving the app with automatic HTTPS, with all logging discarded. It's built with the [layer4](https://github.com/mholt/caddy-l4) plugin (pinned versions) so it can also carry the relay on port 443
 - **signaling**: a small Node.js server for room signaling, owner sign-in, invites and short-lived relay credentials
-- **coturn**: your own STUN and TURN relay, with logging off. Browsers use it for STUN too, so a Docker deployment contacts no third-party servers. It refuses to relay to private or internal addresses or to the server itself, and has bandwidth quotas. It doesn't use TLS itself: the media it relays is already end-to-end encrypted
+- **coturn**: your own STUN and TURN relay, with logging off. Browsers use it for STUN too, so a Docker deployment contacts no third-party servers. It refuses to relay to private or internal addresses or to the server itself, and has bandwidth quotas. It doesn't use TLS itself: the media it relays is already end-to-end encrypted, and TLS on port 443 is done by Caddy
 
 Docker keeps no container logs (`logging: driver: none`). To debug, see [DOCS.md → Debugging with logs](DOCS.md#debugging-with-logs).
 
 **Tear down:** `docker compose down -v`.
 
-**Ports** (if your provider has an external firewall): your SSH port, 80/tcp + 443/tcp (HTTPS), 3478 tcp/udp (STUN/TURN), 61000–65535/udp (relay). The script must run as root (`sudo bash deploy.sh`).
+**Ports** (if your provider has an external firewall): your SSH port, 80/tcp + 443/tcp (HTTPS, and the relay over TLS), 3478 tcp/udp (STUN/TURN), 61000–65535/udp (relay). The script must run as root (`sudo bash deploy.sh`).
 
 **Prefer Cloudflare Access?** Run the containers behind a [Cloudflare Tunnel](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/), add `CF_ACCESS_TEAM_DOMAIN` + `CF_ACCESS_AUD` to `.env` (docker-compose passes them to the signaling service), and protect `/admin` and `/api/admin` exactly as described above.
+
+### Relay on port 443
+
+Some networks (offices, hotels, some mobile carriers) only let traffic out to port 443, which blocks the relay's port 3478. So the relay is also offered as TURN over TLS on port 443 (`turns:turn.your-domain:443`), like Cloudflare's relay. Port 443 is shared with the website: a browser connecting to the relay asks for the relay's hostname during the TLS handshake (SNI), so Caddy can tell the two apart. It completes the handshake with its own Let's Encrypt certificate for that name and passes the TURN connection on to coturn, where the same short-lived credentials, quotas and rules apply. Everything else on port 443 reaches the website as before.
+
+This needs the relay hostname's A record to point at the server. If it doesn't (yet), `deploy.sh` skips the relay on port 443 with a warning and deploys everything else; add the record and run the script again. Setting up by hand, put the name in `TURN_TLS_DOMAIN` in `.env` (empty turns it off; see `.env.example`). To check it from anywhere: `openssl s_client -connect turn.your-domain:443 -servername turn.your-domain` should show a valid certificate for that name.
 
 ---
 
@@ -234,6 +242,7 @@ vchat/
 ├── deploy.sh                    Interactive server deployment
 ├── docker-compose.yml           Containers (Caddy, signaling, coturn)
 ├── Caddyfile                    Reverse proxy + TLS
+├── caddy/turn-tls-on/           Caddy config for the relay on port 443 (TURN over TLS)
 └── turnserver.conf.template     coturn config template
 ```
 
