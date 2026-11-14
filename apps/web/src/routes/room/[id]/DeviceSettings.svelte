@@ -14,8 +14,10 @@
   import { replaceTrackOnAllPeers, useNewMicTrack } from '$lib/webrtc/mesh';
   import { rememberDevice } from '$lib/media/device-prefs';
   import { flipCamera, isTouchDevice, rememberCameraWhenInUse } from '$lib/media/call-camera';
+  import { createEventDispatcher, onMount } from 'svelte';
   import Icon from '$lib/ui/Icon.svelte';
-  import { onMount } from 'svelte';
+
+  const dispatch = createEventDispatcher<{ shortcuts: void }>();
 
   const touch = isTouchDevice();
   $: canFlip = touch && $videoEnabled && $videoDevices.length > 1;
@@ -108,6 +110,10 @@
       </select>
     </div>
   {/if}
+
+  <button type="button" class="shortcuts-link" on:click={() => dispatch('shortcuts')}>
+    <Icon name="keyboard" size={15} /> Keyboard shortcuts <kbd>?</kbd>
+  </button>
 </div>
 
 <style>
@@ -145,6 +151,32 @@
     margin-top: var(--space-2);
     gap: var(--space-2);
     align-self: flex-start;
+  }
+
+  .shortcuts-link {
+    display: inline-flex;
+    align-items: center;
+    gap: var(--space-2);
+    align-self: flex-start;
+    padding: 0;
+    border: 0;
+    background: none;
+    color: var(--accent);
+    font-size: var(--text-sm);
+    cursor: pointer;
+  }
+
+  .shortcuts-link:hover {
+    text-decoration: underline;
+  }
+
+  .shortcuts-link kbd {
+    padding: 0 5px;
+    border: 1px solid var(--border-strong);
+    border-radius: var(--radius-sm);
+    font-family: var(--font-mono);
+    font-size: var(--text-xs);
+    color: var(--text-muted);
   }
 
   .device-error {

@@ -18,7 +18,6 @@
       '<path d="M10.5 6H13a3 3 0 0 1 3 3v2.5"/><path d="M16 14.5V15a3 3 0 0 1-3 3H5a3 3 0 0 1-3-3V9a3 3 0 0 1 2-2.8"/><path d="M16 10.5l5.2-3a.6.6 0 0 1 .8.5v8a.6.6 0 0 1-.8.5l-1.7-1"/><path d="M3 3l18 18"/>',
     'switch-camera':
       '<path d="M4 8h3l2-3h6l2 3h3a1 1 0 0 1 1 1v9a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1V9a1 1 0 0 1 1-1z"/><path d="M9.5 12.5a2.5 2.5 0 0 1 4.3-1.7"/><path d="M14.5 13.5a2.5 2.5 0 0 1-4.3 1.7"/><path d="M14 9.3v1.7h-1.7"/><path d="M10 16.7V15h1.7"/>',
-    volume: '<path d="M4 9h3l5-4v14l-5-4H4z"/><path d="M16 9a4 4 0 0 1 0 6"/><path d="M18.5 6.5a7.5 7.5 0 0 1 0 11"/>',
     'screen-share':
       '<rect x="2" y="3" width="20" height="14" rx="2"/><path d="M8 21h8"/><path d="M12 17v4"/><path d="M12 13V8"/><path d="M9.5 10.5L12 8l2.5 2.5"/>',
     'screen-share-off':
@@ -64,6 +63,10 @@
     'file-text': '<path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path d="M14 2v6h6"/><path d="M16 13H8"/><path d="M16 17H8"/><path d="M10 9H8"/>',
     'mouse-pointer': '<path d="M3 3l7.100 17.500 2.500-7.900 7.900-2.500z"/><path d="M13 13l6 6"/>',
     hand: '<path d="M18 11V6a2 2 0 0 0-4 0v5"/><path d="M14 10V4a2 2 0 0 0-4 0v6"/><path d="M10 10.500V6a2 2 0 0 0-4 0v8"/><path d="M18 8a2 2 0 1 1 4 0v6a8 8 0 0 1-8 8h-2c-2.800 0-4.500-.900-6-2.400L2.400 16a2 2 0 0 1 2.800-2.800L7 15"/>',
+    pin: '<path d="M9 3h6"/><path d="M10 3v6l-4 4v2h12v-2l-4-4V3"/><path d="M12 15v6"/>',
+    volume: '<path d="M11 5L6 9H3v6h3l5 4z"/><path d="M15.500 8.500a5 5 0 0 1 0 7"/><path d="M18.500 5.500a9 9 0 0 1 0 13"/>',
+    'volume-x': '<path d="M11 5L6 9H3v6h3l5 4z"/><path d="M22 9l-6 6"/><path d="M16 9l6 6"/>',
+    keyboard: '<rect x="2" y="6" width="20" height="12" rx="2"/><path d="M6 10h.01"/><path d="M10 10h.01"/><path d="M14 10h.01"/><path d="M18 10h.01"/><path d="M7 14h10"/>',
     'zoom-in': '<circle cx="11" cy="11" r="7"/><path d="M21 21l-4.300-4.300"/><path d="M11 8v6"/><path d="M8 11h6"/>',
     'zoom-out': '<circle cx="11" cy="11" r="7"/><path d="M21 21l-4.300-4.300"/><path d="M8 11h6"/>',
     fit: '<path d="M3 8V5a2 2 0 0 1 2-2h3"/><path d="M16 3h3a2 2 0 0 1 2 2v3"/><path d="M21 16v3a2 2 0 0 1-2 2h-3"/><path d="M8 21H5a2 2 0 0 1-2-2v-3"/><rect x="8" y="8" width="8" height="8" rx="1"/>',
