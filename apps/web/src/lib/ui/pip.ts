@@ -9,10 +9,11 @@
 // the Content-Security-Policy whether or not the PiP document inherits it.
 //
 // Elsewhere (Safari, Chromium on Android): standard picture-in-picture on one video, picked by
-// pip-target.ts (shared screen, else the active speaker, else the first remote video). It plays
-// in a hidden, muted video element of our own that exists only from the click until PiP closes,
-// so the picture can follow the conversation without another click, and nothing extra plays the
-// rest of the time. Firefox has neither API: the button is hidden.
+// pip-target.ts (shared screen, else the active speaker, else the first remote video). It uses a
+// hidden, muted video element of our own, kept on the current pick but paused (no frames drawn)
+// while PiP is closed: Safari only opens PiP when it's requested synchronously in the click, on a
+// video that already has its metadata. It plays only while PiP is open, and the picture can
+// follow the conversation without another click. Firefox has neither API: the button is hidden.
 //
 // Both only ever show streams from connections that passed the trust gate, and close when the
 // call ends (leave, removed, replaced). Closing the PiP window leaves the call untouched.
@@ -67,12 +68,12 @@ let callGeneration = 0;
 export function togglePip(opts: PipOptions): void {
   if (get(open)) closePip();
   else if (pipMode === 'document') void openDocumentPip(opts);
-  else if (pipMode === 'video') void openVideoPip();
+  else if (pipMode === 'video') openVideoPip();
 }
 
 export function closePip(): void {
   if (docWindow) teardownDocumentPip();
-  endVideoPip();
+  if (pipVideo && document.pictureInPictureElement === pipVideo) document.exitPictureInPicture().catch(() => {});
   open.set(false);
 }
 
@@ -155,7 +156,7 @@ function teardownDocumentPip(): void {
 
 // ── Standard (video element) picture-in-picture ─────────────────────────────
 
-/** Our hidden video element: exists (and plays) only while standard PiP is opening or open. */
+/** Our hidden video element: on the current pick, paused unless PiP is open. */
 let pipVideo: HTMLVideoElement | null = null;
 let target: string | null = null;
 let activeSpeaker: string | null = null;
@@ -180,8 +181,31 @@ function candidates(): PipCandidate[] {
   });
 }
 
-/** Stop standard PiP: leave it, stop playing, and drop the element and its stream. */
-function endVideoPip(): void {
+/** The hidden element, created on first use. Muted: the call's sound plays from the tiles. */
+function ensureVideo(): HTMLVideoElement {
+  if (pipVideo) return pipVideo;
+  const video = document.createElement('video');
+  video.muted = true;
+  video.playsInline = true;
+  video.setAttribute('aria-hidden', 'true');
+  video.tabIndex = -1;
+  // Invisible but rendered, like a tile's video while the camera is off.
+  Object.assign(video.style, { position: 'fixed', right: '0', bottom: '0', width: '1px', height: '1px', opacity: '0', pointerEvents: 'none' });
+  video.addEventListener('enterpictureinpicture', () => {
+    open.set(true);
+    video.play().catch(() => {});
+  });
+  video.addEventListener('leavepictureinpicture', () => {
+    open.set(false);
+    video.pause();
+  });
+  document.body.append(video);
+  pipVideo = video;
+  return video;
+}
+
+/** Leave PiP and release the element and its stream (nobody to show, or the call ended). */
+function dropVideo(): void {
   const video = pipVideo;
   if (!video) return;
   pipVideo = null;
@@ -192,17 +216,16 @@ function endVideoPip(): void {
   open.set(false);
 }
 
-/** Show `stream` in the PiP video (while it exists), or end PiP if there's nothing to show. */
-function showInPip(stream: MediaStream | null): void {
-  if (!pipVideo) return;
+/** Keep the element on `stream`: playing while PiP is open, paused otherwise. */
+function attach(stream: MediaStream | null): void {
   if (!stream) {
-    endVideoPip();
+    dropVideo();
     return;
   }
-  if (pipVideo.srcObject !== stream) {
-    pipVideo.srcObject = stream;
-    pipVideo.play().catch(() => {});
-  }
+  const video = ensureVideo();
+  if (video.srcObject !== stream) video.srcObject = stream;
+  if (document.pictureInPictureElement === video) video.play().catch(() => {});
+  else video.pause();
 }
 
 function refreshFallback(): void {
@@ -211,54 +234,32 @@ function refreshFallback(): void {
   activeSpeaker = nextActiveSpeaker(activeSpeaker, get(speakingPeers), (id) => get(peers).has(id));
   const list = candidates();
   const wanted = pickPipPeer(list, activeSpeaker, target);
+  const showing = get(open);
   if (wanted !== target) {
     const currentOk = list.some((c) => c.id === target && c.hasVideo);
     const wait = lastSwitchAt + SWITCH_DWELL_MS - Date.now();
-    if (pipVideo && currentOk && wait > 0) {
+    if (showing && currentOk && wait > 0) {
       switchTimer = setTimeout(refreshFallback, wait);
-    } else if (!pipVideo || wanted || !target || !trustedStream(target)) {
+    } else if (!showing || wanted || !target || !trustedStream(target)) {
       // (While open, keep showing someone whose camera just went off rather than closing, unless they left.)
       target = wanted;
       lastSwitchAt = Date.now();
     }
   }
   hasTarget.set(!!wanted);
-  showInPip(target ? trustedStream(target) : null);
+  attach(target ? trustedStream(target) : null);
 }
 
-async function openVideoPip(): Promise<void> {
-  const stream = target ? trustedStream(target) : null;
-  if (pipVideo || !stream) return;
-  const video = document.createElement('video');
-  video.muted = true; // the call's sound plays from the tiles
-  video.playsInline = true;
-  video.setAttribute('aria-hidden', 'true');
-  video.tabIndex = -1;
-  // Rendered (so it can load) but invisible, like a tile's video while the camera is off.
-  Object.assign(video.style, { position: 'fixed', right: '0', bottom: '0', width: '1px', height: '1px', opacity: '0', pointerEvents: 'none' });
-  video.addEventListener('enterpictureinpicture', () => {
-    if (pipVideo === video) open.set(true);
-  });
-  video.addEventListener('leavepictureinpicture', () => {
-    if (pipVideo === video) endVideoPip();
-  });
-  document.body.append(video);
-  pipVideo = video;
+/** Synchronous on purpose: Safari only allows the request inside the click itself. */
+function openVideoPip(): void {
+  const video = pipVideo;
+  if (!video?.srcObject) return;
   lastSwitchAt = Date.now();
-  showInPip(stream);
-  try {
-    if (video.readyState < HTMLMediaElement.HAVE_METADATA) {
-      await new Promise<void>((resolve, reject) => {
-        const t = setTimeout(() => reject(new Error('video not ready')), 1500);
-        video.addEventListener('loadedmetadata', () => (clearTimeout(t), resolve()), { once: true });
-      });
-    }
-    if (pipVideo !== video) return; // ended while loading
-    await video.requestPictureInPicture();
-  } catch (err) {
+  video.play().catch(() => {});
+  video.requestPictureInPicture().catch((err: unknown) => {
     console.warn('Picture-in-picture is not available:', err instanceof Error ? err.message : err);
-    if (pipVideo === video) endVideoPip();
-  }
+    if (document.pictureInPictureElement !== video) video.pause();
+  });
 }
 
 // ── Lifecycle ───────────────────────────────────────────────────────────────
@@ -278,5 +279,6 @@ if (typeof window !== 'undefined') {
     switchTimer = null;
     target = null;
     activeSpeaker = null;
+    dropVideo();
   });
 }
