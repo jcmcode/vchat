@@ -72,6 +72,8 @@ export interface RoomMeta {
   removed: BarEntry[];
   /** Denied by the host while waiting: can't ask again until `u`. */
   denied: BarEntry[];
+  /** Locked by the host: new join attempts are refused (admitted peers and the owner still get in). */
+  locked: boolean;
   createdAt: number;
 }
 
@@ -116,9 +118,19 @@ export const DENY_COOLDOWN_MS = 5 * 60 * 1000;
 export const CLOSE_REMOVED = 4002;
 /** Close code for a connection replaced by the same identity elsewhere. */
 export const CLOSE_REPLACED = 4000;
+/** Close code sent to everyone when the host ends the call. Clients must not reconnect. */
+export const CLOSE_ENDED = 4004;
+/** Close code for a new join attempt refused because the host locked the room. Clients must not reconnect. */
+export const CLOSE_LOCKED = 4005;
+/**
+ * After the host ends the call, new entries are refused (with `room-ended`) for this long, except
+ * the owner's, so a participant who was offline at that moment can't quietly re-open the room.
+ * Memory only; on Cloudflare it lasts only while the Durable Object stays in memory.
+ */
+export const ENDED_GRACE_MS = 60 * 1000;
 
 function emptyMeta(): RoomMeta {
-  return { hostPeerId: null, passwordHash: null, admitted: admittedMap(), removed: [], denied: [], createdAt: Date.now() };
+  return { hostPeerId: null, passwordHash: null, admitted: admittedMap(), removed: [], denied: [], locked: false, createdAt: Date.now() };
 }
 
 /** Accept metadata restored from storage written by any version. */
@@ -135,6 +147,7 @@ export function normalizeMeta(meta: Partial<RoomMeta> | null | undefined): RoomM
     admitted,
     removed: Array.isArray(meta.removed) ? meta.removed : [],
     denied: Array.isArray(meta.denied) ? meta.denied : [],
+    locked: meta.locked === true,
     createdAt: meta.createdAt ?? Date.now(),
   };
 }
@@ -163,6 +176,8 @@ export class Room<C> {
   readonly id: string;
   meta: RoomMeta;
   readonly members = new Map<C, MemberState>();
+  /** When the host last ended the call (0 = not recently). Not room metadata: it outlives the reset. */
+  private endedAt = 0;
 
   constructor(
     id: string,
@@ -200,6 +215,11 @@ export class Room<C> {
     return this.members.has(conn);
   }
 
+  /** The host ended the call less than ENDED_GRACE_MS ago (backends keep the room object until then). */
+  recentlyEnded(now = Date.now()): boolean {
+    return this.endedAt > 0 && now - this.endedAt < ENDED_GRACE_MS;
+  }
+
   nextWaitingDeadline(): number | null {
     let next: number | null = null;
     for (const [, s] of this.waiting()) {
@@ -219,6 +239,7 @@ export class Room<C> {
       args.password ? hashPassword(salt, args.password) : Promise.resolve(null),
     ]);
 
+    if (this.refuseEnded(conn)) return;
     if (this.exists()) {
       this.error(conn, 'Room already exists');
       return;
@@ -248,10 +269,12 @@ export class Room<C> {
       args.password ? hashPassword(salt, args.password) : Promise.resolve(null),
     ]);
 
+    if (this.refuseEnded(conn)) return;
     if (!this.exists()) {
       this.error(conn, 'Room does not exist');
       return;
     }
+    const stillWaiting = this.isWaitingAs(args.peerId, secretHash, args.secret);
     this.removeQuietly(conn);
     if (this.refuseBarred(conn, args, secretHash)) return;
 
@@ -280,6 +303,8 @@ export class Room<C> {
       }
       passwordAttempts.refund(this.id, args.clientId);
     }
+    // Checked after the password, so only people who know it learn that the room is locked.
+    if (this.refuseLocked(conn, isReturning || stillWaiting)) return;
 
     if (this.peers().length >= MAX_PEERS_PER_ROOM) {
       this.error(conn, 'Room is full');
@@ -317,8 +342,11 @@ export class Room<C> {
    */
   async enter(conn: C, args: EnterArgs, grant: EnterGrant): Promise<void> {
     const secretHash = await hashSecret(args.secret);
-    this.removeQuietly(conn);
     const isHost = grant.role === 'host';
+    // The owner can always open the room again, even right after ending it.
+    if (this.refuseEnded(conn, isHost)) return;
+    const stillWaiting = this.isWaitingAs(args.peerId, secretHash, args.secret);
+    this.removeQuietly(conn);
     if (!isHost && this.refuseBarred(conn, args, secretHash, grant.email)) return;
 
     const prior = this.meta.admitted[args.peerId];
@@ -329,6 +357,8 @@ export class Room<C> {
       this.error(conn, 'Peer ID already in use');
       return;
     }
+    // A locked room still lets in the owner, admitted peers reconnecting, and guests already waiting.
+    if (!isHost && this.refuseLocked(conn, isReturning || stillWaiting)) return;
     if (!this.replaceDuplicate(conn, args.peerId, secretHash, args.secret, isReturning || isHost, grant.role)) return;
 
     // The owner can always get into their own room, even if guests filled it: one seat over the
@@ -439,6 +469,42 @@ export class Room<C> {
     this.metaChanged();
   }
 
+  /**
+   * Host only: lock or unlock the room. While locked, every new join attempt is refused (even with a
+   * valid invite); admitted peers can still reconnect, the owner can always get in, and guests
+   * already waiting stay in the queue for the host to admit or deny. Everyone in the call is told.
+   */
+  setLocked(hostConn: C, locked: boolean): void {
+    if (!this.requireHost(hostConn, locked ? 'lock' : 'unlock', 'the room')) return;
+    if (this.meta.locked === locked) {
+      this.send(hostConn, { type: 'lock-changed', locked });
+      return;
+    }
+    this.meta.locked = locked;
+    this.metaChanged();
+    this.broadcast({ type: 'lock-changed', locked });
+    this.log(`Host ${locked ? 'locked' : 'unlocked'} the room`);
+  }
+
+  /**
+   * Host only: end the call for everyone. Every participant and waiting guest is told
+   * (`room-ended`) and disconnected with CLOSE_ENDED, and everything about the room is forgotten.
+   * For ENDED_GRACE_MS afterwards new entries get the same answer, except the owner's.
+   */
+  endRoom(hostConn: C): void {
+    if (!this.requireHost(hostConn, 'end', 'the call')) return;
+    const everyone = [...this.members.keys()];
+    const notice = JSON.stringify({ type: 'room-ended', roomId: this.id, reason: 'Ended by host' });
+    for (const conn of everyone) {
+      this.sendRaw(conn, notice);
+      this.deleteMember(conn);
+    }
+    this.endedAt = Date.now();
+    this.reset();
+    for (const conn of everyone) this.transport.close(conn, CLOSE_ENDED, 'Ended by host');
+    this.log('Host ended the call');
+  }
+
   signal(conn: C, targetPeerId: string, signal: unknown): void {
     const from = this.members.get(conn);
     if (!from || from.status !== 'peer') return;
@@ -517,6 +583,7 @@ export class Room<C> {
     this.metaChanged();
 
     this.send(conn, { type: 'room-peers', peers: existingPeers, roomId: this.id });
+    if (this.meta.locked) this.send(conn, { type: 'lock-changed', locked: true });
     this.broadcast({ type: 'peer-joined', peerId: state.peerId, displayName: state.displayName }, conn);
 
     const host = this.currentHost();
@@ -581,6 +648,31 @@ export class Room<C> {
       return true;
     }
     return false;
+  }
+
+  /** A guest already in the waiting queue entering again (e.g. a new socket after a blip). */
+  private isWaitingAs(peerId: string, secretHash: string, secret: string | undefined): boolean {
+    const entry = this.findByPeerId(peerId);
+    return !!entry && !!secret && entry[1].status === 'waiting' && entry[1].secretHash === secretHash;
+  }
+
+  /** Refuse a new entry while the host has the room locked (`exempt`: returning or already waiting). */
+  private refuseLocked(conn: C, exempt: boolean): boolean {
+    if (!this.meta.locked || exempt) return false;
+    this.error(conn, 'Room is locked');
+    this.transport.close(conn, CLOSE_LOCKED, 'Room is locked');
+    return true;
+  }
+
+  /** Refuse an entry shortly after the host ended the call. The owner instead opens it again. */
+  private refuseEnded(conn: C, isOwner = false): boolean {
+    if (!this.recentlyEnded() || isOwner) {
+      this.endedAt = 0;
+      return false;
+    }
+    this.send(conn, { type: 'room-ended', roomId: this.id, reason: 'Ended by host' });
+    this.transport.close(conn, CLOSE_ENDED, 'Ended by host');
+    return true;
   }
 
   /** Drop a connection's membership without announcing it (used before re-entering). */
@@ -649,10 +741,10 @@ export class Room<C> {
     return true;
   }
 
-  private requireHost(conn: C, action: string): boolean {
+  private requireHost(conn: C, action: string, object = 'peers'): boolean {
     const state = this.members.get(conn);
     if (!state || state.status !== 'peer' || state.role === 'guest' || state.peerId !== this.meta.hostPeerId) {
-      this.error(conn, `Only the host can ${action} peers`);
+      this.error(conn, `Only the host can ${action} ${object}`);
       return false;
     }
     return true;

@@ -283,10 +283,13 @@ function getOrCreateRoom(roomId: string): Room<WebSocket> {
   return room;
 }
 
-/** Forget a room once nobody is in it and no create/join for it is still in flight. */
+/**
+ * Forget a room once nobody is in it and no create/join for it is still in flight. A room the host
+ * just ended is kept (empty) for a minute, so it can refuse stragglers instead of being re-created.
+ */
 function reapIfEmpty(roomId: string): void {
   const room = rooms.get(roomId);
-  if (room && room.isEmpty() && !pendingEnters.get(roomId)) rooms.delete(roomId);
+  if (room && room.isEmpty() && !pendingEnters.get(roomId) && !room.recentlyEnded()) rooms.delete(roomId);
 }
 
 function leaveRoom(ws: WebSocket): void {
@@ -356,6 +359,8 @@ async function handleMessage(ws: WebSocket, msg: ClientMessage): Promise<void> {
       else if (msg.type === 'admit-peer') room.admitPeer(ws, msg.peerId);
       else if (msg.type === 'deny-peer') room.denyPeer(ws, msg.peerId);
       else if (msg.type === 'remove-peer') room.removePeer(ws, msg.peerId);
+      else if (msg.type === 'lock-room' || msg.type === 'unlock-room') room.setLocked(ws, msg.type === 'lock-room');
+      else if (msg.type === 'end-room') room.endRoom(ws);
       reapIfEmpty(info.roomId);
     }
   }

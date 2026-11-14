@@ -240,6 +240,13 @@ export class SignalingRoom extends DurableObject<Env> {
       case 'remove-peer':
         room.removePeer(ws, msg.peerId);
         break;
+      case 'lock-room':
+      case 'unlock-room':
+        room.setLocked(ws, msg.type === 'lock-room');
+        break;
+      case 'end-room':
+        room.endRoom(ws);
+        break;
     }
     await this.scheduleAlarm();
   }
