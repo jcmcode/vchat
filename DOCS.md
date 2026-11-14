@@ -115,11 +115,23 @@ The Node server (`src/index.ts`) keeps a `Map<roomId, Room>` in memory. The Clou
 |---|---|
 | `lib/signaling/client.ts` | WebSocket client: keepalive pings, exponential-backoff reconnect, automatic re-entry |
 | `lib/webrtc/mesh.ts` | Peer connections, session ids, glare handling, ICE recovery, data-channel messages |
+| `lib/webrtc/media-slots.ts` | Which transceiver carries the microphone, camera and shared screen (pure, unit-tested) |
 | `lib/webrtc/file-transfer.ts` | Chunked, acknowledged, per-recipient file transfer (50MB max) |
-| `lib/media/manager.ts` | Camera/mic/screen capture, device switching, audio-only fallback |
+| `lib/media/manager.ts` | Camera/mic/screen capture, camera on/off, device switching, audio-only fallback |
+| `lib/media/quality.ts` | Upload caps for camera and screen by call size (pure policy, unit-tested) |
 | `lib/stores/room.ts` | Endpoints, ICE fetch, per-tab identity, preferences |
 
 The app is a static SPA (SvelteKit + adapter-static). Its Content-Security-Policy is emitted as a `<meta>` tag with a hash for SvelteKit's boot script (`svelte.config.js`), so it works on any host.
+
+### Media: camera, screen and quality
+
+**Transceiver layout** (`lib/webrtc/media-slots.ts`). Every connection has the same three media transceivers, created by the side that sends the offer: audio (the microphone, mixed with the shared screen's sound while presenting), then a video transceiver for the camera, then one for a shared screen. All three can send and receive from the start, also for someone who joined audio-only, chat-only or with the camera off. The answerer adds its microphone and camera first (the offer adopts them) and gets the rest from the offer; it lets them send while the offer is applied, and if its browser fires those events too late it asks the offerer for one more round (at most twice per connection). After that, turning the camera off or on and starting or stopping a share only changes the track a sender carries (`replaceTrack`), and every change goes through the trust gate: nothing, including the screen, is sent before the connection is verified. Microphone and camera share a stream id so the receiver keeps them lip-synced (an answerer whose camera was off when it connected needs `RTCRtpSender.setStreams` for that).
+
+**Which video is the screen.** It's never guessed. When sharing, the presenter tells each verified peer, in `screen-state { sharing: true, mid }`, the mid of its own screen transceiver on that connection. The receiver accepts a mid only in the form browsers write them (`[A-Za-z0-9_.{}-]`, at most 32 characters) and looks it up only among the transceivers of the connection it came over, as a live video transceiver, so a peer can only ever label its own video. Its camera is the first other video transceiver. The receiver builds its own streams from the transceivers (microphone + camera for the person's tile, the screen alone for the stage) and ignores stream ids in the session description. Viewers see the screen on the stage and the presenter's camera (or initial) in their tile; the stage never plays sound, because the shared audio is mixed into the presenter's microphone.
+
+**Camera off** stops the camera track, so the camera (and its light) is released, and points every peer's camera sender at nothing. Camera on asks for the selected camera again, or the default one if it's gone. If the camera is busy, unplugged or blocked, it stays off and the reason is shown. Choosing another camera while it's off only remembers the choice. A camera that stops by itself (unplugged) is treated as turned off. Peers are told through `media-state` either way.
+
+**Quality** (`lib/media/quality.ts`). In a mesh you upload a copy of your camera to each other person, so outgoing video is capped by the number of verified peers, to about 3.5 Mbps in total: 2.5 Mbps at 720p for one peer, down to 700 kbps at 480p each for five. While presenting, the screen gets 75% of that (all of it if the camera is off), a higher priority than the camera, `contentHint = 'detail'` and `degradationPreference = 'maintain-resolution'` where supported (text stays sharp and the frame rate gives way), and it's sent at up to 1080 lines. The caps are applied with `getParameters`/`setParameters` when peers are verified or leave, when a share starts or stops and when a track changes. Changes to one sender run one at a time, fields a browser refuses are dropped, and errors never escape.
 
 ---
 
@@ -131,7 +143,7 @@ Everything below travels over the WebRTC **data channels** between browsers. It'
 |---|---|---|
 | Chat and private messages | `mesh.ts`, `ChatPanel.svelte` | `chat` (a private message is sent only to its recipient's channel, with `private: true`), `typing` (private: recipient only) |
 | Mic/camera state | `mesh.ts` | `media-state { audio, video }`, sent on change and to newcomers |
-| Screen-share state | `mesh.ts` | `screen-state { sharing }`, which puts the presenter's screen on the stage |
+| Screen-share state | `mesh.ts`, `media-slots.ts` | `screen-state { sharing, mid }`, which puts the presenter's screen on the stage (`mid`: their screen transceiver, see [Media](#media-camera-screen-and-quality)) |
 | Screen annotations | `lib/collab/annotations.ts`, `AnnotationLayer.svelte` | `annot` with `pointer` / `pointer-off` / `stroke` / `remove` / `clear`, scoped by `screen` (the presenter's peer id) |
 | Whiteboard | `lib/collab/whiteboard.ts`, `Whiteboard.svelte`, `whiteboard/TextEditor.svelte` | `wb` with `stroke` / `update` / `remove` / `clear` / `opened` / `sync-req` / `sync` |
 | Room name | `lib/collab/room-meta.ts` | `room-name`, accepted only from the current host |
@@ -243,7 +255,7 @@ WebRTC encrypts everything between browsers (DTLS-SRTP), but the DTLS fingerprin
 
 - **Room key.** 256 random bits generated in the creator's browser. It only ever travels in the link's `#fragment` (`#invite=<token>&k=<key>`, or `#k=<key>` in open mode), which is stripped from the address bar before any network request. A pasted invite is kept in tab storage and opened without the fragment, so the key never lands in browser history. Old `?invite=` links are no longer accepted.
 - **One pinned transport per connection.** Every connection uses max-bundle + rtcp-mux, so there's exactly one DTLS transport. Session descriptions are parsed strictly: exactly one SHA-256 fingerprint, every active m-section bundled, one ICE username fragment. Fingerprint and ufrag are pinned, and any change on renegotiation blocks the connection. Fingerprints are also cross-checked against the certificates reported by `getStats()`.
-- **Trust gate.** Nothing flows until a connection is verified: your camera and microphone senders are held empty, received media isn't shown, and only verification messages cross the data channel.
+- **Trust gate.** Nothing flows until a connection is verified: your camera, microphone and screen senders are held empty, received media isn't shown, and only verification messages cross the data channel.
 - **Proof.** Each side sends an HMAC (key derived from the room key with HKDF) over the protocol version, room id, session id, both peer ids, both fingerprints and the sender's display name, as *it* sees them. An interceptor shows each side a different fingerprint and doesn't know the key, so the proofs can't match. A valid proof marks the connection **verified**, and the name shown for that person is authenticated. A wrong proof or mismatched details **blocks** the connection, with a warning. No proof (the peer doesn't have the key, e.g. typed the room code) or no answer within 20 seconds marks it **unverified**: it stays blocked unless you click "Allow anyway".
 - **Safety codes.** Tap a person to see a 12-digit code for your connection with them. Comparing it out loud detects even someone in the middle who has the room key.
 
@@ -268,8 +280,8 @@ These logs can contain IP addresses, room ids, names and (in Caddy's error log) 
 
 ## Known limitations
 
-- Mesh topology: upload bandwidth grows with each participant, so 6 is the practical cap.
-- Screen sharing replaces your camera feed. In audio-only mode there's no video track to swap, so remote peers won't see your screen.
+- Mesh topology: everyone uploads a copy of their video to each other person. Outgoing video is capped at about 3.5 Mbps in total, so with more people each copy gets a lower resolution, and encoding several copies costs CPU. 6 is the practical cap.
+- Only one shared screen is shown on the stage at a time (the first presenter's).
 - Switching microphones while sharing screen audio drops the screen audio until you re-share.
 - Firefox doesn't support choosing the speaker output on all platforms (`setSinkId`).
 

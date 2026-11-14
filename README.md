@@ -8,8 +8,9 @@ Your own private, end-to-end encrypted video calls. Deploy it on your domain, si
 - **No data, no logs**: no database, no accounts, no message history, and no server or container logs. Invite links are self-contained signed tokens
 - **2–6 people** per room
 - **Features**:
-  - Video, audio-only, or **chat-only** participation
-  - **Screen sharing** (with audio), plus a **laser pointer and drawing** over the shared screen that everyone sees
+  - Video, audio-only, or **chat-only** participation. Turning your camera off really releases it (the camera light goes off)
+  - **Screen sharing** (with audio) next to your camera, also when you joined audio-only, plus a **laser pointer and drawing** over the shared screen that everyone sees
+  - Video quality adapts to the size of the call, so upload stays around 3.5 Mbps even with six people
   - A **shared whiteboard** (pen, highlighter, text, eraser) you can export as **PDF** or PNG
   - Group chat, **private direct messages** and **files sent straight to one person** (tap them), and reactions
   - **Calendar and email invites**: download an `.ics` event or draft an email in your own mail app. Nothing is sent by vchat
