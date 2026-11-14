@@ -15,6 +15,7 @@ import {
   Room,
   WS_PROTOCOL,
   authorizeJoin,
+  endedCalls,
   socketRole,
   handleApi,
   ipKey,
@@ -283,23 +284,20 @@ function getOrCreateRoom(roomId: string): Room<WebSocket> {
   return room;
 }
 
-/**
- * Rooms the host just ended, kept (empty) for a minute so they can turn stragglers away instead of
- * being re-created. Capped, so churning through rooms (open mode) can't pile them up in memory.
- */
-const MAX_ENDED_ROOMS = 1000;
-const endedRooms = new Set<string>();
-
 /** Forget a room once nobody is in it and no create/join for it is still in flight. */
 function reapIfEmpty(roomId: string): void {
   const room = rooms.get(roomId);
-  if (!room || !room.isEmpty() || pendingEnters.get(roomId)) return;
-  if (room.recentlyEnded() && (endedRooms.has(roomId) || endedRooms.size < MAX_ENDED_ROOMS)) {
-    endedRooms.add(roomId);
-    return;
+  if (room && room.isEmpty() && !pendingEnters.get(roomId)) rooms.delete(roomId);
+}
+
+/**
+ * The host ended the call: members were told and closed by the Room. Close the room's other
+ * sockets too (never entered, at the password prompt, denied…), without saying why.
+ */
+function closeRoomSockets(roomId: string): void {
+  for (const client of wss.clients) {
+    if (sockets.get(client)?.roomId === roomId && client.readyState === client.OPEN) client.close(1000, 'Closing');
   }
-  endedRooms.delete(roomId);
-  rooms.delete(roomId);
 }
 
 function leaveRoom(ws: WebSocket): void {
@@ -370,7 +368,7 @@ async function handleMessage(ws: WebSocket, msg: ClientMessage): Promise<void> {
       else if (msg.type === 'deny-peer') room.denyPeer(ws, msg.peerId);
       else if (msg.type === 'remove-peer') room.removePeer(ws, msg.peerId);
       else if (msg.type === 'lock-room' || msg.type === 'unlock-room') room.setLocked(ws, msg.type === 'lock-room');
-      else if (msg.type === 'end-room') room.endRoom(ws);
+      else if (msg.type === 'end-room' && room.endRoom(ws)) closeRoomSockets(info.roomId);
       reapIfEmpty(info.roomId);
     }
   }
@@ -442,7 +440,7 @@ const housekeeping = setInterval(() => {
     reapIfEmpty(id);
     peers += room.peers().length;
   }
-  for (const id of endedRooms) if (!rooms.get(id)?.recentlyEnded()) endedRooms.delete(id);
+  endedCalls.sweep();
   sweepApiState();
   if (DEBUG_LOGS && ++ticks % 12 === 0 && rooms.size > 0) {
     console.log(`[stats] ${rooms.size} room(s), ${peers} peer(s)`);

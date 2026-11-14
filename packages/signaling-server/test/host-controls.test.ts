@@ -5,7 +5,9 @@ import {
   CLOSE_ENDED,
   CLOSE_LOCKED,
   ENDED_GRACE_MS,
+  EndedCalls,
   Room,
+  endedCalls,
   normalizeMeta,
   parseClientMessage,
   type MemberState,
@@ -333,7 +335,7 @@ test('end: only the host can end the call', async () => {
 
 test('end: every participant and waiting guest is told, closed with 4004, and the room is forgotten', async () => {
   const metaChanges: unknown[] = [];
-  const room = new Room<Conn>('priv', transport, { onMetaChange: (m) => metaChanges.push(m) });
+  const room = new Room<Conn>('allgone', transport, { onMetaChange: (m) => metaChanges.push(m) });
   const h = new Conn('h');
   const g = new Conn('g');
   const w = new Conn('w');
@@ -342,9 +344,9 @@ test('end: every participant and waiting guest is told, closed with 4004, and th
   await room.enter(w, who('w'), GUEST_APPROVAL);
   room.setLocked(h, true);
 
-  room.endRoom(h);
+  assert.equal(room.endRoom(h), true);
   for (const c of [h, g, w]) {
-    assert.deepEqual(c.last(), { type: 'room-ended', roomId: 'priv', reason: 'Ended by host' });
+    assert.deepEqual(c.last(), { type: 'room-ended', roomId: 'allgone', reason: 'Ended by host' });
     assert.equal(c.closedWith, CLOSE_ENDED);
   }
   // Nobody is told someone "left": the call is simply over.
@@ -354,62 +356,100 @@ test('end: every participant and waiting guest is told, closed with 4004, and th
   assert.deepEqual(Object.keys(room.meta.admitted), []);
   assert.equal(room.meta.hostPeerId, null);
   assert.deepEqual(metaChanges.at(-1), null);
-  assert.equal(room.recentlyEnded(), true);
+  assert.equal(endedCalls.has('allgone'), true);
+  assert.equal(room.endRoom(g), false);
 });
 
-test('end: for a minute, stragglers get room-ended instead of re-opening the room (open mode)', async () => {
-  const { room, h } = await openRoom('gone');
+test('end: a participant who was offline is told on return; strangers just see no room (open mode)', async () => {
+  const { room, h } = await openRoom('gone', 'pw');
+  const a = new Conn('a');
+  await room.join(a, who('a', { password: 'pw' }));
+  room.admitPeer(h, 'a');
+  // a's connection drops (the server notices) just before the host ends the call.
+  a.open = false;
+  room.leave(a);
   room.endRoom(h);
 
-  // A participant who was offline at that moment reconnects and tries to re-create the room.
+  // a's tab reconnects on its own and, finding the room empty, tries to re-create it.
   const stale = new Conn('stale');
-  await room.create(stale, who('stale'));
+  await room.create(stale, who('a'));
   assert.equal(stale.last().type, 'room-ended');
   assert.equal(stale.closedWith, CLOSE_ENDED);
-  const joiner = new Conn('joiner');
-  await room.join(joiner, who('joiner'));
-  assert.equal(joiner.last().type, 'room-ended');
-  assert.ok(room.isEmpty());
+  const stale2 = new Conn('stale2');
+  await room.join(stale2, who('a'));
+  assert.equal(stale2.last().type, 'room-ended');
 
-  // After the grace period the code is free again (open mode: anyone may create rooms).
+  // Strangers learn nothing: no room, as if it never existed (and the old password is gone).
+  const s = new Conn('s');
+  await room.join(s, who('stranger'));
+  assert.deepEqual(s.last(), { type: 'error', message: 'Room does not exist' });
+  assert.equal(s.open, true);
+  assert.ok(!s.types().includes('room-ended'));
+  // Same peer id but another secret is not the same identity.
+  const guess = new Conn('guess');
+  await room.join(guess, { peerId: 'a', displayName: 'a', secret: 'guessed' });
+  assert.deepEqual(guess.last(), { type: 'error', message: 'Room does not exist' });
+  // Open mode: anyone may create a room, including this code, right away.
+  const fresh = new Conn('fresh');
+  await room.create(fresh, who('stranger'));
+  assert.deepEqual(fresh.types(), ['room-created', 'room-peers', 'host-changed']);
+  assert.equal(room.meta.passwordHash, null);
+
+  // After the grace period, the old identities are forgotten too.
   await withClock(ENDED_GRACE_MS + 1, async () => {
-    assert.equal(room.recentlyEnded(), false);
-    const fresh = new Conn('fresh');
-    await room.create(fresh, who('fresh'));
-    assert.deepEqual(fresh.types(), ['room-created', 'room-peers', 'host-changed']);
+    assert.equal(endedCalls.has('gone'), false);
   });
 });
 
-test('end: invited guests are refused during the grace period; the owner can open the room again at once', async () => {
+test('end: an owner device that was offline cannot quietly re-open the room; a fresh owner join can', async () => {
   const { room, h } = await privateRoom('again');
-  room.endRoom(h);
-
   const g = new Conn('g');
   await room.enter(g, who('g'), GUEST_OPEN);
-  assert.equal(g.last().type, 'room-ended');
-  assert.equal(g.closedWith, CLOSE_ENDED);
+  const laptop = new Conn('laptop');
+  await room.enter(laptop, who('owner-laptop'), HOST); // the owner on a second device (takes the role)
+  const h2 = new Conn('h2');
+  await room.enter(h2, who('h'), HOST); // the first device takes it back
+  laptop.open = false;
+  room.leave(laptop); // the laptop goes offline
+  assert.equal(room.endRoom(h2), true);
 
+  // The offline owner device reconnects automatically, with its old identity: refused, even as host.
+  const back = new Conn('back');
+  await room.enter(back, who('owner-laptop'), HOST);
+  assert.equal(back.last().type, 'room-ended');
+  assert.equal(back.closedWith, CLOSE_ENDED);
+  const back2 = new Conn('back2');
+  await room.enter(back2, who('h'), HOST);
+  assert.equal(back2.last().type, 'room-ended');
+  // A guest from the ended call too.
+  const g2 = new Conn('g2');
+  await room.enter(g2, who('g'), GUEST_OPEN);
+  assert.equal(g2.last().type, 'room-ended');
+  assert.ok(room.isEmpty());
+
+  // Opening the room again on purpose is a fresh join (the client forgot the old identity).
   const owner = new Conn('owner');
-  await room.enter(owner, who('h'), HOST);
+  await room.enter(owner, who('owner-fresh'), HOST);
   assert.ok(owner.types().includes('room-peers'));
-  assert.equal(room.recentlyEnded(), false);
-  // The room is fresh: a guest on an approval invite waits for the owner as usual.
+  // The room is fresh: a new guest on an approval invite waits for the owner as usual.
   const w = new Conn('w');
   await room.enter(w, who('w'), GUEST_APPROVAL);
   assert.equal(w.last().type, 'waiting-for-admission');
 });
 
-test('end: after the grace period an invite opens a fresh room (the guest waits for the owner)', async () => {
+test('end: after the grace period an old identity simply opens a fresh room', async () => {
   const { room, h } = await privateRoom('later');
+  const g = new Conn('g');
+  await room.enter(g, who('g'), GUEST_APPROVAL);
   room.endRoom(h);
   await withClock(ENDED_GRACE_MS + 1, async () => {
     const w = new Conn('w');
-    await room.enter(w, who('w'), GUEST_APPROVAL);
+    await room.enter(w, who('g'), GUEST_APPROVAL);
     assert.deepEqual(w.last(), { type: 'waiting-for-admission', roomId: 'later', hostPresent: false });
   });
 });
 
-test('end: a join still hashing when the call ends does not bring the room back', async () => {
+test('end: a re-join still hashing when the call ends does not bring the room back', async () => {
   const { room, h } = await openRoom('race');
   const g = new Conn('g');
   await room.join(g, who('g'));
@@ -426,9 +466,122 @@ test('end: a join still hashing when the call ends does not bring the room back'
 
   const { room: priv, h: owner } = await privateRoom('race2');
   const n = new Conn('n');
-  const pendingEnter = priv.enter(n, who('n'), GUEST_OPEN);
+  await priv.enter(n, who('n'), GUEST_OPEN);
+  const n2 = new Conn('n2');
+  const pendingEnter = priv.enter(n2, who('n'), GUEST_OPEN);
   priv.endRoom(owner);
   await pendingEnter;
-  assert.equal(n.last().type, 'room-ended');
+  assert.equal(n2.last().type, 'room-ended');
   assert.ok(priv.isEmpty());
 });
+
+test('end: a flood of create+end cycles cannot stop a real call from being remembered (oldest dropped)', async () => {
+  for (let i = 0; i < 5_100; i++) {
+    const r = new Room<Conn>(`churn${i}`, transport);
+    const c = new Conn();
+    await r.create(c, who('z'));
+    r.endRoom(c);
+  }
+  assert.ok(endedCalls.size <= 5_000);
+  assert.equal(endedCalls.has('churn0'), false, 'the oldest entries went first');
+  assert.equal(endedCalls.has('churn5099'), true);
+
+  const { room, h } = await openRoom('legit');
+  const p = new Conn('p');
+  await room.join(p, who('p'));
+  room.admitPeer(h, 'p');
+  room.endRoom(h);
+  const straggler = new Conn('s');
+  await room.create(straggler, who('p'));
+  assert.equal(straggler.last().type, 'room-ended');
+  assert.ok(room.isEmpty());
+});
+
+test('EndedCalls: bounded by entries and identities, expires, and never stores empty secrets', () => {
+  const calls = new EndedCalls(3, 5, 1000);
+  calls.mark('a', [{ peerId: 'p', secretHash: 'h1' }], 0);
+  calls.mark('b', [{ peerId: 'p', secretHash: 'h2' }, { peerId: 'q', secretHash: 'h3' }], 1);
+  calls.mark('c', [{ peerId: 'p', secretHash: 'h4' }], 2);
+  calls.mark('d', [{ peerId: 'p', secretHash: 'h5' }], 3);
+  assert.equal(calls.has('a', 3), false, 'oldest evicted at the entry cap');
+  calls.mark('e', [1, 2, 3].map((n) => ({ peerId: `x${n}`, secretHash: 's' })), 4);
+  assert.equal(calls.has('b', 4), false, 'oldest evicted at the identity cap');
+  assert.equal(calls.wasIn('e', 'x2', 's', 4), true);
+  assert.equal(calls.wasIn('e', 'x2', 'other', 4), false);
+  assert.equal(calls.wasIn('e', 'x2', 's', 1004), false, 'expired');
+  calls.mark('f', [{ peerId: 'p', secretHash: '' }], 5);
+  assert.equal(calls.has('f', 5), false);
+  calls.sweep(10_000);
+  assert.equal(calls.size, 0);
+});
+
+// ── Review fixes ─────────────────────────────────────────────────────────────
+
+test('open mode: the creator gets the host role back after a blip, and the stand-in loses it', async () => {
+  const { room, h } = await openRoom('blip');
+  const b = new Conn('b');
+  await room.join(b, who('b'));
+  room.admitPeer(h, 'b');
+
+  h.open = false;
+  room.leave(h); // network blip
+  assert.equal(room.meta.hostPeerId, 'b');
+  // The stand-in can't remove the creator while they're away.
+  room.removePeer(b, 'h');
+  assert.equal(b.last().message, "The room's creator can't be removed");
+  assert.ok(room.meta.admitted.h);
+
+  const h2 = new Conn('h2');
+  await room.join(h2, who('h'));
+  assert.equal(room.meta.hostPeerId, 'h');
+  assert.deepEqual(b.last('host-changed'), { type: 'host-changed', hostPeerId: 'h' });
+  room.setLocked(b, true);
+  assert.equal(b.last().message, 'Only the host can lock the room');
+  room.endRoom(b);
+  assert.equal(b.last().message, 'Only the host can end the call');
+  assert.equal(room.peers().length, 2);
+});
+
+test('open mode: the creator identity survives a restore, and needs the right secret', async () => {
+  const { room, h } = await openRoom('blip2');
+  const b = new Conn('b');
+  await room.join(b, who('b'));
+  room.admitPeer(h, 'b');
+  h.open = false;
+  room.leave(h);
+
+  const meta = JSON.parse(JSON.stringify(room.meta));
+  assert.equal(meta.creator.p, 'h');
+  const members: [Conn, MemberState][] = [...room.members].map(([c, s]) => [c, JSON.parse(JSON.stringify(s))]);
+  const woken = new Room<Conn>('blip2', transport, {}, { meta, members });
+
+  // Someone using the creator's peer id without the secret never gets the role, even if the
+  // creator's admitted entry were gone and the stand-in let them in.
+  delete woken.meta.admitted.h;
+  const imp = new Conn('imp');
+  await woken.join(imp, { peerId: 'h', displayName: 'h', secret: 'not-the-secret' });
+  woken.admitPeer(b, 'h');
+  assert.ok(imp.types().includes('room-peers'));
+  assert.equal(woken.meta.hostPeerId, 'b');
+  woken.leave(imp);
+
+  woken.meta.admitted.h = { h: meta.creator.h, r: 'open' };
+  const h2 = new Conn('h2');
+  await woken.join(h2, who('h'));
+  assert.equal(woken.meta.hostPeerId, 'h');
+  assert.equal(normalizeMeta({ ...meta, creator: { p: 1 } })?.creator, null);
+});
+
+test('lock: a waiting guest re-entering with a second (no-approval) invite goes back to waiting', async () => {
+  const { room, h } = await privateRoom('twoinvites');
+  const w = new Conn('w');
+  await room.enter(w, who('w'), GUEST_APPROVAL);
+  room.setLocked(h, true);
+  const w2 = new Conn('w2');
+  await room.enter(w2, who('w'), GUEST_OPEN);
+  assert.equal(w2.last().type, 'waiting-for-admission');
+  assert.ok(!w2.types().includes('room-peers'));
+  assert.equal(room.peers().length, 1);
+  assert.equal(room.waiting().length, 1);
+});
+

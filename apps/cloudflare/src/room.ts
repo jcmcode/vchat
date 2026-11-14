@@ -245,7 +245,11 @@ export class SignalingRoom extends DurableObject<Env> {
         room.setLocked(ws, msg.type === 'lock-room');
         break;
       case 'end-room':
-        room.endRoom(ws);
+        // Members were told and closed by the Room. Close every other socket too (never entered,
+        // password prompt, denied…), so no connection is left to keep a stale object around.
+        if (room.endRoom(ws)) {
+          for (const other of this.ctx.getWebSockets()) if (other.readyState === OPEN) transport.close(other, 1000, 'Closing');
+        }
         break;
     }
     await this.scheduleAlarm();
