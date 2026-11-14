@@ -8,7 +8,7 @@
     "build": "vite build",
     "preview": "vite preview",
     "check": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json",
-    "test": "tsx --test src/lib/chat/*.test.ts src/lib/collab/*.test.ts src/lib/webrtc/*.test.ts src/lib/*.test.ts"
+    "test": "tsx --test src/lib/*/*.test.ts src/lib/*.test.ts"
   },
   "dependencies": {
     "nanoid": "^5.0.4",
