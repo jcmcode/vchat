@@ -1,6 +1,7 @@
 # vchat on one server: Caddy (HTTPS + static app), the signaling server, and a coturn relay.
 # No container keeps logs (logging driver "none"); see DOCS.md → "Debugging with logs" to turn them
-# on temporarily.
+# on temporarily. The relay on port 443 (TURN over TLS) is an opt-in add-on on top of this file:
+# docker-compose.turn-tls.yml.
 services:
   web:
     build:
@@ -63,7 +64,8 @@ services:
       driver: none
 
   coturn:
-    image: coturn/coturn:4.19
+    # Pinned by digest; DOCS.md → "Updating pinned images" explains how to move it forward.
+    image: coturn/coturn:4.19.0@sha256:0a3c026baaab092c79c9005823a72747bd09bf211071d537bb0865d95eae4638
     network_mode: host
     volumes:
       - ./turnserver.conf:/etc/coturn/turnserver.conf:ro

@@ -6,9 +6,11 @@
 4. [Signaling protocol](#signaling-protocol)
 5. [Reconnection](#reconnection)
 6. [Security and privacy model](#security-and-privacy-model)
-7. [Debugging with logs](#debugging-with-logs)
-8. [Known limitations](#known-limitations)
-9. [Desktop app](#desktop-app)
+7. [TURN over TLS on port 443 (Docker)](#turn-over-tls-on-port-443-docker)
+8. [Debugging with logs](#debugging-with-logs)
+9. [Updating pinned images](#updating-pinned-images)
+10. [Known limitations](#known-limitations)
+11. [Desktop app](#desktop-app)
 
 ---
 
@@ -114,6 +116,8 @@ On Cloudflare, Cloudflare terminates TLS, so it sees the same signaling traffic 
                      TURN (optional relay):
                      coturn (Docker) or Cloudflare Realtime TURN
 ```
+
+In the Docker setup, browsers reach coturn on port 3478 (UDP and TCP) and, if the optional add-on is on, as TURN over TLS on port 443 through Caddy (see [TURN over TLS on port 443](#turn-over-tls-on-port-443-docker)).
 
 ### Shared core
 
@@ -342,6 +346,7 @@ A socket is bound to the room it was authorized for at the upgrade (`/ws?room=`)
 - **Access.** Private mode: only the owner can create rooms. Guests need a signed, expiring invite, plus an optional password and owner approval. TURN credentials are only issued to invite/host holders, so strangers can't use your relay.
 - **Rooms.** Unguessable 10-char codes (private) or 8-char codes (open). Room passwords are verified against a keyed hash in the invite (private) or a SHA-256 hash in memory (open).
 - **TURN credentials.** Short-lived (4h by default, never past the invite's expiry): coturn uses a shared-secret HMAC (`use-auth-secret`) with a unique `<expiry>:<random>` username per response, and Cloudflare credentials come from its API (cached briefly per role and room). No TURN password is baked into the frontend. coturn has per-user and total quotas, a per-session and total bandwidth cap, and refuses to relay to private, special-purpose, NAT64/Teredo and cloud-metadata addresses or any address of the host itself.
+- **TURN over TLS on port 443 (Docker, optional).** Off by default. When on, Caddy routes one hostname to coturn's TCP listener and nothing else, coturn's credentials, quotas and peer rules apply unchanged, and coturn itself still has no TLS listener. Details in [TURN over TLS on port 443](#turn-over-tls-on-port-443-docker).
 - **Input validation.** All signaling messages are validated, size-limited (64KB; 32KB for a signal payload) and rate-limited per connection. WebSocket origins are checked. The Node server drops clients that stop reading (over 1MB queued).
 - **Peer data.** Names shown in chat come from the server's validated list, not from what a peer claims over the data channel. SVG files aren't previewed inline. Links in chat are only `http(s)`, show the normalized address they open (punycode hostnames), and are never previewed or fetched.
 - **Storage.** Chat is kept in memory only and never written to storage: it is gone when you leave, are removed, refresh or close the tab. Saving it yourself with Save chat is the only time chat is written anywhere: the text file is made in your browser and downloaded, and nothing is uploaded. The invite token, room key and per-room identity live in sessionStorage so a refresh can rejoin; they are cleared when you leave the call or are removed from it (if the tab is closed without leaving, the browser may keep them for its own "reopen closed tab" feature until the session ends). localStorage holds your display name, TURN preferences, whether you turned on waiting-room notifications, the microphone, camera and speaker you last picked (`vchat_devices`: browser device ids, opaque strings that are specific to this site and that the browser already remembers for it; cleared with the site's data) and, on the owner's own browser, the rooms they created (including their host links and room keys, which grant host access until they expire). Expired rooms are pruned and the list is cleared on sign-out. Don't use the owner dashboard on a shared computer.
@@ -352,7 +357,7 @@ A socket is bound to the room it was authorized for at the upgrade (`/ws?room=`)
 - **Screen wake lock.** During a call (and while waiting to be admitted) the page asks the browser to keep the screen on, where supported. It's asked for again when the page becomes visible, and released when you leave, are removed, or the call ends with an error.
 - **Hide my IP address.** An optional pre-join setting makes the browser use only the TURN relay (`iceTransportPolicy: relay`), so other participants see the relay's address instead of yours. It needs TURN to be configured.
 - **Server hardening.** In private mode a WebSocket is only accepted with a valid invite or host token, sent as a subprotocol so it never appears in URLs. Invite links carry the token after `#`, which browsers never send to servers. Owner logins are throttled (see above). Room-password guesses are limited to 10 per room and client per 10 minutes, with a backstop of 200 per room; on Cloudflare the client is identified by an HMAC of its IP keyed with `SECRET_KEY`, never the raw address. These throttles live in memory (per process, or per Durable Object/isolate on Cloudflare) and forget clients once their window passes. Configuration fails closed.
-- **No logs.** Room activity is only logged with `DEBUG_LOGS=1`. Workers Logs are disabled in `wrangler.jsonc`. In the Docker setup, Caddy discards all logs (its error log would otherwise include IPs and the token header), coturn's logging is off, and every container uses Docker's `none` logging driver.
+- **No logs.** Room activity is only logged with `DEBUG_LOGS=1`. Workers Logs are disabled in `wrangler.jsonc`. In the Docker setup, Caddy discards all logs, including the layer4 module's (its error log would otherwise include IPs and the token header), coturn's logging is off, and every container uses Docker's `none` logging driver.
 
 ### End-to-end verification
 
@@ -370,6 +375,36 @@ What this doesn't cover: the server serves the web app's JavaScript, so a malici
 
 ---
 
+## TURN over TLS on port 443 (Docker)
+
+> **New and optional.** So far this has only been verified by reviewing the configuration, not on a real server. It's off unless you turn it on in `deploy.sh`; see the [checks after enabling](#checks-after-enabling).
+
+For networks that only let traffic out to port 443, the relay can also answer as `turns:<TURN_TLS_DOMAIN>:443?transport=tcp`, next to the website on the same port.
+
+**How it's switched on.** `deploy.sh` keeps your answer in `.env` (`TURN_TLS=on`/`off`) with the hostname (`TURN_TLS_DOMAIN`). Only while it's on and every check passes does it add `docker-compose.turn-tls.yml` to `COMPOSE_FILE` in `.env`. That add-on builds the `web-turn-tls` target of `Dockerfile.web` (the stock Caddy image plus a Caddy binary compiled with the [layer4](https://github.com/mholt/caddy-l4) plugin: Caddy 2.11.9, caddy-l4 v0.1.3), sets `TURN_TLS=on` for Caddy so the Caddyfile imports `caddy/turn-tls-on/`, and adds the `turns:` URL to the relay URLs browsers get. Without it, the web image is the stock Caddy image, nothing is compiled, and the Caddyfile imports nothing extra. If the DNS check, the build, the configuration check (`caddy validate`, before the running containers are replaced) or the site check after starting fails, `deploy.sh` deploys without it and says why, keeping your answer and the hostname for the next run.
+
+**How a connection is routed.** A layer4 listener wrapper sits in front of Caddy's HTTPS server on port 443. It reads each new connection's TLS ClientHello (waiting up to 10 seconds for it) and, if the server name (SNI) is the relay hostname and it isn't an ACME TLS-ALPN challenge, takes the connection over: Caddy completes the TLS handshake with its own certificate for the name (obtained through the site block in `caddy/turn-tls-on/site.caddy`; ALPN `stun.turn` is offered, handshakes time out after 10 seconds) and passes the decrypted TURN stream to coturn's plain TCP listener. Every other connection goes to the website unchanged. The rule routes one name to one fixed address, so it can't be used as an open proxy, and its logs go to Caddy's discarded log like everything else.
+
+**What coturn sees.** coturn keeps `no-tls`, so it gets no TLS listener or certificate copy, and the relay still only works with valid short-lived credentials. Between Caddy and coturn, TURN runs over plain TCP, as it does for `turn:` clients on port 3478 (the media inside is end-to-end encrypted). coturn sees these clients with Caddy's address instead of their own. None of its protections depend on client addresses: quotas count per credential and in total, bandwidth caps apply per session and in total, and `denied-peer-ip` rules are about relay targets. The PROXY protocol, which would pass the real address on, isn't used: coturn only accepts it on a separate listener (`tcp-proxy-port`) that replaces its plain TCP listener, which would break `turn:` over TCP on port 3478.
+
+**The upstream address (`TURN_TLS_UPSTREAM`).** coturn relays from the local address a client connected to. So Caddy has to connect to coturn on the address where outside traffic to port 3478 arrives. If it uses another one, `turns:` connections and allocations still work, but relayed media never arrives: the relay is bound to an address outside traffic doesn't reach. `deploy.sh` guesses the address once (the public IP if it's on an interface, otherwise the default route's source address, otherwise the domain), prints it, and from then on keeps whatever is in `.env`. The guess is wrong for a DigitalOcean Reserved IP (traffic arrives at the droplet's anchor IP), a host with several public IPs, or a VPN or exit node as the default route. In those cases set `TURN_TLS_UPSTREAM` in `.env` to the right `address:3478` and run `deploy.sh` again.
+
+**What `deploy.sh` checks after starting.** It sends a STUN Binding request over TLS to `TURN_TLS_DOMAIN:443`, verifying the certificate. An answer proves the DNS record, the SNI routing, the certificate and Caddy's TCP path to coturn. It doesn't prove relaying: it doesn't allocate, and relaying can't be tested from the server itself because coturn refuses to relay to the server's own addresses. A wrong `TURN_TLS_UPSTREAM` isn't detected; only a real call is.
+
+**Resources.** Compiling Caddy runs Go one package at a time with a soft 512MiB memory limit, before the other images are built. On a 1GB server without swap it may still run out of memory; `deploy.sh` then deploys without the relay on port 443. At runtime each relayed connection costs the web container roughly 100KB (two 32KB copy buffers plus TLS state). At coturn's limit of 300 allocations in total that's about 30MB, well within the container's 256MB limit, which stays as it is. Connections that never set up an allocation are dropped by coturn after `max-allocate-timeout` (60 seconds by default).
+
+### Checks after enabling
+
+- The image builds on your server's architecture (amd64 or arm64), and on a 1GB server if that's what you use (`deploy.sh` warns if it fell back).
+- `openssl s_client -connect turn.your-domain:443 -servername turn.your-domain` shows a valid certificate for that name, and the website and `https://your-domain/api/config` still answer.
+- A call works from a network that only allows port 443 (or a test machine with outgoing UDP and TCP 3478 blocked) in Chrome, Firefox and Safari. In `chrome://webrtc-internals`, the selected candidate pair should be a relay candidate over `tls`.
+- Behind 1:1 NAT or a Reserved IP, that media actually flows over that connection, not just that it connects. If calls through `turns:` connect but stay black and silent, `TURN_TLS_UPSTREAM` is wrong.
+- With a firewall other than ufw, Caddy's container can reach `TURN_TLS_UPSTREAM` on TCP (container to host).
+
+To turn it off, run `deploy.sh` and answer no (or remove the `COMPOSE_FILE` line from `.env` and run `docker compose up -d --build`).
+
+---
+
 ## Debugging with logs
 
 Logging is off everywhere by default. To investigate a problem on a Docker deployment, turn it on temporarily and turn it off again afterwards:
@@ -383,6 +418,16 @@ These logs can contain IP addresses, room ids, names and (in Caddy's error log) 
 
 ---
 
+## Updating pinned images
+
+The Docker setup pins its images by digest: Caddy's runtime and builder images in `Dockerfile.web`, and coturn in `docker-compose.yml` (plus the caddy-l4 version in `Dockerfile.web`). A pinned image never changes under you, but it also doesn't pick up security fixes by itself. Image publishers rebuild their tags from time to time (coturn re-pushes `4.19.0` with each rebuild, for example), each time under a new digest, and a digest no tag points to any more can eventually stop being pullable, which would make deployments fail. So move the pins forward now and then:
+
+1. Pick the versions: the image tags on Docker Hub, and for caddy-l4 its GitHub releases (its `go.mod` must not require a newer Caddy than the one you pin).
+2. Look up each tag's multi-platform digest, e.g. `docker buildx imagetools inspect caddy:2.11.9-alpine` (the `Digest:` line at the top). Do the same for `caddy:2.11.9-builder-alpine` and `coturn/coturn:4.19.0`.
+3. Update the tag and digest in `Dockerfile.web` and `docker-compose.yml` (and the Caddy version in the `xcaddy build` line, which must match the builder image), then run `sudo bash deploy.sh`.
+
+---
+
 ## Known limitations
 
 - Mesh topology: everyone uploads a copy of their video to each other person. Outgoing video is capped at about 3.5 Mbps in total, so with more people each copy gets a lower resolution, and encoding several copies costs CPU. 6 is the practical cap.
@@ -393,6 +438,7 @@ These logs can contain IP addresses, room ids, names and (in Caddy's error log) 
 - The screen wake lock needs a browser with the Screen Wake Lock API, and the browser may refuse it (battery saver, for example).
 - Per-person volume has no effect on iPhone and iPad, where browsers ignore volume changes on media elements. "Mute for me" still works.
 - The pop-out window with everyone in it needs Chromium on desktop (Document Picture-in-Picture). Safari and Chromium on Android pop out a single video, and Firefox has no web API for picture-in-picture, so the button is hidden there.
+- Docker setup: two people who can only connect through the relay (for example both on HTTPS-only networks, or both using "Hide my IP address") can't reach each other, because coturn refuses to relay to its own address (`denied-peer-ip`), and that includes the other person's relay address. Allowing it would also open the host's other UDP services to relayed traffic.
 
 ---
 

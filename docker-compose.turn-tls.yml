@@ -1,0 +1,20 @@
+# Relay on port 443 (TURN over TLS through Caddy), on top of docker-compose.yml. Compose loads it
+# when COMPOSE_FILE in .env lists it, which deploy.sh sets only while the relay on port 443 is on
+# and its checks passed. See README.md → "Relay on port 443" and DOCS.md → "TURN over TLS on port 443".
+services:
+  web:
+    build:
+      # Caddy built with the layer4 plugin (Dockerfile.web), instead of the stock image.
+      target: web-turn-tls
+    environment:
+      # Makes the Caddyfile import caddy/turn-tls-on/.
+      - TURN_TLS=on
+      - TURN_TLS_DOMAIN=${TURN_TLS_DOMAIN:?TURN_TLS_DOMAIN must be set in .env}
+      # Where Caddy hands relay connections to coturn: the address on this server that outside
+      # traffic to port 3478 arrives at, because coturn relays from the address a client connected to.
+      - TURN_TLS_UPSTREAM=${TURN_TLS_UPSTREAM:?TURN_TLS_UPSTREAM must be set in .env}
+
+  signaling:
+    environment:
+      # docker-compose.yml's relay URLs plus TURN over TLS on port 443 (keep the first two in sync).
+      - TURN_URLS=turn:${DOMAIN}:3478?transport=udp,turn:${DOMAIN}:3478?transport=tcp,turns:${TURN_TLS_DOMAIN:?TURN_TLS_DOMAIN must be set in .env}:443?transport=tcp
