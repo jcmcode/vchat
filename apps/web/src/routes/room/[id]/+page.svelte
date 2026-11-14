@@ -32,6 +32,7 @@
     stopSharingScreen,
     roomLocked,
     callEnded,
+    roomJoined,
     type PeerConnection,
   } from '$lib/webrtc/mesh';
   import { startWaitingAlerts } from '$lib/ui/attention';
@@ -714,7 +715,7 @@
         <h1 class="room-id" title={roomId}>{$roomName || roomId}</h1>
       {/if}
       {#if $hostStatus}
-        <HostControls locked={$roomLocked} connected={$connectionState === 'connected'} />
+        <HostControls locked={$roomLocked} connected={$roomJoined} />
       {/if}
       {#if $roomLocked}
         <span class="chip warning" title="The host locked this call: nobody new can join" role="status">

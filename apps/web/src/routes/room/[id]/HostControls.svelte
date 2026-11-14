@@ -1,7 +1,8 @@
 <script lang="ts">
   // The host's menu: lock/unlock the call, opt in to "someone's waiting" notifications, and end the
   // call for everyone (with a confirm step). The server enforces who may do this; this is only UI.
-  import { setRoomLocked, endCallForEveryone } from '$lib/webrtc/mesh';
+  import { onDestroy } from 'svelte';
+  import { setRoomLocked, endCallForEveryone, hostActionError } from '$lib/webrtc/mesh';
   import {
     waitingAlertsEnabled,
     enableWaitingAlerts,
@@ -13,15 +14,50 @@
 
   /** As reported by the server. */
   export let locked = false;
-  /** Signaling is connected (commands can't be sent otherwise). */
+  /** We're in the room on a live connection (commands are refused or lost otherwise). */
   export let connected = true;
+
+  /** How long to wait for the server to confirm a lock change or end the call. */
+  const CONFIRM_TIMEOUT_MS = 6000;
+  const NOT_CONNECTED = "You're not connected right now. Try again once you're back in the call.";
+  const NO_ANSWER = "The server didn't confirm. Check your connection and try again.";
 
   let open = false;
   let confirmEnd = false;
   let alertNote = '';
+  let actionError = '';
+  /** The lock state we asked for and are waiting to hear back about. */
+  let pendingLock: boolean | null = null;
+  let ending = false;
+  let pendingTimer: ReturnType<typeof setTimeout> | null = null;
   let root: HTMLDivElement;
   let trigger: HTMLButtonElement;
   const supported = notificationsSupported();
+
+  $: if (pendingLock !== null && locked === pendingLock) settle('');
+  // The server refused (we're no longer the host), or the connection dropped mid-request.
+  $: if ($hostActionError) {
+    settle('');
+    open = true;
+  }
+  $: if (!connected && (pendingLock !== null || ending)) settle(NOT_CONNECTED);
+  $: shownError = actionError || $hostActionError;
+
+  function settle(error: string) {
+    if (pendingTimer) clearTimeout(pendingTimer);
+    pendingTimer = null;
+    pendingLock = null;
+    ending = false;
+    actionError = error;
+  }
+
+  function waitForServer() {
+    if (pendingTimer) clearTimeout(pendingTimer);
+    pendingTimer = setTimeout(() => settle(NO_ANSWER), CONFIRM_TIMEOUT_MS);
+  }
+  onDestroy(() => {
+    if (pendingTimer) clearTimeout(pendingTimer);
+  });
 
   function toggleMenu() {
     open = !open;
@@ -36,7 +72,14 @@
   }
 
   function toggleLock() {
-    setRoomLocked(!locked);
+    const want = !locked;
+    settle('');
+    if (!setRoomLocked(want)) {
+      actionError = NOT_CONNECTED;
+      return;
+    }
+    pendingLock = want;
+    waitForServer();
   }
 
   async function toggleAlerts() {
@@ -56,11 +99,15 @@
       confirmEnd = true;
       return;
     }
+    settle('');
+    confirmEnd = false;
     if (!endCallForEveryone()) {
-      confirmEnd = false;
+      actionError = NOT_CONNECTED;
       return;
     }
-    close();
+    // The page switches to "Call ended" when the server confirms; until then, say so here.
+    ending = true;
+    waitForServer();
   }
 
   function onWindowClick(e: MouseEvent) {
@@ -93,10 +140,10 @@
 
   {#if open}
     <div class="host-menu card fade-in" role="dialog" aria-label="Host controls">
-      <button class="menu-item" on:click={toggleLock} disabled={!connected}>
+      <button class="menu-item" on:click={toggleLock} disabled={!connected || pendingLock !== null || ending}>
         <span class="item-icon" class:on={locked}><Icon name="lock" size={16} /></span>
         <span class="item-text">
-          <strong>{locked ? 'Unlock the call' : 'Lock the call'}</strong>
+          <strong>{pendingLock !== null ? (pendingLock ? 'Locking…' : 'Unlocking…') : locked ? 'Unlock the call' : 'Lock the call'}</strong>
           <small>{locked ? 'People with an invite can join again.' : 'Nobody new can join, even with an invite. People already waiting stay.'}</small>
         </span>
       </button>
@@ -111,7 +158,9 @@
       {#if alertNote}<p class="note" role="alert">{alertNote}</p>{/if}
 
       <div class="end-area">
-        {#if confirmEnd}
+        {#if ending}
+          <p class="confirm-text" role="status">Ending the call for everyone…</p>
+        {:else if confirmEnd}
           <p class="confirm-text" role="alert">End the call for everyone? Everyone is disconnected, including people waiting.</p>
           <div class="confirm-actions">
             <button class="btn small ghost" on:click={() => (confirmEnd = false)}>Cancel</button>
@@ -125,7 +174,8 @@
           </button>
         {/if}
       </div>
-      {#if !connected}<p class="note">Reconnecting… these controls work again once you're back.</p>{/if}
+      {#if shownError}<p class="note error" role="alert">{shownError}</p>{/if}
+      {#if !connected}<p class="note">Reconnecting… these controls work again once you're back in the call.</p>{/if}
     </div>
   {/if}
 </div>
@@ -257,6 +307,10 @@
     padding: 0 var(--space-3) var(--space-2);
     font-size: var(--text-xs);
     color: var(--text-muted);
+  }
+
+  .note.error {
+    color: var(--danger);
   }
 
   .end-area {

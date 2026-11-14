@@ -105,6 +105,16 @@ export const localPeerIdStore = writable<string>('');
 export const roomLocked = writable<boolean>(false);
 /** The call was ended for everyone: by the host, or by you as the host. Cleared on the next join. */
 export const callEnded = writable<'host' | 'you' | null>(null);
+/** We're in the room right now (admitted on this connection; false while reconnecting). */
+export const roomJoined = writable<boolean>(false);
+/** Why the server refused our last lock/unlock/end request ('' if it didn't). */
+export const hostActionError = writable<string>('');
+
+const HOST_ACTION_ERRORS: Record<string, string> = {
+  'Only the host can lock the room': "Couldn't lock the call: you're not the host any more.",
+  'Only the host can unlock the room': "Couldn't unlock the call: you're not the host any more.",
+  'Only the host can end the call': "Couldn't end the call: you're not the host any more.",
+};
 
 // ── Extension points for collaboration features ─────────────────────────────
 // Whiteboard, annotations etc. register their own data-channel message types here, so they ride
@@ -521,6 +531,8 @@ export async function joinRoom(opts: JoinOptions): Promise<void> {
   hostStatus.set(false);
   roomLocked.set(false);
   callEnded.set(null);
+  roomJoined.set(false);
+  hostActionError.set('');
   endRequested = false;
   knownNames.clear();
   serverNames.clear();
@@ -584,8 +596,14 @@ export async function joinRoom(opts: JoinOptions): Promise<void> {
     callEnded.set(endRequested ? 'you' : 'host');
     forceOut(endRequested ? 'You ended the call for everyone.' : 'The host ended the call.');
   });
-  on('lock-changed', (event) => roomLocked.set(event.locked === true));
+  on('lock-changed', (event) => {
+    roomLocked.set(event.locked === true);
+    hostActionError.set('');
+  });
+  on('disconnected', () => roomJoined.set(false));
   on('error', (event) => {
+    const hostError = HOST_ACTION_ERRORS[String(event.message)];
+    if (hostError) hostActionError.set(hostError);
     if (event.message === 'Only the host can end the call') endRequested = false;
     // Refused because the host locked the room. We never got in: release the camera and forget the
     // invite in this tab, as being removed does (the client won't knock again either).
@@ -596,6 +614,7 @@ export async function joinRoom(opts: JoinOptions): Promise<void> {
     admissionState.set('none');
     roomError.set('');
     roomLocked.set(false); // the server follows up with lock-changed if the room is locked
+    roomJoined.set(true);
     const existingPeers = event.peers as { id: string; displayName: string }[];
     // After a reconnect, drop anyone who left while we were away.
     const listed = new Set(existingPeers.map((p) => p.id));
@@ -748,6 +767,8 @@ export function leaveRoom(): void {
   admissionRequests.set([]);
   hostStatus.set(false);
   roomLocked.set(false);
+  roomJoined.set(false);
+  hostActionError.set('');
   endRequested = false;
   typingPeers.set(new Set());
   reactions.set([]);
@@ -785,12 +806,15 @@ export function denyPeer(peerId: string): void {
  * changes only when the server confirms. Returns false if we're not connected right now.
  */
 export function setRoomLocked(locked: boolean): boolean {
+  hostActionError.set('');
+  if (!get(roomJoined)) return false;
   return signalingClient?.setRoomLocked(locked) ?? false;
 }
 
 /** Host only (enforced by the server): end the call for everyone. Returns false if not connected. */
 export function endCallForEveryone(): boolean {
-  if (!signalingClient) return false;
+  hostActionError.set('');
+  if (!signalingClient || !get(roomJoined)) return false;
   endRequested = signalingClient.endRoom();
   return endRequested;
 }
