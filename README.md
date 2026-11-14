@@ -14,6 +14,8 @@ Your own private, end-to-end encrypted video calls. Deploy it on your domain, si
   - Group chat, **private direct messages** and **files sent straight to one person** (tap them), and reactions
   - **Calendar and email invites**: download an `.ics` event or draft an email in your own mail app. Nothing is sent by vchat
   - Named rooms (the host can rename during a call), host approval, and automatic reconnection
+  - **Picture-in-picture**: pop the call out into a small always-on-top window to keep seeing people (and mute, turn the camera off or leave) while you're in another tab or app. Chromium shows everyone; Safari shows one video
+  - **Connection quality** bars on each person, and round trip, packet loss and whether the connection is direct or relayed in their card. Measured in your browser and never sent anywhere
 
 ## How it works for you
 
@@ -217,6 +219,7 @@ Open mode needs either **nothing** configured (no `SECRET_KEY`, `ADMIN_PASSWORD`
 - The signaling server does see some things while a call is set up: room ids, display names, IP addresses and network candidates, and the **room password in plain text** (over TLS) when a guest types it, because that's how it checks it. It keeps none of this after the room empties.
 - Whoever runs the server (you, and Cloudflare if you use it, since it terminates TLS) can see that connection metadata, but never call content.
 - With email set up, invite emails (link, room key and code) and sign-in codes pass through your server, Resend and the mail providers on both ends. The server never logs addresses, codes or tokens.
+- Connection quality is measured in your browser from WebRTC's own statistics and only shown there. It's never sent to the server or to other participants.
 - Browsers contact a STUN server to learn their public address: `stun.cloudflare.com` by default, your own coturn with Docker, or whatever `STUN_URLS` says.
 
 See [DOCS.md](DOCS.md) for the full security model and how it works under the hood.

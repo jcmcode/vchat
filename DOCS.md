@@ -118,6 +118,8 @@ The Node server (`src/index.ts`) keeps a `Map<roomId, Room>` in memory. The Clou
 | `lib/webrtc/file-transfer.ts` | Chunked, acknowledged, per-recipient file transfer (50MB max) |
 | `lib/media/manager.ts` | Camera/mic/screen capture, device switching, audio-only fallback |
 | `lib/stores/room.ts` | Endpoints, ICE fetch, per-tab identity, preferences |
+| `lib/webrtc/conn-stats.ts`, `conn-quality.ts` | Connection quality: polls `getStats()`, classifies each link as good / fair / poor |
+| `lib/ui/pip.ts`, `PipView.svelte`, `pip-target.ts` | Picture-in-picture: a Document Picture-in-Picture window, or standard video picture-in-picture |
 
 The app is a static SPA (SvelteKit + adapter-static). Its Content-Security-Policy is emitted as a `<meta>` tag with a hash for SvelteKit's boot script (`svelte.config.js`), so it works on any host.
 
@@ -156,6 +158,36 @@ Anyone in the call may edit any text box (strokes stay author-only). A box is cr
 - **PNG** saves that image.
 - **PDF** is a single page with the image (a small built-in PDF writer).
 - **DOCX** (`docx.ts` + `zip.ts`, no libraries) contains a title ("Whiteboard — date"), the board image inline, then every text box as editable paragraphs in reading order (top-to-bottom, then left-to-right). Bold, italic and underline runs, colors, bullets and numbered lists (`word/numbering.xml`, each list restarting at its own first number) are kept. The ZIP is written uncompressed with real CRC-32s.
+
+## Picture-in-picture
+
+The **Pop out** button (`lib/ui/pip.ts`) keeps the call in view while you're in another tab or app, for example while presenting.
+
+- **Chromium on desktop** (Document Picture-in-Picture API): a small always-on-top window shows everyone (video, or their initial when the camera is off, with name, muted and speaking indicators) and mic, camera and leave buttons that call the same handlers as the main controls. `PipView.svelte` is mounted into that window's document by the main page and reads the same stores, so it follows people joining and leaving and tracks changing. Its videos are muted: the sound keeps playing from the main window.
+- **Safari and Chromium on Android** (standard picture-in-picture): one video, chosen by `pip-target.ts`: a shared screen, else the active speaker, else whoever is shown already, else the first person with video. It plays from a hidden, muted video element of the app's own, so the picture can follow the conversation (at most one switch every 3 seconds) without another click.
+- **Firefox** has neither API, so the button is hidden.
+
+The window closes when you leave the call or are removed or replaced. Closing it leaves the call as it was.
+
+The PiP window is a blank same-origin document (opened like a blank popup, which in Chromium inherits the page's CSP). No script is loaded into it or runs in it, and nothing is fetched into it: the main page builds its DOM through Svelte with DOM APIs, so peer names are only ever text. The app's own CSS is copied in as a constructed stylesheet (`adoptedStyleSheets`), which CSP doesn't restrict, so the Content-Security-Policy stays as it is. Both modes only show streams from connections that passed the trust gate (`stream` is set only once a connection is verified or allowed), so an unverified person appears as their initial.
+
+## Connection quality
+
+Every 2.5 seconds `lib/webrtc/conn-stats.ts` reads `getStats()` for each open connection. One timer serves all of them; it stops when nobody is connected and skips while the tab is hidden. `conn-quality.ts` (pure, unit-tested) turns each report into:
+
+| Metric | Source |
+|---|---|
+| Round trip | The selected candidate pair's `currentRoundTripTime` (Firefox: the RTCP round trip of outgoing streams) |
+| Packet loss in | `inbound-rtp`: lost / (received + lost), from the change since the previous sample |
+| Packet loss out | `remote-inbound-rtp` `packetsLost` (what they report) against our `outbound-rtp` `packetsSent`, both as changes |
+| Jitter | Audio `jitter` in both directions (`inbound-rtp`, `remote-inbound-rtp`), the worse one |
+| Route | Relayed if either end of the selected pair is a `relay` (TURN) candidate, otherwise direct |
+| Upload estimate | The pair's `availableOutgoingBitrate` (Chromium only) |
+| Receiving | The largest incoming video's size and frame rate |
+
+Loss needs at least 20 packets in the interval. Counters that go backwards (a new connection or SSRC after a restart) or samples more than 10 seconds apart start a fresh baseline instead of producing a figure. A sample is graded by its worst metric: round trip up to 250 ms is good and up to 500 ms fair; loss (the worse direction) up to 2% good and up to 8% fair; jitter up to 30 ms good and up to 80 ms fair; anything above is poor. While you send video, an upload estimate under 150 kbit/s makes it at best fair. What's shown is the median of the last three samples, so one odd sample doesn't flip it.
+
+Remote tiles show signal bars, tapping a person shows the details, and a "Your connection is poor" hint appears when more than half of your measured connections are poor.
 
 ## Signaling protocol
 
@@ -233,6 +265,7 @@ A socket is bound to the room it was authorized for at the upgrade (`/ws?room=`)
 - **Peer data.** Names shown in chat come from the server's validated list, not from what a peer claims over the data channel. SVG files aren't previewed inline.
 - **Storage.** Chat is kept in memory only and never written to storage: it is gone when you leave, are removed, refresh or close the tab. The invite token, room key and per-room identity live in sessionStorage so a refresh can rejoin; they are cleared when you leave the call or are removed from it (if the tab is closed without leaving, the browser may keep them for its own "reopen closed tab" feature until the session ends). localStorage holds your display name, TURN preferences and, on the owner's own browser, the rooms they created (including their host links and room keys, which grant host access until they expire). Expired rooms are pruned and the list is cleared on sign-out. Don't use the owner dashboard on a shared computer.
 - **Untrusted peers.** Everything received over data channels is size- and rate-limited per participant. Files are capped (3 at a time, 150MB total per sender, 50 files / 300MB per peer per call) and checked chunk by chunk, with a 60s stall timeout. Received images are previewed only after a header check (at most 16 megapixels). Whiteboard and annotation data is capped (3,000 strokes / 600k points). Nobody can rewrite someone else's strokes or file entries. Names are made unique (compared after folding case, accents, compatibility forms and common look-alike letters) and stripped of invisible/bidi characters.
+- **Connection statistics.** Connection quality is computed in the browser from `getStats()` and only shown there: it's never sent to the server or to other participants, never stored, and dropped when someone leaves or the call ends. Candidate statistics include IP addresses; only the candidate type (relay or not) is read.
 - **Hide my IP address.** An optional pre-join setting makes the browser use only the TURN relay (`iceTransportPolicy: relay`), so other participants see the relay's address instead of yours. It needs TURN to be configured.
 - **Server hardening.** In private mode a WebSocket is only accepted with a valid invite or host token, sent as a subprotocol so it never appears in URLs. Invite links carry the token after `#`, which browsers never send to servers. Owner logins are throttled (see above). Room-password guesses are limited to 10 per room and client per 10 minutes, with a backstop of 200 per room; on Cloudflare the client is identified by an HMAC of its IP keyed with `SECRET_KEY`, never the raw address. These throttles live in memory (per process, or per Durable Object/isolate on Cloudflare) and forget clients once their window passes. Configuration fails closed.
 - **No logs.** Room activity is only logged with `DEBUG_LOGS=1`. Workers Logs are disabled in `wrangler.jsonc`. In the Docker setup, Caddy discards all logs (its error log would otherwise include IPs and the token header), coturn's logging is off, and every container uses Docker's `none` logging driver.
@@ -272,6 +305,7 @@ These logs can contain IP addresses, room ids, names and (in Caddy's error log) 
 - Screen sharing replaces your camera feed. In audio-only mode there's no video track to swap, so remote peers won't see your screen.
 - Switching microphones while sharing screen audio drops the screen audio until you re-share.
 - Firefox doesn't support choosing the speaker output on all platforms (`setSinkId`).
+- The pop-out window with everyone in it needs Chromium on desktop (Document Picture-in-Picture). Safari and Chromium on Android pop out a single video, and Firefox has no web API for picture-in-picture, so the button is hidden there.
 
 ---
 
