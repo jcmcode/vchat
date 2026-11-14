@@ -46,7 +46,8 @@ export function isValidRoomId(roomId: unknown): roomId is string {
 }
 
 export function isValidPeerId(peerId: unknown): peerId is string {
-  return typeof peerId === 'string' && PEER_ID_RE.test(peerId);
+  // "__proto__" would be a valid id by the pattern, but ids are used as keys of plain objects.
+  return typeof peerId === 'string' && PEER_ID_RE.test(peerId) && peerId !== '__proto__';
 }
 
 /** Remove control, zero-width, bidi-override and other invisible characters (used to fake or hide names). */

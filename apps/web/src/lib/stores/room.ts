@@ -282,7 +282,11 @@ export interface SavedRoom {
   label: string;
   inviteToken: string;
   hostToken: string;
-  /** End-to-end room key (generated in this browser; never sent to the server). */
+  /**
+   * End-to-end room key (generated in this browser). It stays out of every request, with one
+   * exception the owner opts into: an emailed invite that includes the key hands it to the server
+   * to put in the email.
+   */
   key?: string;
   /** Optional schedule, for calendar/email invites. */
   startsAt?: number;
@@ -309,6 +313,7 @@ export function clearSavedRooms(): void {
 
 /** Drop expired rooms from storage (not just from the list shown). */
 export function pruneSavedRooms(): void {
+  if (local()?.getItem(ADMIN_ROOMS_KEY) == null) return; // nothing saved: don't create the entry
   saveRooms(getSavedRooms());
 }
 
@@ -330,7 +335,7 @@ export function roomUrl(roomId: string, key?: string): string {
   return `${window.location.origin}/room/${roomId}${key ? `#k=${key}` : ''}`;
 }
 
-/** The room's end-to-end key for this tab (from the link's #k=…; never sent to any server). */
+/** The room's end-to-end key for this tab (from the link's #k=…; a guest's browser never sends it anywhere). */
 export function setRoomKey(roomId: string, key: string): void {
   session()?.setItem(`vchat_key_${roomId}`, key);
 }
@@ -384,7 +389,7 @@ export function takePendingJoin(roomId: string): PendingJoin | null {
   }
 }
 
-/** Pressing Leave: forget this call's chat, password and invite in this tab. */
+/** Leaving (or being removed): forget this call's password, invite and key in this tab. */
 export function forgetRoom(roomId: string): void {
   const store = session();
   if (!store) return;

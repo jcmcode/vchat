@@ -110,13 +110,26 @@ if command -v ip &>/dev/null; then
   done > "$HOST_DENY" || true
 fi
 
-# Values are validated above, so they contain no sed metacharacters.
-sed -e "s|EXTERNAL_IP_PLACEHOLDER|$EXTERNAL_IP|g" \
-    -e "s|TURN_SECRET_PLACEHOLDER|$TURN_SECRET|g" \
-    -e "s|DOMAIN_PLACEHOLDER|$DOMAIN|g" \
-    turnserver.conf.template |
-  awk -v f="$HOST_DENY" '$0 == "HOST_ADDRESSES_PLACEHOLDER" { while ((getline l < f) > 0) print l; next } { print }' \
-    > turnserver.conf
+# Values are validated above. They're passed through the environment rather than on a command
+# line, so the TURN secret never shows up in the process list.
+EXTERNAL_IP="$EXTERNAL_IP" TURN_SECRET="$TURN_SECRET" DOMAIN="$DOMAIN" HOST_DENY="$HOST_DENY" \
+  awk '
+    function fill(placeholder, value,    at, out) {
+      out = ""
+      while ((at = index($0, placeholder)) > 0) {
+        out = out substr($0, 1, at - 1) value
+        $0 = substr($0, at + length(placeholder))
+      }
+      $0 = out $0
+    }
+    $0 == "HOST_ADDRESSES_PLACEHOLDER" { while ((getline l < ENVIRON["HOST_DENY"]) > 0) print l; next }
+    {
+      fill("EXTERNAL_IP_PLACEHOLDER", ENVIRON["EXTERNAL_IP"])
+      fill("TURN_SECRET_PLACEHOLDER", ENVIRON["TURN_SECRET"])
+      fill("DOMAIN_PLACEHOLDER", ENVIRON["DOMAIN"])
+      print
+    }
+  ' turnserver.conf.template > turnserver.conf
 # coturn runs as nobody/nogroup (65534) inside its container and needs to read this file.
 chgrp 65534 turnserver.conf || fail "Couldn't give coturn's group (65534) access to turnserver.conf."
 chmod 640 turnserver.conf
@@ -154,6 +167,7 @@ if command -v ufw &>/dev/null; then
   ufw delete allow 5349/tcp >/dev/null 2>&1 || true
   ufw delete allow 5349/udp >/dev/null 2>&1 || true
   ufw delete allow 49152:65535/udp >/dev/null 2>&1 || true
+  ufw logging off >/dev/null # no log of who knocked on which port
   ufw --force enable
 else
   echo "Note: ufw not found. Make sure these ports are open:"

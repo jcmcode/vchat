@@ -46,6 +46,8 @@ export interface BarEntry {
   h: string;
   /** Unix ms when the bar lifts (absent = for the rest of the room's life). */
   u?: number;
+  /** Emailed invites: the address the person's invite was sent to (barred with them). */
+  e?: string;
 }
 
 export interface RoomMeta {
@@ -307,7 +309,7 @@ export class Room<C> {
     const secretHash = await hashSecret(args.secret);
     this.removeQuietly(conn);
     const isHost = grant.role === 'host';
-    if (!isHost && this.refuseBarred(conn, args, secretHash)) return;
+    if (!isHost && this.refuseBarred(conn, args, secretHash, grant.email)) return;
 
     const prior = this.meta.admitted[args.peerId];
     // A guest can never step into an identity admitted as host, even with the right secret.
@@ -336,7 +338,11 @@ export class Room<C> {
       role: grant.role,
       ...(grant.role === 'guest' && grant.email ? { email: grant.email } : {}),
     };
-    if (isHost || isReturning || !grant.approval) {
+    // Once the host has removed someone, every new guest needs approval for the rest of the call —
+    // even on an invite that doesn't ask for it. A removed person still holds the invite link and can
+    // come back with a fresh identity (new tab), so the bar on their old one isn't enough by itself.
+    const approval = grant.approval || this.meta.removed.length > 0;
+    if (isHost || isReturning || !approval) {
       this.admit(conn, state);
       return;
     }
@@ -375,7 +381,11 @@ export class Room<C> {
     if (!entry || entry[1].status !== 'waiting') return;
     const [conn, state] = entry;
     // Can't knock again for a while (stops a denied guest flooding the host with requests).
-    this.bar(this.meta.denied, { p: state.peerId, h: this.barHash(state.secretHash), u: Date.now() + DENY_COOLDOWN_MS }, MAX_DENIED);
+    this.bar(
+      this.meta.denied,
+      { p: state.peerId, h: this.barHash(state.secretHash), u: Date.now() + DENY_COOLDOWN_MS, ...(state.email ? { e: state.email } : {}) },
+      MAX_DENIED
+    );
     this.send(conn, { type: 'admission-denied', roomId: this.id, reason: 'Denied by host' });
     this.removeQuietly(conn);
     this.metaChanged();
@@ -403,7 +413,12 @@ export class Room<C> {
       return;
     }
     delete this.meta.admitted[peerId];
-    this.bar(this.meta.removed, { p: peerId, h: this.barHash(entry?.[1].secretHash ?? admitted?.h ?? '') }, MAX_REMOVED);
+    const removedEmail = entry?.[1].email;
+    this.bar(
+      this.meta.removed,
+      { p: peerId, h: this.barHash(entry?.[1].secretHash ?? admitted?.h ?? ''), ...(removedEmail ? { e: removedEmail } : {}) },
+      MAX_REMOVED
+    );
     if (entry) {
       const [conn, state] = entry;
       this.send(conn, { type: 'removed', roomId: this.id, reason: 'Removed by host' });
@@ -538,10 +553,14 @@ export class Room<C> {
     list.splice(0, list.length, ...kept.slice(-max));
   }
 
-  /** Refuse a peerId/secret the host removed (for good) or denied (for a few minutes). */
-  private refuseBarred(conn: C, args: EnterArgs, secretHash: string): boolean {
+  /**
+   * Refuse a peerId/secret the host removed (for good) or denied (for a few minutes). A personal
+   * (emailed) invite is barred with its holder: a new tab doesn't get them past a removal.
+   */
+  private refuseBarred(conn: C, args: EnterArgs, secretHash: string, email?: string): boolean {
     const now = Date.now();
-    const matches = (e: BarEntry) => e.p === args.peerId || (!!args.secret && e.h !== '' && e.h === secretHash);
+    const matches = (e: BarEntry) =>
+      e.p === args.peerId || (!!args.secret && e.h !== '' && e.h === secretHash) || (!!email && e.e === email);
     if (this.meta.removed.some(matches)) {
       this.send(conn, { type: 'removed', roomId: this.id, reason: 'Removed by host' });
       this.transport.close(conn, CLOSE_REMOVED, 'Removed by host');

@@ -86,7 +86,16 @@ export interface IceOptions {
   /** Unix seconds: TURN credentials never outlive the invite/host token they were issued for. */
   expiresAt?: number;
   now?: number;
+  /**
+   * Stable, opaque id for whoever is asking (per room and client). With it, coturn credentials
+   * keep the same username for a while, so coturn's per-user allocation quota limits each client
+   * instead of resetting on every request.
+   */
+  userId?: string;
 }
+
+/** coturn usernames issued to one client stay the same within a window this long (seconds). */
+const TURN_USER_WINDOW = 10 * 60;
 
 /** Credential lifetime in seconds: TURN_TTL_SECONDS (default 4h), capped at the token's expiry. */
 export function turnTtl(env: IceEnv, opts: IceOptions = {}): number {
@@ -119,11 +128,16 @@ export async function getIceServers(env: IceEnv, opts: IceOptions = {}): Promise
   const turnUrls = splitList(env.TURN_URLS);
   if (turnUrls.length && env.TURN_SECRET) {
     // coturn "TURN REST API" credentials: username = "<expiry>:<id>", password = HMAC(secret, username).
-    // A random id per response, so coturn's per-user quota applies per client rather than to everyone.
-    const username = `${nowSec + ttl}:${randomId()}`;
+    // The id is per client (random when the caller is unknown), so coturn's per-user quota applies
+    // per client rather than to everyone. For a known client the expiry is rounded down to a
+    // window, so asking again and again yields the same username — and the same quota — instead of
+    // a fresh allowance each time.
+    let expiry = nowSec + ttl;
+    if (opts.userId && ttl >= 2 * TURN_USER_WINDOW) expiry = Math.floor(expiry / TURN_USER_WINDOW) * TURN_USER_WINDOW;
+    const username = `${expiry}:${opts.userId ?? randomId()}`;
     const credential = await hmacSha1Base64(env.TURN_SECRET, username);
     iceServers.push({ urls: turnUrls, username, credential });
-    return { iceServers, ttl };
+    return { iceServers, ttl: expiry - nowSec };
   }
   if (turnUrls.length && env.TURN_USERNAME && env.TURN_CREDENTIAL) {
     iceServers.push({ urls: turnUrls, username: env.TURN_USERNAME, credential: env.TURN_CREDENTIAL });

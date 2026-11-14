@@ -3,8 +3,17 @@
 /*
   X-Frame-Options: DENY
   X-Content-Type-Options: nosniff
-  Referrer-Policy: strict-origin-when-cross-origin
+  Referrer-Policy: no-referrer
   Permissions-Policy: camera=(self), microphone=(self), display-capture=(self)
   Strict-Transport-Security: max-age=31536000
   Content-Security-Policy: frame-ancestors 'none'
   Cross-Origin-Opener-Policy: same-origin
+
+# Pages are never kept in the browser's HTTP cache, so no copy stored under a room's address
+# outlives the call. (Scripts and styles under /_app/ are content-hashed and stay cacheable.)
+/
+  Cache-Control: no-store
+/room/*
+  Cache-Control: no-store
+/admin
+  Cache-Control: no-store

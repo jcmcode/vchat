@@ -28,11 +28,12 @@ no-multicast-peers
 no-loopback-peers
 no-rfc5780
 no-stun-backward-compatibility
-# Allocations per credential / in total, bandwidth per session / in total (bits per second).
+# Allocations per credential / in total, bandwidth per session / in total. coturn counts
+# bandwidth in BYTES per second: 500000 is 4 Mbit/s per session, 25000000 is 200 Mbit/s in total.
 user-quota=12
 total-quota=300
-max-bps=4000000
-bps-capacity=200000000
+max-bps=500000
+bps-capacity=25000000
 stale-nonce=600
 
 # Never relay to private, internal or special-purpose addresses (incl. cloud metadata and this host).

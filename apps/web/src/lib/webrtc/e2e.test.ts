@@ -105,7 +105,7 @@ test('safety codes match for a direct connection and differ with someone in the 
   const alice = await safetyCode(keys, 'room1', FP_ALICE, FP_BOB);
   const bob = await safetyCode(keys, 'room1', FP_BOB, FP_ALICE);
   assert.equal(alice, bob);
-  assert.match(alice, /^\d{3} \d{3}$/);
+  assert.match(alice, /^\d{3} \d{3} \d{3} \d{3}$/);
   const aliceSeesMitm = await safetyCode(keys, 'room1', FP_ALICE, FP_M1);
   const bobSeesMitm = await safetyCode(keys, 'room1', FP_BOB, FP_M2);
   assert.notEqual(aliceSeesMitm, bobSeesMitm);

@@ -510,7 +510,7 @@
               </div>
               <label class="toggle-row small-text">
                 <input type="checkbox" bind:checked={inviteIncludeKey} />
-                <span>Include the end-to-end key in the link (one-click join; the email service can see it)</span>
+                <span>Include the end-to-end key in the link (one-click join). The key then passes through this server and the email service, and either could use it to listen in unnoticed. For full protection, untick this and send the guest the invite link yourself.</span>
               </label>
               {#if inviteStatus}<p class={inviteStatus.ok ? 'ok small-text' : 'error'} role="status">{inviteStatus.text}</p>{/if}
             </form>
@@ -565,7 +565,7 @@
                     </div>
                     <label class="toggle-row small-text">
                       <input type="checkbox" bind:checked={inviteIncludeKey} />
-                      <span>Include the end-to-end key in the link (one-click join; the email service can see it)</span>
+                      <span>Include the end-to-end key in the link (one-click join). The key then passes through this server and the email service, and either could use it to listen in unnoticed. For full protection, untick this and send the guest the invite link yourself.</span>
                     </label>
                     {#if inviteStatus}<p class={inviteStatus.ok ? 'ok small-text' : 'error'} role="status">{inviteStatus.text}</p>{/if}
                   </form>

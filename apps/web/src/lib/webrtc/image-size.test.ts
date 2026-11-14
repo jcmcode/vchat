@@ -13,8 +13,7 @@ function png(w: number, h: number): Uint8Array {
 test('reads PNG, GIF, JPEG and WebP dimensions from headers', () => {
   assert.deepEqual(readImageSize(png(640, 480)), { width: 640, height: 480 });
 
-  const gif = new Uint8Array([...Buffer.from('GIF89a'), 0x20, 0x03, 0x58, 0x02]);
-  assert.deepEqual(readImageSize(gif), { width: 800, height: 600 });
+  assert.deepEqual(readImageSize(gif(800, 600, 800, 600)), { width: 800, height: 600 });
 
   // SOI, APP0 (length 16), SOF0 with height 300, width 400.
   const app0 = [0xff, 0xe0, 0x00, 0x10, ...new Array(14).fill(0)];
@@ -34,4 +33,22 @@ test('a decompression bomb is detectable and garbage is rejected', () => {
   assert.ok(bomb && bomb.width * bomb.height > MAX_PREVIEW_PIXELS);
   assert.equal(readImageSize(new Uint8Array([1, 2, 3, 4])), null);
   assert.equal(readImageSize(new Uint8Array([0xff, 0xd8, 0x00, 0x00, 0, 0, 0, 0, 0, 0, 0, 0])), null);
+});
+
+/** A minimal GIF: logical screen, a graphic-control extension, then one frame of the given size. */
+function gif(screenW: number, screenH: number, frameW: number, frameH: number): Uint8Array {
+  const le = (n: number) => [n & 0xff, n >> 8];
+  return new Uint8Array([
+    ...Buffer.from('GIF89a'), ...le(screenW), ...le(screenH), 0x00, 0x00, 0x00,
+    0x21, 0xf9, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x2c, 0x00, 0x00, 0x00, 0x00, ...le(frameW), ...le(frameH), 0x00,
+    0x02, 0x02, 0x4c, 0x01, 0x00,
+    0x3b,
+  ]);
+}
+
+test('a GIF frame larger than its declared screen counts (no tiny-screen decompression bomb)', () => {
+  assert.deepEqual(readImageSize(gif(1, 1, 20000, 20000)), { width: 20000, height: 20000 });
+  // No frame within the bytes we read: size unknown, so it is never previewed.
+  assert.equal(readImageSize(gif(800, 600, 800, 600).subarray(0, 13)), null);
 });

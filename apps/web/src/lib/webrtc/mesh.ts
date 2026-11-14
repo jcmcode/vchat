@@ -7,6 +7,7 @@ import { fetchIceServers } from '../stores/room.js';
 import { deserialize, serialize, type AnyDataMessage, type DataChannelMessage } from './data-channel.js';
 import { createSpeakingDetector } from '../media/audio-analysis.js';
 import { readSdpIdentity } from './e2e-proof.js';
+import { nameKey } from './name-key.js';
 import {
   initFileTransfer,
   handleFileMeta,
@@ -98,6 +99,11 @@ export const sharingPeers = writable<Set<string>>(new Set());
 export const peerMediaState = writable<Map<string, { audio: boolean; video: boolean }>>(new Map());
 /** Peer id of the current host (null if nobody holds the role). */
 export const hostPeerIdStore = writable<string | null>(null);
+/**
+ * Set when the server ended our part in the call (removed by the host, or replaced by another tab).
+ * The call is torn down immediately; the page releases the camera and forgets the room.
+ */
+export const forcedOut = writable<boolean>(false);
 /** This participant's peer id (for collaboration features). */
 export const localPeerIdStore = writable<string>('');
 
@@ -177,13 +183,56 @@ export function trustPeer(peerId: string, sid: string): void {
   for (const handler of connectHandlers) handler(peerId);
 }
 
-/** Use a name the peer proved (via their verification proof) instead of the server's label. */
+/**
+ * A peer proved (via their verification proof) which name they chose. The proof only shows they
+ * hold the room key — which every invited person does — so the name is never taken at face value:
+ *  - If the server's label is that same name (possibly with the " (2)" it adds to keep names
+ *    unique), the label is shown. The server can't relabel people and a peer can't drop the suffix.
+ *  - Otherwise the proven name is shown, but never one that reads the same as another
+ *    participant's (or ours): it gets a number, so nobody can pose as someone else with a
+ *    "verified" badge.
+ */
 export function setVerifiedName(peerId: string, sid: string, name: string): void {
   const pc = get(peers).get(peerId);
   if (!pc || pc.sid !== sid) return;
-  knownNames.set(peerId, name);
-  pc.displayName = name;
+  const label = serverNames.get(peerId);
+  if (label !== undefined && labelMatchesName(label, name)) {
+    claimedNames.delete(peerId);
+    setShownName(peerId, label);
+  } else {
+    claimedNames.set(peerId, name);
+  }
+  resolveClaimedNames();
   updatePeers();
+}
+
+/** Whether the server's label is `name` itself, or `name` with the server's " (n)" uniqueness suffix. */
+function labelMatchesName(label: string, name: string): boolean {
+  const key = nameKey(name);
+  if (!key) return false;
+  if (nameKey(label) === key) return true;
+  const m = label.match(/^(.*\S) \((\d{1,2})\)$/);
+  if (!m) return false;
+  const stem = nameKey(m[1]);
+  return stem.length > 0 && key.startsWith(stem);
+}
+
+function setShownName(peerId: string, name: string): void {
+  knownNames.set(peerId, name);
+  const pc = get(peers).get(peerId);
+  if (pc) pc.displayName = name;
+}
+
+/** Give every proven-but-unconfirmed name a display form that can't be mistaken for anyone else's. */
+function resolveClaimedNames(): void {
+  const taken = new Set<string>([nameKey(localDisplayName)]);
+  for (const [id, pc] of get(peers)) if (!claimedNames.has(id)) taken.add(nameKey(knownNames.get(id) ?? pc.displayName));
+  for (const [id, name] of claimedNames) {
+    let shown = name;
+    for (let n = 2; taken.has(nameKey(shown)) && n < 100; n++) shown = `${name.slice(0, 26).trimEnd()} (${n})`;
+    taken.add(nameKey(shown));
+    setShownName(id, shown);
+  }
 }
 
 /** Verification messages are the only thing allowed over an untrusted connection. */
@@ -286,8 +335,12 @@ let currentRoomId: string = '';
 const unsubscribers: (() => void)[] = [];
 const disconnectTimers = new Map<string, ReturnType<typeof setTimeout>>();
 const speakingDetectorCleanups = new Map<string, () => void>();
-/** Display names as reported by the signaling server (trusted over names sent peer-to-peer). */
+/** Display names shown for each peer (the server's label, or a name they proved; see setVerifiedName). */
 const knownNames = new Map<string, string>();
+/** The label the signaling server gave each peer (unique within the room). */
+const serverNames = new Map<string, string>();
+/** Names peers proved that don't match the server's label; shown made unique (see setVerifiedName). */
+const claimedNames = new Map<string, string>();
 let localSpeakingCleanup: (() => void) | null = null;
 /** Bumped by every join/leave so an in-flight joinRoom can tell it has been superseded. */
 let joinGeneration = 0;
@@ -320,6 +373,9 @@ const TYPE_LIMITS: Record<string, number> = {
   'screen-state': 2,
   'media-state': 2,
   'room-name': 1,
+  // A few files at once is normal; a stream of announcements/cancellations is a flood.
+  'file-meta': 2,
+  'file-cancel': 4,
 };
 const typeBuckets = new Map<string, { tokens: number; at: number }>();
 
@@ -368,43 +424,13 @@ function newSid(): string {
   return Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join('');
 }
 
-// Chat history lives in sessionStorage: it survives a refresh or reconnect,
-// but disappears when the tab is closed (nothing persists after the call).
-function chatKey(roomId: string): string {
-  return `vchat_chat_${roomId}`;
-}
-
-function loadChatHistory(roomId: string): void {
-  try {
-    const saved = sessionStorage.getItem(chatKey(roomId));
-    const msgs = saved ? (JSON.parse(saved) as ChatMessage[]) : [];
-    chatMessages.set(
-      msgs.slice(-500).map((m, i) => ({ ...m, id: m.id || `loaded_${i}_${m.timestamp}` }))
-    );
-  } catch {
-    chatMessages.set([]);
-  }
-}
-
-let saveTimer: ReturnType<typeof setTimeout> | null = null;
-
-/** Persist chat at most a few times a second (writing 500 messages on every message is slow). */
-function scheduleChatSave(): void {
-  if (saveTimer) return;
-  const roomId = currentRoomId;
-  saveTimer = setTimeout(() => {
-    saveTimer = null;
-    if (roomId && roomId === currentRoomId) saveChatHistory(roomId);
-  }, 400);
-}
-
-function saveChatHistory(roomId: string): void {
-  try {
-    const msgs = get(chatMessages).map(({ fileTransfer: _ft, ...m }) => m);
-    sessionStorage.setItem(chatKey(roomId), JSON.stringify(msgs.slice(-500)));
-  } catch {
-    // ignore (quota, private mode)
-  }
+/**
+ * The server's label for a peer. It's what we show until (and unless) they prove a name, and a
+ * newcomer's label must not make an already-shown claimed name ambiguous.
+ */
+function noteServerName(peerId: string, name: string): void {
+  serverNames.set(peerId, name);
+  if (!claimedNames.has(peerId)) knownNames.set(peerId, name);
 }
 
 // Data channel helpers
@@ -460,8 +486,18 @@ export async function joinRoom(opts: JoinOptions): Promise<void> {
   admissionRequests.set([]);
   hostStatus.set(false);
   knownNames.clear();
+  serverNames.clear();
+  claimedNames.clear();
+  forcedOut.set(false);
 
-  loadChatHistory(roomId);
+  // Chat lives only in this tab's memory: it is never written to storage, so nothing of the
+  // conversation is left behind when the call ends (a page refresh starts with an empty chat).
+  chatMessages.set([]);
+  try {
+    sessionStorage.removeItem(`vchat_chat_${roomId}`); // left by earlier versions
+  } catch {
+    // storage unavailable
+  }
   initFileTransfer(sendDataToPeer, broadcastToAllPeers);
 
   const ice = await fetchIceServers(token);
@@ -493,14 +529,18 @@ export async function joinRoom(opts: JoinOptions): Promise<void> {
   });
   on('disconnected', () => connectionState.set('disconnected'));
   // Removed by the host: the server sends 'removed' and then closes the connection.
-  const onRemoved = () => {
-    roomError.set(FATAL_ERRORS['Removed by host']);
-    for (const id of [...get(peers).keys()]) destroyPeerConnection(id);
+  // Either way our part in the call is over: end it now (connections, chat, files, whiteboard, keys)
+  // instead of leaving it all in the tab until "Back to home" is clicked.
+  const forceOut = (message: string) => {
+    roomError.set(message);
+    forcedOut.set(true);
+    // After this event has been delivered to every listener.
+    queueMicrotask(() => {
+      if (generation === joinGeneration) leaveRoom();
+    });
   };
-  on('removed', onRemoved);
-  on('replaced', () => {
-    roomError.set('You joined this call from another tab or window, so this one was disconnected.');
-  });
+  on('removed', () => forceOut(FATAL_ERRORS['Removed by host']));
+  on('replaced', () => forceOut('You joined this call from another tab or window, so this one was disconnected.'));
 
   on('room-peers', (event) => {
     admissionState.set('none');
@@ -510,14 +550,14 @@ export async function joinRoom(opts: JoinOptions): Promise<void> {
     const listed = new Set(existingPeers.map((p) => p.id));
     for (const id of get(peers).keys()) if (!listed.has(id)) destroyPeerConnection(id);
     for (const p of existingPeers) {
-      knownNames.set(p.id, p.displayName);
+      noteServerName(p.id, p.displayName);
       createPeerConnection(p.id, p.displayName, true);
     }
   });
 
   on('peer-joined', (event) => {
     const { peerId: newPeerId, displayName: name } = event as unknown as { peerId: string; displayName: string };
-    knownNames.set(newPeerId, name);
+    noteServerName(newPeerId, name);
     // The newcomer sends the offer; we wait for it.
     createPeerConnection(newPeerId, name, false);
   });
@@ -619,15 +659,12 @@ export function leaveRoom(): void {
     localSpeakingCleanup = null;
   }
 
-  if (currentRoomId) saveChatHistory(currentRoomId);
   currentRoomId = '';
 
   for (const timer of disconnectTimers.values()) clearTimeout(timer);
   disconnectTimers.clear();
   for (const timer of typingTimers.values()) clearTimeout(timer);
   typingTimers.clear();
-  if (saveTimer) clearTimeout(saveTimer);
-  saveTimer = null;
   dataBuckets.clear();
   byteBuckets.clear();
   typeBuckets.clear();
@@ -665,6 +702,13 @@ export function leaveRoom(): void {
   sharingPeers.set(new Set());
   peerMediaState.set(new Map());
   hostPeerIdStore.set(null);
+  // Nothing of the call stays in this tab's memory either.
+  chatMessages.set([]);
+  knownNames.clear();
+  serverNames.clear();
+  claimedNames.clear();
+  localDisplayName = '';
+  iceServers = [];
   for (const handler of roomLeaveHandlers) handler();
 }
 
@@ -721,7 +765,6 @@ export function sendChatMessage(text: string, toPeerId?: string): boolean {
     },
   ].slice(-MAX_CHAT_MESSAGES));
 
-  scheduleChatSave();
   return true;
 }
 
@@ -807,7 +850,6 @@ function handleDataChannelMessage(fromPeerId: string, anyMsg: DataChannelMessage
           ...(msg.private ? { private: true } : {}),
         },
       ].slice(-MAX_CHAT_MESSAGES));
-      scheduleChatSave();
 
       // Clear typing indicator for this peer
       typingPeers.update((s) => {
@@ -1082,36 +1124,48 @@ function getStreamForNewPeer(): MediaStream | undefined {
   return stream ?? undefined;
 }
 
-/** Route an incoming signal to the right connection, (re)creating it when the remote starts a new session. */
 /**
- * Only well-formed signals reach the WebRTC stack. Offers/answers must carry exactly one SHA-256
- * DTLS fingerprint with everything bundled on one transport, and once pinned, the fingerprint and
- * ICE credentials may never change (we never do ICE restarts) — so a malicious server can't swap
- * in its own certificate after the connection was verified.
+ * Only well-formed signals reach the WebRTC stack, and only the fields we checked. Each message is
+ * exactly one of: an offer/answer, an ICE candidate, or a renegotiation request — rebuilt from
+ * scratch, because simple-peer acts on every field it finds (an `sdp` riding along on a
+ * "candidate" would otherwise be applied unchecked).
+ *
+ * Offers/answers must carry exactly one SHA-256 DTLS fingerprint with everything bundled on one
+ * transport, and once pinned, the fingerprint and ICE credentials may never change (we never do
+ * ICE restarts) — so a malicious server can't swap in its own certificate after the connection
+ * was verified. Any other message that carries a session description (pranswer, rollback, …) is
+ * treated as an attack.
  */
-function checkRemoteSignal(pc: PeerConnection, data: unknown): 'ok' | 'drop' | 'reject' {
-  if (!data || typeof data !== 'object') return 'drop';
+function checkRemoteSignal(pc: PeerConnection, data: unknown): SimplePeer.SignalData | 'drop' | 'reject' {
+  if (!data || typeof data !== 'object' || Array.isArray(data)) return 'drop';
   const d = data as Record<string, unknown>;
   if (d.type === 'offer' || d.type === 'answer') {
     const identity = readSdpIdentity(d.sdp);
     if (!identity) return 'reject';
-    if (!pc.pinned) {
-      pc.pinned = identity;
-      return 'ok';
-    }
-    return pc.pinned.fingerprint === identity.fingerprint && pc.pinned.ufrag === identity.ufrag ? 'ok' : 'reject';
+    if (!pc.pinned) pc.pinned = identity;
+    else if (pc.pinned.fingerprint !== identity.fingerprint || pc.pinned.ufrag !== identity.ufrag) return 'reject';
+    return { type: d.type, sdp: d.sdp as string };
   }
-  if (d.type === 'candidate' || 'candidate' in d) return 'ok';
-  if (d.type === 'renegotiate' || d.renegotiate === true) {
+  if (d.sdp !== undefined && d.sdp !== null) return 'reject';
+  if (d.type === 'candidate') {
+    const c = d.candidate as Record<string, unknown> | null | undefined;
+    if (!c || typeof c !== 'object' || typeof c.candidate !== 'string' || c.candidate.length > 2048) return 'drop';
+    const sdpMid = typeof c.sdpMid === 'string' && c.sdpMid.length <= 64 ? c.sdpMid : null;
+    const sdpMLineIndex = typeof c.sdpMLineIndex === 'number' && Number.isInteger(c.sdpMLineIndex) && c.sdpMLineIndex >= 0 && c.sdpMLineIndex < 64 ? c.sdpMLineIndex : null;
+    if (sdpMid === null && sdpMLineIndex === null) return 'drop';
+    return { type: 'candidate', candidate: { candidate: c.candidate, sdpMid, sdpMLineIndex } } as SimplePeer.SignalData;
+  }
+  if (d.type === 'renegotiate') {
     const now = Date.now();
     const recent = (renegotiations.get(pc.id) ?? []).filter((t) => now - t < 60_000);
     if (recent.length >= MAX_RENEGOTIATIONS_PER_MIN) return 'drop';
     renegotiations.set(pc.id, [...recent, now]);
-    return 'ok';
+    return { type: 'renegotiate', renegotiate: true } as SimplePeer.SignalData;
   }
   return 'drop'; // e.g. transceiverRequest: never let a peer add transceivers to our connection
 }
 
+/** Route an incoming signal to the right connection, (re)creating it when the remote starts a new session. */
 function handleSignal(fromPeerId: string, raw: unknown): void {
   const envelope = raw as { sid?: unknown; data?: SimplePeer.SignalData } | null;
   if (!envelope || typeof envelope.sid !== 'string' || !envelope.data) return;
@@ -1129,7 +1183,7 @@ function handleSignal(fromPeerId: string, raw: unknown): void {
       return;
     }
     try {
-      target.peer.signal(data);
+      target.peer.signal(verdict);
     } catch (err) {
       console.warn('Ignoring bad signal:', err);
     }
@@ -1254,7 +1308,7 @@ function createPeerConnection(
 
   peer.on('error', (err: Error) => {
     if (!isCurrent()) return;
-    console.warn(`Connection error with ${remoteDisplayName}:`, err.message);
+    console.warn('Peer connection error:', err.message);
     // Try again rather than silently dropping the person from the call.
     reconnectPeer(remotePeerId, remoteDisplayName);
   });
@@ -1318,12 +1372,11 @@ function reconnectPeer(remotePeerId: string, remoteDisplayName: string): void {
   const now = Date.now();
   const recent = (reconnectAttempts.get(remotePeerId) ?? []).filter((t) => now - t < 60_000);
   if (recent.length >= 5) {
-    console.warn(`Giving up reconnecting to ${remoteDisplayName} for now`);
+    console.warn('Giving up reconnecting to a participant for now');
     destroyPeerConnection(remotePeerId);
     return;
   }
   reconnectAttempts.set(remotePeerId, [...recent, now]);
-  console.warn(`Reconnecting to ${remoteDisplayName}`);
   createPeerConnection(remotePeerId, remoteDisplayName, true);
 }
 
@@ -1367,6 +1420,8 @@ function destroyPeerConnection(remotePeerId: string): void {
     next.delete(remotePeerId);
     return next;
   });
+  serverNames.delete(remotePeerId);
+  if (claimedNames.delete(remotePeerId)) resolveClaimedNames();
   for (const handler of leaveHandlers) handler(remotePeerId);
 
   typingPeers.update((s) => {

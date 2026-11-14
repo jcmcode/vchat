@@ -15,7 +15,7 @@
 	header {
 		X-Frame-Options DENY
 		X-Content-Type-Options nosniff
-		Referrer-Policy strict-origin-when-cross-origin
+		Referrer-Policy no-referrer
 		Permissions-Policy "camera=(self), microphone=(self), display-capture=(self)"
 		Strict-Transport-Security "max-age=31536000"
 		# The full Content-Security-Policy is set by the app itself (apps/web/svelte.config.js);
@@ -39,6 +39,10 @@
 
 	handle {
 		root * /srv/web
+		# Pages are never kept in the browser's HTTP cache, so no copy stored under a room's address
+		# outlives the call. (Scripts and styles under /_app/ are content-hashed and stay cacheable.)
+		@pages path / /room/* /admin /admin/*
+		header @pages Cache-Control no-store
 		try_files {path} /index.html
 		file_server
 	}

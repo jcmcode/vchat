@@ -16,7 +16,7 @@
     type ServerConfig,
   } from '$lib/stores/room';
   import { onMount } from 'svelte';
-  import { generateRoomKey } from '$lib/webrtc/e2e-proof';
+  import { generateRoomKey, isValidRoomKey } from '$lib/webrtc/e2e-proof';
   import Icon from '$lib/ui/Icon.svelte';
 
   let config: ServerConfig | null = null;
@@ -93,7 +93,13 @@
 
   function joinRoom() {
     if (!name.trim() || !joinCode.trim()) return;
-    enterRoom(parseRoomCode(joinCode), false);
+    const id = parseRoomCode(joinCode);
+    // A pasted link carries the room's end-to-end key after "#". Keep it (in this tab only), or
+    // the call would be joined without it and nobody in it could be verified.
+    const hashAt = joinCode.indexOf('#');
+    const key = hashAt >= 0 ? new URLSearchParams(joinCode.slice(hashAt + 1).trim()).get('k') : null;
+    if (isValidRoomKey(key)) setRoomKey(id, key);
+    enterRoom(id, false);
   }
 
   function handleKeydown(e: KeyboardEvent) {
@@ -134,7 +140,7 @@
       <form class="form" on:submit|preventDefault={openInvite}>
         <p class="hint">Got an invite? Open the link you were sent, or paste it here.</p>
         <label class="sr-only" for="invite">Invite link</label>
-        <input id="invite" class="input" type="text" bind:value={inviteInput} placeholder="Paste invite link" />
+        <input id="invite" class="input" type="text" bind:value={inviteInput} placeholder="Paste invite link" autocomplete="off" spellcheck="false" />
         {#if inviteError}
           <span class="field-error" role="alert">{inviteError}</span>
         {/if}
@@ -201,6 +207,8 @@
             type="text"
             bind:value={joinCode}
             placeholder="Room code or link"
+            autocomplete="off"
+            spellcheck="false"
             on:keydown={handleKeydown}
             maxlength="200"
           />

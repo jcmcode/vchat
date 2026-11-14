@@ -12,6 +12,7 @@
     hostPresent,
     passwordInvalid,
     roomError,
+    forcedOut,
     submitRoomPassword,
     admissionRequests,
     hostStatus,
@@ -414,6 +415,14 @@
     }
   });
 
+  // Removed by the host, or replaced by another tab: the call has already been torn down. Release
+  // the camera and microphone and forget this call's invite, key and password right away, rather
+  // than when "Back to home" is clicked (which may never happen if the tab is just closed).
+  $: if (browser && $forcedOut) {
+    stopMedia();
+    if (roomId) forgetRoom(roomId);
+  }
+
   function handleLeave() {
     leaveRoom();
     stopMedia();
@@ -731,7 +740,8 @@
       <Icon name="shield-alert" size={16} />
       <span>
         Couldn't verify <strong>{up.displayName}</strong> ({$verification.get(up.id)?.reason ?? 'no proof'}). You can't see or hear each other
-        until they're verified. If you trust them (e.g. they typed the room code), you can allow it, but it may be intercepted.
+        until they're verified. The name shown is not proof of who this is. Only allow it if you've confirmed, outside this call, that it's
+        really them and why they have no key: an unverified connection can be listened to by someone in the middle.
       </span>
       <button class="btn small secondary" on:click={() => allowUnverified(up.id)}>Allow anyway</button>
     </div>
@@ -974,7 +984,7 @@
             <div class="safety-code">
               <span class="muted">Safety code</span>
               <strong>{$verification.get(selectedPeer.id)?.code}</strong>
-              <p>Read it to {selectedPeer.displayName} (by voice, or another app). If you both see the same code, nobody is in the middle of your connection.</p>
+              <p>Read all of it to {selectedPeer.displayName} (by voice, or another app). If you both see the same code, nobody is in the middle of your connection.</p>
             </div>
           {/if}
           {#if $verification.get(selectedPeer.id)?.state === 'unverified'}

@@ -13,6 +13,8 @@ const WINDOW = 8;
 /** Limits on what one participant can send us at the same time. */
 const MAX_INCOMING_PER_PEER = 3;
 const MAX_INCOMING_BYTES = 150 * 1024 * 1024;
+/** In-flight bytes from everyone together (one participant can't use up all of it). */
+const MAX_INCOMING_BYTES_TOTAL = 300 * 1024 * 1024;
 /** Lifetime limits per participant (finished files stay in memory until you leave the call). */
 const MAX_FILES_PER_PEER = 50;
 const MAX_KEPT_BYTES_PER_PEER = 300 * 1024 * 1024;
@@ -214,24 +216,32 @@ function updateSendProgress(fileId: string): void {
   }
 }
 
-function incomingLoad(fromPeerId: string): { count: number; bytes: number } {
+/** Transfers in flight: this participant's count and bytes, and bytes from everyone. */
+function incomingLoad(fromPeerId: string): { count: number; bytes: number; totalBytes: number } {
   let count = 0;
   let bytes = 0;
+  let totalBytes = 0;
   for (const f of incomingFiles.values()) {
-    if (f.fromPeerId === fromPeerId) count++;
+    totalBytes += f.fileSize;
+    if (f.fromPeerId !== fromPeerId) continue;
+    count++;
     bytes += f.fileSize;
   }
-  return { count, bytes };
+  return { count, bytes, totalBytes };
 }
 
-/** Everything this participant has sent us so far this call (in progress or kept in memory). */
+/**
+ * Everything this participant has sent us so far this call (in progress or kept in memory).
+ * Cancelled transfers hold no bytes but still count as files: each one stays listed in the chat,
+ * so announcing and cancelling in a loop can't grow that list without limit.
+ */
 function lifetimeLoad(fromPeerId: string): { files: number; bytes: number } {
   let files = 0;
   let bytes = 0;
   for (const e of get(fileTransfers).values()) {
-    if (e.direction !== 'receive' || e.fromPeerId !== fromPeerId || e.status === 'cancelled') continue;
+    if (e.direction !== 'receive' || e.fromPeerId !== fromPeerId) continue;
     files++;
-    bytes += e.fileSize;
+    if (e.status !== 'cancelled') bytes += e.fileSize;
   }
   return { files, bytes };
 }
@@ -274,7 +284,7 @@ export function handleFileMeta(
   if (get(fileTransfers).has(key)) return; // never let a second announcement overwrite a transfer
 
   const load = incomingLoad(fromPeerId);
-  if (load.count >= MAX_INCOMING_PER_PEER || load.bytes + fileSize > MAX_INCOMING_BYTES) return;
+  if (load.count >= MAX_INCOMING_PER_PEER || load.bytes + fileSize > MAX_INCOMING_BYTES || load.totalBytes + fileSize > MAX_INCOMING_BYTES_TOTAL) return;
   const lifetime = lifetimeLoad(fromPeerId);
   if (lifetime.files >= MAX_FILES_PER_PEER || lifetime.bytes + fileSize > MAX_KEPT_BYTES_PER_PEER) return;
 

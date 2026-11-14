@@ -3,7 +3,8 @@
 // WebRTC encrypts media and data between browsers (DTLS-SRTP), but the DTLS fingerprints that
 // anchor that encryption travel through the signaling server — so a compromised server could try
 // to sit in the middle. To rule that out, each room has a secret key that lives only in the invite
-// link's "#fragment" (never sent to any server).
+// link's "#fragment" (browsers don't send that part of a link to servers; the one exception is an
+// emailed invite the owner chooses to include the key in, which passes through the server).
 //
 // For each connection:
 //   1. mesh.ts creates it with max-bundle (one transport), rejects any session description that
@@ -17,7 +18,7 @@
 //      changed encryption details — blocks the connection; no proof (they don't have the key) or no
 //      answer keeps it closed until the user explicitly chooses "Allow anyway".
 // Someone in the middle shows each side different fingerprints and lacks the key, so it can't
-// produce proofs that match what each side sees. A 6-digit safety code per connection also lets
+// produce proofs that match what each side sees. A 12-digit safety code per connection also lets
 // people confirm out loud that nobody (not even another key holder) is in the middle.
 
 import { get, writable } from 'svelte/store';

@@ -22,7 +22,7 @@ import { verifyAccessJwt } from './access.js';
 import { inviteEmail, isCode, isValidSender, loginCodeEmail, normalizeEmail, randomCode, sendEmail } from './email.js';
 import { getIceServers, turnTtl, type IceEnv } from './ice.js';
 import { isValidRoomId, sliceCodePoints, stripInvisible } from './protocol.js';
-import { AttemptCounter, LoginThrottle, passwordAttempts } from './throttle.js';
+import { AttemptCounter, ipKey, LoginThrottle, passwordAttempts } from './throttle.js';
 import {
   base64UrlEncode,
   hashRoomPassword,
@@ -196,11 +196,40 @@ function sameOrigin(request: Request): boolean {
   }
 }
 
+const MAX_JSON_BODY_BYTES = 4096;
+
+/** Read a request body, giving up as soon as it exceeds `max` bytes (never buffering more). */
+async function readLimitedText(request: Request, max: number): Promise<string | null> {
+  const declared = Number(request.headers.get('Content-Length') ?? '');
+  if (declared > max) return null;
+  if (!request.body) return '';
+  const reader = request.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let size = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    size += value.byteLength;
+    if (size > max) {
+      await reader.cancel().catch(() => {});
+      return null;
+    }
+    chunks.push(value);
+  }
+  const all = new Uint8Array(size);
+  let at = 0;
+  for (const c of chunks) {
+    all.set(c, at);
+    at += c.byteLength;
+  }
+  return new TextDecoder().decode(all);
+}
+
 async function readJson(request: Request): Promise<Record<string, unknown> | null> {
   if (!(request.headers.get('Content-Type') ?? '').includes('application/json')) return null;
   try {
-    const text = await request.text();
-    if (text.length > 4096) return null;
+    const text = await readLimitedText(request, MAX_JSON_BODY_BYTES);
+    if (text === null) return null;
     const body = JSON.parse(text);
     return body && typeof body === 'object' ? (body as Record<string, unknown>) : null;
   } catch {
@@ -290,10 +319,16 @@ const E2E_KEY_RE = /^[A-Za-z0-9_-]{43}$/;
 // provider's API. coturn REST credentials are minted locally and never cached (each response gets
 // its own username). Keys never contain tokens.
 const ICE_CACHE_MS = 10 * 60 * 1000;
+// Relay credentials per client (IPv4 address or IPv6 /64) per window. A call asks once on joining
+// and again shortly before they expire; several people can share an address. Anything beyond that
+// is someone farming credentials from one invite.
+const ICE_REQUEST_WINDOW_MS = 10 * 60 * 1000;
+const ICE_REQUESTS_PER_CLIENT = 40;
+const iceRequests = new AttemptCounter(ICE_REQUEST_WINDOW_MS);
 const iceCache = new Map<string, { at: number; expiresAt: number; body: { iceServers: unknown[]; ttl?: number } }>();
 
-async function iceServersFor(key: string, env: IceEnv, expiresAt: number | undefined): Promise<unknown> {
-  if (!(env.CF_TURN_KEY_ID && env.CF_TURN_API_TOKEN)) return getIceServers(env, { expiresAt });
+async function iceServersFor(key: string, env: IceEnv, expiresAt: number | undefined, userId?: string): Promise<unknown> {
+  if (!(env.CF_TURN_KEY_ID && env.CF_TURN_API_TOKEN)) return getIceServers(env, { expiresAt, userId });
   const now = Date.now();
   const hit = iceCache.get(key);
   // Hand out a cached set only while it still has most of its life left.
@@ -313,6 +348,7 @@ export function sweepApiState(now = Date.now()): void {
   loginThrottle.sweep(now);
   passwordAttempts.sweep(now);
   codeRequests.sweep(now);
+  iceRequests.sweep(now);
   codesSent = codesSent.filter((t) => now - t < CODE_WINDOW_MS);
   invitesSent = invitesSent.filter((t) => now - t < INVITE_WINDOW_MS);
   sweepChallenges(now);
@@ -460,6 +496,7 @@ export async function handleApi(request: Request, env: ServerEnv, opts: ApiOptio
       let cacheKey = `open:${env.OPEN_MODE_TURN === '1'}`;
       let iceEnv: IceEnv = env;
       let expiresAt: number | undefined;
+      let userId: string | undefined;
       if (config.mode === 'private') {
         // TURN relays cost money and can be abused: only invited guests and the owner get credentials.
         const token = request.headers.get('X-Vchat-Token');
@@ -468,6 +505,9 @@ export async function handleApi(request: Request, env: ServerEnv, opts: ApiOptio
         if (p && (p.role === 'host' || p.role === 'guest') && p.room) {
           cacheKey = `${p.role}:${p.room}:${p.exp}`;
           expiresAt = p.exp; // credentials never outlive the invite
+          // One relay identity per room and client, so the relay's per-user quota can't be reset
+          // by asking again. (A keyed hash: the relay never sees the address or the room.)
+          userId = (await hmacBase64Url(env.SECRET_KEY!, `turn-user:${p.room}:${ipKey(opts.clientIp)}`)).slice(0, 16);
         } else if (await getAdmin(request, env, config)) {
           cacheKey = 'admin';
         } else {
@@ -477,8 +517,12 @@ export async function handleApi(request: Request, env: ServerEnv, opts: ApiOptio
         // Open mode: anyone can reach this endpoint, so never hand out relay credentials by default.
         iceEnv = { STUN_URLS: env.STUN_URLS };
       }
+      // Only where relay credentials are actually handed out (open mode without TURN gets STUN only).
+      if (iceEnv === env && !iceRequests.take(ipKey(opts.clientIp), ICE_REQUESTS_PER_CLIENT)) {
+        return json({ error: 'Too many requests. Try again later.' }, { status: 429, headers: { 'Retry-After': '60' } });
+      }
       try {
-        return json(await iceServersFor(cacheKey, iceEnv, expiresAt));
+        return json(await iceServersFor(cacheKey, iceEnv, expiresAt, userId));
       } catch (err) {
         console.error('Failed to build ICE servers:', err instanceof Error ? err.message : 'unknown error');
         return json({ error: 'TURN unavailable' }, { status: 502 });

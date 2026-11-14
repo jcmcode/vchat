@@ -17,9 +17,38 @@ export function readImageSize(bytes: Uint8Array): { width: number; height: numbe
   if (b.length >= 24 && b[0] === 0x89 && ascii(1, 3) === 'PNG' && ascii(12, 4) === 'IHDR') {
     return { width: u32be(16), height: u32be(20) };
   }
-  // GIF: logical screen size (frames can't exceed it when rendered).
-  if (b.length >= 10 && (ascii(0, 6) === 'GIF87a' || ascii(0, 6) === 'GIF89a')) {
-    return { width: u16le(6), height: u16le(8) };
+  // GIF: the logical screen size, widened by any frame that reaches past it (browsers grow the
+  // canvas to fit the first frame, so a 1x1 "screen" with a huge frame is still a huge decode).
+  // The first frame must be within the bytes we were given, or the size is unknown.
+  if (b.length >= 13 && (ascii(0, 6) === 'GIF87a' || ascii(0, 6) === 'GIF89a')) {
+    let width = u16le(6);
+    let height = u16le(8);
+    let i = 13 + (b[10] & 0x80 ? 3 * 2 ** ((b[10] & 7) + 1) : 0);
+    let frames = 0;
+    const skipSubBlocks = () => {
+      while (i < b.length && b[i] !== 0) i += 1 + b[i];
+      i++; // terminator
+    };
+    while (i < b.length) {
+      const block = b[i];
+      if (block === 0x3b) break; // trailer
+      if (block === 0x21) {
+        i += 2; // introducer + label
+        skipSubBlocks();
+      } else if (block === 0x2c) {
+        if (i + 10 > b.length) break;
+        width = Math.max(width, u16le(i + 1) + u16le(i + 5));
+        height = Math.max(height, u16le(i + 3) + u16le(i + 7));
+        frames++;
+        const packed = b[i + 9];
+        i += 10 + (packed & 0x80 ? 3 * 2 ** ((packed & 7) + 1) : 0);
+        i++; // LZW minimum code size
+        skipSubBlocks();
+      } else {
+        return null; // not a valid block
+      }
+    }
+    return frames > 0 ? { width, height } : null;
   }
   // JPEG: walk segments to the first start-of-frame marker.
   if (b.length >= 4 && b[0] === 0xff && b[1] === 0xd8) {

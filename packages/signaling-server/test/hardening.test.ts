@@ -320,6 +320,57 @@ test('remove-peer: removed peer is told, closed with 4002, and refused by peerId
   assert.equal(h.last().message, "You can't remove yourself");
 });
 
+test('remove-peer: a removed guest returning with a fresh identity has to be approved again', async () => {
+  const OPEN_INVITE = { role: 'guest' as const, approval: false };
+  const room = new Room<Conn>('rm2', transport);
+  const h = new Conn();
+  await room.enter(h, who('h'), HOST);
+  const g = new Conn();
+  await room.enter(g, who('g'), OPEN_INVITE);
+  assert.equal(g.inbox.some((m) => m.type === 'room-peers'), true); // no approval needed so far
+
+  room.removePeer(h, 'g');
+  // Same person, same invite link, new tab (new peerId and secret): no longer straight in.
+  const back = new Conn();
+  await room.enter(back, who('g2', 'fresh'), OPEN_INVITE);
+  assert.equal(back.last().type, 'waiting-for-admission');
+  assert.equal(h.last().type, 'admission-request');
+  assert.equal(room.meta.admitted.g2, undefined);
+});
+
+test('remove-peer: a personal (emailed) invite is barred with its holder', async () => {
+  const personal = { role: 'guest' as const, approval: true, email: 'guest@example.com' };
+  const room = new Room<Conn>('rm3', transport);
+  const h = new Conn();
+  await room.enter(h, who('h'), HOST);
+  const g = new Conn();
+  await room.enter(g, who('g'), personal);
+  room.admitPeer(h, 'g');
+  room.removePeer(h, 'g');
+
+  const back = new Conn();
+  await room.enter(back, who('g2', 'fresh'), personal);
+  assert.equal(back.closedWith, CLOSE_REMOVED);
+  // Someone else's invite still works (through approval).
+  const other = new Conn();
+  await room.enter(other, who('o'), { ...personal, email: 'other@example.com' });
+  assert.equal(other.last().type, 'waiting-for-admission');
+});
+
+test('peer ids that would collide with object internals are refused', () => {
+  assert.equal(parseClientMessage(JSON.stringify({ type: 'join', roomId: 'abc', peerId: '__proto__', displayName: 'x' })).ok, false);
+});
+
+test('API bodies over the limit are refused without being parsed', async () => {
+  const big = new Request('https://x.test/api/admin/login', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Origin: 'https://x.test', Host: 'x.test' },
+    body: JSON.stringify({ password: 'x'.repeat(100_000) }),
+  });
+  const res = await handleApi(big, { SECRET_KEY: SECRET, ADMIN_PASSWORD: 'correct horse battery' }, { clientIp: '203.0.113.77' });
+  assert.equal(res?.status, 401);
+});
+
 test('deny: a denied guest cannot knock again for 5 minutes', async () => {
   const room = new Room<Conn>('deny', transport);
   const h = new Conn();
@@ -432,17 +483,36 @@ test('TURN: unique usernames, 4h default TTL capped at the invite expiry, STUN d
   assert.deepEqual(a.iceServers[0].urls, ['stun:stun.cloudflare.com:3478']);
 });
 
-test('TURN: ICE endpoint takes host/guest tokens only, and never caches coturn credentials', async () => {
+test('TURN: ICE endpoint takes host/guest tokens only; coturn credentials are per client and rate limited', async () => {
   const turnEnv: ServerEnv = { ...env, TURN_URLS: 'turn:t:3478', TURN_SECRET: 's' };
   const admin = await signToken(SECRET, { role: 'admin', exp: now() + 600 });
-  const ice = (token: string) =>
-    handleApi(new Request('https://x.test/api/ice-servers', { headers: { 'X-Vchat-Token': token } }), turnEnv);
+  const ice = (token: string, clientIp = '198.51.100.1') =>
+    handleApi(new Request('https://x.test/api/ice-servers', { headers: { 'X-Vchat-Token': token } }), turnEnv, { clientIp });
+  const username = async (res: Response | null | undefined) =>
+    ((await res!.json()) as { iceServers: { username?: string }[] }).iceServers.find((s) => s.username)?.username;
   assert.equal((await ice(admin))?.status, 401);
+
+  // Asking again doesn't yield a fresh relay identity (the relay's per-user quota can't be reset)…
+  const long = await signToken(SECRET, { role: 'guest', room: 'abc', exp: now() + 6 * 3600 });
+  const first = await username(await ice(long));
+  assert.ok(first);
+  assert.equal(await username(await ice(long)), first);
+  // …while another client, or the same client in another room, gets its own.
+  assert.notEqual(await username(await ice(long, '198.51.100.2')), first);
+  const other = await signToken(SECRET, { role: 'guest', room: 'xyz', exp: now() + 6 * 3600 });
+  assert.notEqual((await username(await ice(other)))?.split(':')[1], first.split(':')[1]);
+  // The relay never sees the room or the address.
+  assert.ok(!first.includes('abc') && !first.includes('198.51'));
+
+  // Credentials never outlive the invite.
   const invite = await signToken(SECRET, { role: 'guest', room: 'abc', exp: now() + 600 });
-  const first = (await (await ice(invite))!.json()) as { iceServers: { username?: string }[]; ttl: number };
-  const second = (await (await ice(invite))!.json()) as { iceServers: { username?: string }[] };
-  assert.notEqual(first.iceServers.find((s) => s.username)?.username, second.iceServers.find((s) => s.username)?.username);
-  assert.ok(first.ttl <= 600);
+  const short = (await (await ice(invite))!.json()) as { ttl: number };
+  assert.ok(short.ttl <= 600);
+
+  // One client can't farm credentials.
+  let limited = 0;
+  for (let i = 0; i < 60; i++) if ((await ice(long, '198.51.100.9'))?.status === 429) limited++;
+  assert.ok(limited >= 15 && limited < 60);
 });
 
 // ── Email sign-in and emailed invites (Resend) ────────────────────────────────

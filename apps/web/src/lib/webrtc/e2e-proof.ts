@@ -146,12 +146,17 @@ export async function checkProof(keys: RoomKeys, proof: unknown, c: ProofContext
 }
 
 /**
- * A 6-digit code both people see for their connection. If it matches when read out loud,
+ * A 12-digit code both people see for their connection. If it matches when read out loud,
  * nobody is in the middle — even someone who has the room key.
+ *
+ * 12 digits (about 40 bits) rather than 6: someone in the middle who holds the room key could
+ * otherwise keep generating certificates until the two codes happen to agree (a million tries is
+ * seconds of work; a trillion is not something that fits inside a call being set up).
  */
 export async function safetyCode(keys: RoomKeys, roomId: string, fpA: string, fpB: string): Promise<string> {
   const [a, b] = [fpA, fpB].sort();
   const mac = new Uint8Array(await crypto.subtle.sign('HMAC', keys.code, new TextEncoder().encode(JSON.stringify([roomId, a, b]))));
-  const n = ((mac[0] << 16) | (mac[1] << 8) | mac[2]) % 1_000_000;
-  return n.toString().padStart(6, '0').replace(/(\d{3})(\d{3})/, '$1 $2');
+  let n = 0n;
+  for (const byte of mac.subarray(0, 8)) n = (n << 8n) | BigInt(byte);
+  return (n % 1_000_000_000_000n).toString().padStart(12, '0').replace(/(\d{3})(?=\d)/g, '$1 ');
 }

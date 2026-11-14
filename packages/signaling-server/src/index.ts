@@ -86,6 +86,20 @@ function clientIdFor(ip: string): string {
   return createHmac('sha256', CLIENT_KEY).update(`client:${ipKey(ip)}`).digest('base64url').slice(0, 22);
 }
 
+// Open sockets are capped per room (as on Cloudflare), per client address and in total, so one
+// invite holder can't exhaust the server's memory or crowd everyone else out of a room.
+const MAX_SOCKETS_PER_ROOM = 40;
+const MAX_SOCKETS_PER_CLIENT = 30;
+const MAX_SOCKETS_TOTAL = 5000;
+const socketsPerRoom = new Map<string, number>();
+const socketsPerClient = new Map<string, number>();
+
+function bump(map: Map<string, number>, key: string, by: 1 | -1): void {
+  const next = (map.get(key) ?? 0) + by;
+  if (next > 0) map.set(key, next);
+  else map.delete(key);
+}
+
 function armIdle(ws: WebSocket): void {
   clearIdle(ws);
   idleTimers.set(
@@ -203,6 +217,13 @@ const wss = new WebSocketServer({
     if (!originAllowed(origin, req)) return done(false, 403, 'Origin not allowed');
     const roomId = new URL(req.url ?? '/', 'http://localhost').searchParams.get('room') ?? '';
     if (!isValidRoomId(roomId)) return done(false, 400, 'Invalid room');
+    if (
+      wss.clients.size >= MAX_SOCKETS_TOTAL ||
+      (socketsPerRoom.get(roomId) ?? 0) >= MAX_SOCKETS_PER_ROOM ||
+      (socketsPerClient.get(clientIdFor(clientIp(req))) ?? 0) >= MAX_SOCKETS_PER_CLIENT
+    ) {
+      return done(false, 503, 'Too many connections');
+    }
     // Private mode: no valid invite/host token for this room, no socket.
     authorizeSocket(env, roomId, req.headers['sec-websocket-protocol'])
       .then((ok) => (ok ? done(true) : done(false, 401, 'Invite required')))
@@ -308,7 +329,10 @@ wss.on('connection', (ws, req) => {
     ws.close(1008, 'Invalid room');
     return;
   }
-  sockets.set(ws, { roomId, clientId: clientIdFor(clientIp(req)) });
+  const clientId = clientIdFor(clientIp(req));
+  sockets.set(ws, { roomId, clientId });
+  bump(socketsPerRoom, roomId, 1);
+  bump(socketsPerClient, clientId, 1);
 
   // A pong only counts if we actually asked (unsolicited pongs can't keep a socket alive).
   ws.on('pong', () => {
@@ -339,6 +363,8 @@ wss.on('connection', (ws, req) => {
   ws.on('close', () => {
     clearIdle(ws);
     leaveRoom(ws);
+    bump(socketsPerRoom, roomId, -1);
+    bump(socketsPerClient, clientId, -1);
   });
   ws.on('error', () => leaveRoom(ws));
 });
