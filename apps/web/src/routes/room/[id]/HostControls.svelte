@@ -20,6 +20,7 @@
   let confirmEnd = false;
   let alertNote = '';
   let root: HTMLDivElement;
+  let trigger: HTMLButtonElement;
   const supported = notificationsSupported();
 
   function toggleMenu() {
@@ -63,11 +64,16 @@
   }
 
   function onWindowClick(e: MouseEvent) {
-    if (open && root && !root.contains(e.target as Node)) close();
+    // The path is fixed when the click starts: a button inside the menu that has since been swapped
+    // out (e.g. "End call for everyone" -> confirm) still counts as inside.
+    if (open && root && !e.composedPath().includes(root)) close();
   }
 
   function onKeydown(e: KeyboardEvent) {
-    if (open && e.key === 'Escape') close();
+    if (open && e.key === 'Escape') {
+      close();
+      trigger?.focus();
+    }
   }
 </script>
 
@@ -75,6 +81,7 @@
 
 <div class="host-controls" bind:this={root}>
   <button
+    bind:this={trigger}
     class="chip accent host-trigger"
     aria-haspopup="dialog"
     aria-expanded={open}
