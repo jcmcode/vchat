@@ -18,6 +18,7 @@ import {
   WS_PROTOCOL,
   authorizeJoin,
   checkInviteCode,
+  handleApi,
   isValidRoomId,
   normalizeMeta,
   parseClientMessage,
@@ -27,7 +28,7 @@ import {
   type RoomMeta,
   type Transport,
 } from '@vchat/signaling-server/core';
-import { CLIENT_HEADER, INVITE_CHECK_PATH, type Env } from './env.ts';
+import { AUTH_PATHS, CLIENT_HEADER, INVITE_CHECK_PATH, ROLE_HEADER, type Env } from './env.ts';
 
 interface Attachment {
   roomId: string;
@@ -43,8 +44,10 @@ interface Attachment {
 }
 
 const OPEN = 1;
-/** More sockets than this per room are refused (6 peers + 10 waiting + reconnect slack). */
+/** More sockets than this per room are refused (6 peers + 10 waiting + reconnect slack)… */
 const MAX_SOCKETS_PER_ROOM = 40;
+/** …except for the owner: these last few seats are theirs, so guests can't crowd them out. */
+const HOST_RESERVED_SOCKETS = 4;
 /** Sockets that aren't in the room for this long are closed. */
 const IDLE_SOCKET_MS = 60 * 1000;
 
@@ -151,11 +154,22 @@ export class SignalingRoom extends DurableObject<Env> {
 
   async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
+    if (AUTH_PATHS.has(url.pathname)) {
+      // Owner sign-in, forwarded by the Worker to the one sign-in object (see AUTH_OBJECT), so the
+      // throttles and one-time challenges are shared by every request. The client id is a keyed hash.
+      const response = await handleApi(request, this.env, {
+        clientIp: request.headers.get(CLIENT_HEADER) ?? undefined,
+        waitUntil: (p) => this.ctx.waitUntil(p),
+      });
+      return response ?? new Response('Not found', { status: 404 });
+    }
     const roomId = url.searchParams.get('room') ?? '';
     if (!isValidRoomId(roomId)) return new Response('Invalid room', { status: 400 });
     if (url.pathname === INVITE_CHECK_PATH) return this.inviteCheck(request, roomId);
     if (this.room && this.room.id !== roomId) return new Response('Invalid room', { status: 400 });
-    if (this.ctx.getWebSockets().length >= MAX_SOCKETS_PER_ROOM) {
+    const open = this.ctx.getWebSockets().length;
+    const isHost = request.headers.get(ROLE_HEADER) === 'host';
+    if (open >= MAX_SOCKETS_PER_ROOM + HOST_RESERVED_SOCKETS || (!isHost && open >= MAX_SOCKETS_PER_ROOM)) {
       return new Response('Too many connections', { status: 503 });
     }
 
@@ -226,7 +240,7 @@ export class SignalingRoom extends DurableObject<Env> {
     switch (msg.type) {
       case 'ping':
         ws.send(PONG_MESSAGE);
-        break;
+        return; // no state change: no alarm to reschedule
       case 'create-room':
       case 'join': {
         if (msg.roomId !== room.id) return this.sendError(ws, 'Room ID does not match connection');
@@ -259,8 +273,10 @@ export class SignalingRoom extends DurableObject<Env> {
         room.leave(ws);
         break;
       case 'signal':
+        // The hot path while calls connect (offers, answers, ICE candidates): relay and return. It
+        // changes no membership or deadline, so skip rescanning every socket for the alarm.
         room.signal(ws, msg.targetPeerId, msg.signal);
-        break;
+        return;
       case 'admit-peer':
         room.admitPeer(ws, msg.peerId);
         break;

@@ -26,6 +26,7 @@ import {
   inviteEmail,
   isCode,
   isValidSender,
+  LOGIN_CODE_DIGITS,
   loginCodeEmail,
   normalizeEmail,
   parseSender,
@@ -260,8 +261,9 @@ export function generateRoomId(length = 10): string {
 // per 15 minutes. Across all clients, after 100 attempts in the window further checks are spaced 2s
 // apart (and refused if the queue is over 10s): a distributed guesser is slowed to a crawl, but the
 // owner is never locked out for the whole window. Attempts are counted *before* the password is
-// checked, so parallel bursts can't slip through, and refunded on success. (On Cloudflare this is
-// per isolate — Cloudflare Access is the stronger option there.)
+// checked, so parallel bursts can't slip through, and refunded on success. (On Cloudflare the Worker
+// sends every sign-in request to one Durable Object, so this state is shared rather than per
+// isolate; it resets only if that object is evicted after sitting idle.)
 const loginThrottle = new LoginThrottle({
   windowMs: 15 * 60 * 1000,
   perClient: 10,
@@ -689,7 +691,7 @@ export async function handleApi(request: Request, env: ServerEnv, opts: ApiOptio
       const nonce = randomB64(16);
       let mac = randomB64(32); // nothing is sent for other addresses: this challenge can never verify
       if (isOwner) {
-        const code = randomCode();
+        const code = randomCode(LOGIN_CODE_DIGITS);
         mac = await loginCodeMac(env, nonce, code);
         codesSent.push(now);
         // Sent in the background so the response takes the same time whoever asked.
@@ -727,7 +729,7 @@ export async function handleApi(request: Request, env: ServerEnv, opts: ApiOptio
       if (state.used || state.attempts >= VERIFY_ATTEMPTS_PER_CHALLENGE) return wrong();
       state.attempts++;
       challengeState.set(p.n, state);
-      if (!isCode(code) || !safeEqual(await loginCodeMac(env, p.n, code), p.c)) return wrong();
+      if (!isCode(code, LOGIN_CODE_DIGITS) || !safeEqual(await loginCodeMac(env, p.n, code), p.c)) return wrong();
 
       state.used = true; // single use (remembered until the challenge expires)
       loginThrottle.succeeded(opts.clientIp);

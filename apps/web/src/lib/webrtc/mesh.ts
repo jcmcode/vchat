@@ -11,7 +11,15 @@ import { nameKey, stripInvisible } from './name-key.js';
 import { LatestSender } from './latest-sender.js';
 import { enableSending, isValidMid, localSlots, remoteSlots, sendingBlocked } from './media-slots.js';
 import { holdEarlyState, type EarlyState } from './early-state.js';
-import { cameraTarget, screenTarget, tuneSender } from '../media/quality.js';
+import { cameraForViewer, cameraTarget, parseView, screenTarget, tuneSender, type RemoteView } from '../media/quality.js';
+import {
+  ICE_REBUILD_AFTER_MS,
+  MAX_ACCEPTED_RESTARTS_PER_MIN,
+  MAX_RESTARTS_PER_MIN,
+  RECOVERY_POLL_MS,
+  pinDecision,
+  recoveryStep,
+} from './ice-recovery.js';
 import {
   initFileTransfer,
   handleFileMeta,
@@ -49,6 +57,10 @@ export interface PeerConnection {
   screenMid: string | null;
   /** Their latest screen/media state sent before we trusted them: applied in trustPeer (early-state.ts). */
   earlyState: Map<EarlyState['type'], EarlyState>;
+  /** What their version supports (their `caps` message): ICE restarts (ice-recovery.ts). */
+  remoteCaps: { iceRestart: boolean };
+  /** How they show our camera (their `view` message): sizes the camera we send them (quality.ts). */
+  remoteView: RemoteView | undefined;
 }
 
 export interface ChatMessage {
@@ -101,6 +113,8 @@ export const roomError = writable<string>('');
 export const admissionRequests = writable<AdmissionRequest[]>([]);
 export const hostStatus = writable<boolean>(false);
 export const typingPeers = writable<Set<string>>(new Set());
+/** Of `typingPeers`: those whose typing is a private message to you (shown only in your chat with them). */
+export const privateTypingPeers = writable<Set<string>>(new Set());
 export const reactions = writable<Reaction[]>([]);
 export const speakingPeers = writable<Set<string>>(new Set());
 /** Remote peers currently sharing their screen. */
@@ -149,7 +163,8 @@ export function clearRoomError(): void {
 type DataHandler = (fromPeerId: string, msg: AnyDataMessage) => void;
 const dataHandlers = new Map<string, DataHandler>();
 /** Types that may never be re-registered (the first registration wins). */
-const RESERVED_TYPES = new Set(['e2e-auth']);
+/** Verification messages: the only ones acted on before a connection is trusted (see e2e.ts). */
+const RESERVED_TYPES = new Set(['e2e-auth', 'e2e-reveal']);
 const connectHandlers = new Set<(peerId: string) => void>();
 const channelOpenHandlers = new Set<(peerId: string, sid: string) => void>();
 const createdHandlers = new Set<(peerId: string, sid: string | null) => void>();
@@ -215,6 +230,8 @@ export function trustPeer(peerId: string, sid: string): void {
   // Tell them what we're doing right now, then let features sync state.
   if (screenShareActive) sendIfConnected(pc, serialize(screenState(pc, true)));
   sendIfConnected(pc, serialize({ type: 'media-state', ...localMediaState() }));
+  // We accept ICE restarts on this connection (an older version doesn't; see ice-recovery.ts).
+  sendIfConnected(pc, serialize({ type: 'caps', iceRestart: true }));
   scheduleRetune(); // one more peer to send to
   for (const handler of connectHandlers) handler(peerId);
 }
@@ -412,6 +429,24 @@ let localDisplayName: string = '';
 let currentRoomId: string = '';
 const unsubscribers: (() => void)[] = [];
 const disconnectTimers = new Map<string, ReturnType<typeof setTimeout>>();
+/**
+ * Peers the server lists as in the room right now (room-peers, peer-joined; peer-left removes).
+ * A direct connection that closes for one of them is rebuilt; for anyone else it's simply gone.
+ */
+const presentPeers = new Set<string>();
+/**
+ * The server said these peers left, but our direct connection to them was still working: kept for
+ * LEFT_GRACE_MS in case it was only their signaling connection that dropped (a network blip, a
+ * server restart or deploy). If they come back meanwhile, the call carries on untouched.
+ */
+const leftGrace = new Map<string, ReturnType<typeof setTimeout>>();
+const LEFT_GRACE_MS = 15_000;
+/** When each peer's direct connection went down (ICE "disconnected"), while it's being recovered. */
+const iceDownSince = new Map<string, number>();
+/** Our ICE restarts (or requests for one) per peer, for spacing and limits (ice-recovery.ts). */
+const iceRestartTimes = new Map<string, number[]>();
+/** ICE restarts we accepted from each peer in the last minute. */
+const acceptedRestarts = new Map<string, number[]>();
 const speakingDetectorCleanups = new Map<string, () => void>();
 /** Display names shown for each peer (the server's label, or a name they proved; see setVerifiedName). */
 const knownNames = new Map<string, string>();
@@ -465,8 +500,24 @@ const TYPE_LIMITS: Record<string, number> = {
   // A few files at once is normal; a stream of announcements/cancellations is a flood.
   'file-meta': 2,
   'file-cancel': 4,
+  // One of each per connection session.
+  'e2e-auth': 2,
+  'e2e-reveal': 2,
+  caps: 1,
+  // How they show our camera: at most one a second (view-size.ts).
+  view: 2,
 };
 const typeBuckets = new Map<string, { tokens: number; at: number }>();
+/**
+ * File chunks and their acks have their own message budget (their bytes still count against
+ * BYTES_PER_SECOND): a transfer can't use up the budget chat, drawing and media state share, and
+ * they can't starve a transfer either. Senders pace chunks well below this (file-transfer.ts).
+ */
+const BULK_PER_SECOND = 600;
+const BULK_BURST = 1200;
+const bulkBuckets = new Map<string, { tokens: number; at: number }>();
+/** Senders always serialize `type` first, so the budget is picked before parsing; checked after. */
+const BULK_PREFIXES = ['{"type":"file-chunk"', '{"type":"file-ack"'];
 
 function take(map: Map<string, { tokens: number; at: number }>, key: string, perSecond: number, burst: number, cost = 1): boolean {
   const now = Date.now();
@@ -519,7 +570,8 @@ function newSid(): string {
  * name someone already present is shown under.
  */
 function noteServerName(peerId: string, name: string): void {
-  serverNames.set(peerId, name);
+  // The server already strips invisible and direction-override characters; don't rely on it.
+  serverNames.set(peerId, typeof name === 'string' ? stripInvisible(name).slice(0, 4 * MAX_SHOWN_NAME) : 'Peer');
   resolveShownNames();
   updatePeers();
 }
@@ -678,9 +730,19 @@ export async function joinRoom(opts: JoinOptions): Promise<void> {
     const existingPeers = event.peers as { id: string; displayName: string }[];
     // After a reconnect, drop anyone who left while we were away.
     const listed = new Set(existingPeers.map((p) => p.id));
-    for (const id of get(peers).keys()) if (!listed.has(id)) destroyPeerConnection(id);
+    presentPeers.clear();
+    for (const id of listed) presentPeers.add(id);
+    for (const id of [...get(peers).keys(), ...leftGrace.keys()]) if (!listed.has(id)) destroyPeerConnection(id);
     for (const p of existingPeers) {
       noteServerName(p.id, p.displayName);
+      cancelLeftGrace(p.id);
+      // Only our signaling connection dropped: a verified, working connection carries on as is
+      // (no new handshake, no gap in audio or video). One that's down but can be restarted in place
+      // is kept too, and restarted now that offers can get through again.
+      if (keepable(p.id)) {
+        if (!directlyConnected(p.id)) recoverPeer(p.id);
+        continue;
+      }
       createPeerConnection(p.id, p.displayName, true);
     }
   });
@@ -688,13 +750,42 @@ export async function joinRoom(opts: JoinOptions): Promise<void> {
   on('peer-joined', (event) => {
     const { peerId: newPeerId, displayName: name } = event as unknown as { peerId: string; displayName: string };
     noteServerName(newPeerId, name);
+    presentPeers.add(newPeerId);
+    cancelLeftGrace(newPeerId);
+    // Back after a signaling blip with the call still flowing (or recoverable in place): keep it.
+    // (A new tab of theirs sends an offer with a new session id, which replaces this connection in
+    // handleSignal.)
+    if (keepable(newPeerId)) {
+      if (!directlyConnected(newPeerId)) recoverPeer(newPeerId); // they can get our restart offer now
+      return;
+    }
     // The newcomer sends the offer; we wait for it.
     createPeerConnection(newPeerId, name, false);
   });
 
   on('peer-left', (event) => {
-    const { peerId: leftPeerId } = event as unknown as { peerId: string };
-    destroyPeerConnection(leftPeerId);
+    const { peerId: leftPeerId, reason } = event as unknown as { peerId: string; reason?: string };
+    presentPeers.delete(leftPeerId);
+    // Removed by the host: cut them off at once, working connection or not.
+    if (reason === 'removed') {
+      if (get(peers).has(leftPeerId) || leftGrace.has(leftPeerId)) destroyPeerConnection(leftPeerId);
+      return;
+    }
+    if (!keepable(leftPeerId)) {
+      destroyPeerConnection(leftPeerId);
+      return;
+    }
+    // Their direct connection still works (or can be restarted in place): it may only be their
+    // signaling connection that dropped, or both, briefly (a network switch).
+    // If they leave for real, the connection closes (and is dropped) well before this runs out.
+    cancelLeftGrace(leftPeerId);
+    leftGrace.set(
+      leftPeerId,
+      setTimeout(() => {
+        leftGrace.delete(leftPeerId);
+        if (generation === joinGeneration && !presentPeers.has(leftPeerId)) destroyPeerConnection(leftPeerId);
+      }, LEFT_GRACE_MS)
+    );
   });
 
   on('signal', (event) => {
@@ -725,9 +816,10 @@ export async function joinRoom(opts: JoinOptions): Promise<void> {
   on('admission-request', (event) => {
     const { peerId: reqPeerId, displayName: reqName, email } = event as unknown as AdmissionRequest;
     const verifiedEmail = typeof email === 'string' && email.length <= 254 ? cleanPeerText(email) : undefined;
+    const shownName = typeof reqName === 'string' ? stripInvisible(reqName).slice(0, 4 * MAX_SHOWN_NAME) : '';
     admissionRequests.update((reqs) => [
       ...reqs.filter((r) => r.peerId !== reqPeerId),
-      { peerId: reqPeerId, displayName: reqName, ...(verifiedEmail ? { email: verifiedEmail } : {}) },
+      { peerId: reqPeerId, displayName: shownName || 'Guest', ...(verifiedEmail ? { email: verifiedEmail } : {}) },
     ]);
   });
 
@@ -811,10 +903,17 @@ export function leaveRoom(opts: { keepError?: boolean } = {}): void {
 
   for (const timer of disconnectTimers.values()) clearTimeout(timer);
   disconnectTimers.clear();
+  for (const timer of leftGrace.values()) clearTimeout(timer);
+  leftGrace.clear();
+  presentPeers.clear();
+  iceDownSince.clear();
+  iceRestartTimes.clear();
+  acceptedRestarts.clear();
   for (const timer of typingTimers.values()) clearTimeout(timer);
   typingTimers.clear();
   dataBuckets.clear();
   byteBuckets.clear();
+  bulkBuckets.clear();
   typeBuckets.clear();
   renegotiations.clear();
   remoteSessionStarts.clear();
@@ -853,6 +952,7 @@ export function leaveRoom(opts: { keepError?: boolean } = {}): void {
   clearEndRequest();
   relockOnRejoin = false;
   typingPeers.set(new Set());
+  privateTypingPeers.set(new Set());
   reactions.set([]);
   speakingPeers.set(new Set());
   sharingPeers.set(new Set());
@@ -957,6 +1057,7 @@ export function sendTypingIndicator(isTyping: boolean, toPeerId?: string): void 
     type: 'typing',
     isTyping,
     fromPeerId: localPeerId,
+    ...(toPeerId ? { private: true } : {}),
   };
   if (toPeerId) sendDataToPeer(toPeerId, serialize(msg));
   else broadcastToAllPeers(serialize(msg));
@@ -986,7 +1087,7 @@ export function sendFileToRoom(file: File, toPeerId?: string): string | null {
   const peerIds = Array.from(get(peers).values())
     .filter((pc) => pc.connected && (!toPeerId || pc.id === toPeerId))
     .map((pc) => pc.id);
-  return ftSendFile(file, peerIds, localPeerId, localDisplayName, toPeerId ? { displayName: peerDisplayName(toPeerId) } : undefined);
+  return ftSendFile(file, peerIds, localPeerId, localDisplayName, toPeerId ? { peerId: toPeerId, displayName: peerDisplayName(toPeerId) } : undefined);
 }
 
 // Typing indicator timers
@@ -1000,6 +1101,21 @@ function handleDataChannelMessage(fromPeerId: string, anyMsg: DataChannelMessage
   }
   const msg = anyMsg as DataChannelMessage;
   switch (msg.type) {
+    case 'caps': {
+      const pc = get(peers).get(fromPeerId);
+      if (pc) pc.remoteCaps = { iceRestart: msg.iceRestart === true };
+      break;
+    }
+    case 'view': {
+      // How they show our camera: we send them no bigger than that (never more than their share).
+      const pc = get(peers).get(fromPeerId);
+      const view = parseView(msg);
+      if (!pc || !view) break;
+      const changed = JSON.stringify(view) !== JSON.stringify(pc.remoteView);
+      pc.remoteView = view;
+      if (changed) scheduleRetune();
+      break;
+    }
     case 'media-state': {
       const next = { audio: msg.audio !== false, video: msg.video !== false };
       const prev = get(peerMediaState).get(fromPeerId);
@@ -1054,6 +1170,15 @@ function handleDataChannelMessage(fromPeerId: string, anyMsg: DataChannelMessage
       const pid = fromPeerId;
       if (msg.isTyping) {
         typingPeers.update((s) => new Set(s).add(pid));
+        const isPrivate = msg.private === true;
+        if (get(privateTypingPeers).has(pid) !== isPrivate) {
+          privateTypingPeers.update((s) => {
+            const next = new Set(s);
+            if (isPrivate) next.add(pid);
+            else next.delete(pid);
+            return next;
+          });
+        }
         // Auto-clear after 3s
         const existing = typingTimers.get(pid);
         if (existing) clearTimeout(existing);
@@ -1122,17 +1247,19 @@ let screenShareActive = false;
 let mixedAudioCtx: AudioContext | null = null;
 let mixedAudioDest: MediaStreamAudioDestinationNode | null = null;
 
-function createMixedAudioTrack(micStream: MediaStream, screen: MediaStream): MediaStreamTrack {
+/**
+ * One outgoing audio track carrying the shared screen's sound, plus the microphone when there is
+ * one (someone who joined without a microphone can still share sound). A muted microphone adds
+ * silence, so the shared sound carries on while you're muted.
+ */
+function createMixedAudioTrack(micStream: MediaStream | null, screen: MediaStream): MediaStreamTrack {
   cleanupMixedAudio();
   mixedAudioCtx = new AudioContext();
   mixedAudioCtx.resume().catch(() => {});
   mixedAudioDest = mixedAudioCtx.createMediaStreamDestination();
 
-  const micSource = mixedAudioCtx.createMediaStreamSource(micStream);
-  const screenSource = mixedAudioCtx.createMediaStreamSource(screen);
-
-  micSource.connect(mixedAudioDest);
-  screenSource.connect(mixedAudioDest);
+  if (micStream?.getAudioTracks().length) mixedAudioCtx.createMediaStreamSource(micStream).connect(mixedAudioDest);
+  mixedAudioCtx.createMediaStreamSource(screen).connect(mixedAudioDest);
 
   return mixedAudioDest.stream.getAudioTracks()[0];
 }
@@ -1230,13 +1357,14 @@ function retune(): void {
   const screen = screenTarget(sending.length, !!outgoingCameraTrack());
   for (const pc of sending) {
     const slots = localSlots(transceiversOf(pc));
-    for (const [t, target] of [
-      [slots.camera, camera],
-      [slots.screen, screen],
-    ] as const) {
-      const track = t ? pc.intended.get(t.sender) : null;
-      if (t && track) void tuneSender(t.sender, target, track.getSettings());
+    const cameraTrack = slots.camera ? pc.intended.get(slots.camera.sender) : null;
+    if (slots.camera && cameraTrack) {
+      const source = cameraTrack.getSettings();
+      // Each copy of the camera no bigger than this person shows it (quality.ts cameraForViewer).
+      void tuneSender(slots.camera.sender, cameraForViewer(camera, pc.remoteView, source), source);
     }
+    const screenTrack = slots.screen ? pc.intended.get(slots.screen.sender) : null;
+    if (slots.screen && screenTrack) void tuneSender(slots.screen.sender, screen, screenTrack.getSettings());
   }
 }
 
@@ -1303,7 +1431,7 @@ export function startSharingScreen(): void {
 
   // Mix screen audio with mic so peers hear both voice and shared audio
   const mic = get(localStream);
-  if (screen.getAudioTracks().length > 0 && mic?.getAudioTracks().length) {
+  if (screen.getAudioTracks().length > 0) {
     try {
       createMixedAudioTrack(mic, screen);
     } catch (e) {
@@ -1348,8 +1476,18 @@ function checkRemoteSignal(pc: PeerConnection, data: unknown): SimplePeer.Signal
   if (d.type === 'offer' || d.type === 'answer') {
     const identity = readSdpIdentity(d.sdp);
     if (!identity) return 'reject';
-    if (!pc.pinned) pc.pinned = identity;
-    else if (pc.pinned.fingerprint !== identity.fingerprint || pc.pinned.ufrag !== identity.ufrag) return 'reject';
+    const decision = pinDecision(pc.pinned, identity, pc.connected);
+    if (decision === 'reject') return 'reject';
+    if (decision === 'pin') pc.pinned = identity;
+    if (decision === 'restart') {
+      // An ICE restart: new ICE credentials, same DTLS certificate (still pinned, and what the
+      // end-to-end proof covers), so the same verified session. See ice-recovery.ts.
+      const now = Date.now();
+      const recent = (acceptedRestarts.get(pc.id) ?? []).filter((t) => now - t < 60_000);
+      if (recent.length >= MAX_ACCEPTED_RESTARTS_PER_MIN) return 'drop';
+      acceptedRestarts.set(pc.id, [...recent, now]);
+      pc.pinned = { fingerprint: identity.fingerprint, ufrag: identity.ufrag };
+    }
     return { type: d.type, sdp: d.sdp as string };
   }
   if (d.sdp !== undefined && d.sdp !== null) return 'reject';
@@ -1366,7 +1504,8 @@ function checkRemoteSignal(pc: PeerConnection, data: unknown): SimplePeer.Signal
     const recent = (renegotiations.get(pc.id) ?? []).filter((t) => now - t < 60_000);
     if (recent.length >= MAX_RENEGOTIATIONS_PER_MIN) return 'drop';
     renegotiations.set(pc.id, [...recent, now]);
-    return { type: 'renegotiate', renegotiate: true } as SimplePeer.SignalData;
+    // `iceRestart`: the other side's connection is down and it asks us (the initiator) for an ICE restart.
+    return { type: 'renegotiate', renegotiate: true, ...(d.iceRestart === true ? { iceRestart: true } : {}) } as SimplePeer.SignalData;
   }
   return 'drop'; // e.g. transceiverRequest: never let a peer add transceivers to our connection
 }
@@ -1388,6 +1527,9 @@ function handleSignal(fromPeerId: string, raw: unknown): void {
       blockPeer(fromPeerId);
       return;
     }
+    // The other side's connection is down and it asks for an ICE restart, which only we (the
+    // initiator) can start: flag it for the offer this request produces.
+    if ((verdict as { iceRestart?: boolean }).iceRestart) restartIceOnRequest(target);
     try {
       target.peer.signal(verdict);
     } catch (err) {
@@ -1461,6 +1603,8 @@ function createPeerConnection(
     screenStream: null,
     screenMid: null,
     earlyState: new Map(),
+    remoteCaps: { iceRestart: false },
+    remoteView: undefined,
   };
 
   // Media layout (media-slots.ts): audio, camera, screen. The offerer creates all three, able to
@@ -1556,13 +1700,19 @@ function createPeerConnection(
   peer.on('data', (data: Uint8Array | string) => {
     if (!isCurrent()) return;
     const size = typeof data === 'string' ? data.length : data.byteLength;
-    if (size > MAX_DATA_MESSAGE_BYTES || !allowData(remotePeerId) || !allowBytes(remotePeerId, size)) return;
+    if (size > MAX_DATA_MESSAGE_BYTES || !allowBytes(remotePeerId, size)) return;
     const str = typeof data === 'string' ? data : new TextDecoder().decode(data);
+    // Counted before parsing, against the budget the message claims to belong to...
+    const bulk = BULK_PREFIXES.some((prefix) => str.startsWith(prefix));
+    if (bulk ? !take(bulkBuckets, remotePeerId, BULK_PER_SECOND, BULK_BURST) : !allowData(remotePeerId)) return;
     const msg = deserialize(str);
     if (!msg) return;
-    // Until verified, the only thing we act on is the verification proof itself. Their latest
+    // ...and dropped if it doesn't.
+    if (bulk !== (msg.type === 'file-chunk' || msg.type === 'file-ack')) return;
+    // Until verified, the only thing we act on is verification itself (the proof, and the
+    // safety-code nonce that follows it). Their latest
     // screen/media state is kept (a validated copy, one of each) and applied once trusted.
-    if (!pc.trusted && msg.type !== 'e2e-auth') {
+    if (!pc.trusted && !RESERVED_TYPES.has(msg.type)) {
       holdEarlyState(pc.earlyState, msg);
       return;
     }
@@ -1571,7 +1721,11 @@ function createPeerConnection(
   });
 
   peer.on('close', () => {
-    if (isCurrent()) destroyPeerConnection(remotePeerId);
+    if (!isCurrent()) return;
+    // Still in the room as far as the server knows (their side reset the connection, e.g. an older
+    // version that rebuilt it after a signaling blip): connect again rather than lose them.
+    if (presentPeers.has(remotePeerId) && !leftGrace.has(remotePeerId) && pc.connected) reconnectPeer(remotePeerId, remoteDisplayName);
+    else destroyPeerConnection(remotePeerId);
   });
 
   peer.on('error', (err: Error) => {
@@ -1586,26 +1740,17 @@ function createPeerConnection(
   rtcPc?.addEventListener('iceconnectionstatechange', () => {
     if (!isCurrent()) return;
     const state = rtcPc.iceConnectionState;
-    const clearTimer = () => {
-      const timer = disconnectTimers.get(remotePeerId);
-      if (timer) clearTimeout(timer);
-      disconnectTimers.delete(remotePeerId);
-    };
-
     if (state === 'connected' || state === 'completed') {
-      clearTimer();
+      stopRecovery(remotePeerId);
     } else if (state === 'disconnected') {
-      clearTimer();
-      // "disconnected" often recovers on its own; give it a few seconds first.
-      disconnectTimers.set(
-        remotePeerId,
-        setTimeout(() => {
-          disconnectTimers.delete(remotePeerId);
-          if (isCurrent()) reconnectPeer(remotePeerId, remoteDisplayName);
-        }, 5000)
-      );
+      // Often back by itself within a second or two. If not: an ICE restart on this same connection
+      // (same DTLS session, no new verification), and a full rebuild only if that doesn't work.
+      // The clock runs from the first drop, through any restarts, until it's connected again.
+      if (!iceDownSince.has(remotePeerId)) iceDownSince.set(remotePeerId, Date.now());
+      if (!disconnectTimers.has(remotePeerId)) scheduleRecovery(remotePeerId);
     } else if (state === 'failed') {
-      clearTimer();
+      // The browser gave up on this ICE session (simple-peer closes the connection too): rebuild.
+      stopRecovery(remotePeerId);
       reconnectPeer(remotePeerId, remoteDisplayName);
     }
   });
@@ -1657,6 +1802,125 @@ function refreshRemoteMedia(pc: PeerConnection): void {
 
 const reconnectAttempts = new Map<string, number[]>();
 
+/** A verified connection to this peer whose transport is up right now. */
+function directlyConnected(remotePeerId: string): boolean {
+  const pc = get(peers).get(remotePeerId);
+  if (!pc || !pc.connected || !pc.trusted) return false;
+  const state = rtcOf(pc)?.iceConnectionState;
+  return state === 'connected' || state === 'completed';
+}
+
+function iceIsUp(rtc: RTCPeerConnection): boolean {
+  return rtc.iceConnectionState === 'connected' || rtc.iceConnectionState === 'completed';
+}
+
+/** This connection can be recovered with an ICE restart: established, trusted, and both sides support it. */
+function canRestartIce(pc: PeerConnection, rtc: RTCPeerConnection): boolean {
+  return pc.connected && pc.trusted && pc.remoteCaps.iceRestart && typeof rtc.restartIce === 'function';
+}
+
+/**
+ * Worth keeping through a signaling drop: verified and up, or down for a moment and being recovered
+ * in place (a network switch drops signaling and the direct connection together).
+ */
+function keepable(remotePeerId: string): boolean {
+  if (directlyConnected(remotePeerId)) return true;
+  const pc = get(peers).get(remotePeerId);
+  const rtc = pc ? rtcOf(pc) : null;
+  const since = iceDownSince.get(remotePeerId);
+  return !!pc && !!rtc && since !== undefined && canRestartIce(pc, rtc) && Date.now() - since < ICE_REBUILD_AFTER_MS;
+}
+
+function scheduleRecovery(remotePeerId: string, delayMs = RECOVERY_POLL_MS): void {
+  const prev = disconnectTimers.get(remotePeerId);
+  if (prev) clearTimeout(prev);
+  disconnectTimers.set(
+    remotePeerId,
+    setTimeout(() => {
+      disconnectTimers.delete(remotePeerId);
+      recoverPeer(remotePeerId);
+    }, delayMs)
+  );
+}
+
+function stopRecovery(remotePeerId: string): void {
+  const timer = disconnectTimers.get(remotePeerId);
+  if (timer) clearTimeout(timer);
+  disconnectTimers.delete(remotePeerId);
+  iceDownSince.delete(remotePeerId);
+}
+
+/** One step of bringing a dropped connection back (ice-recovery.ts decides what). */
+function recoverPeer(remotePeerId: string): void {
+  const pc = get(peers).get(remotePeerId);
+  const rtc = pc ? rtcOf(pc) : null;
+  const since = iceDownSince.get(remotePeerId);
+  if (!pc || !rtc || since === undefined) return;
+  const now = Date.now();
+  const restarts = (iceRestartTimes.get(remotePeerId) ?? []).filter((t) => now - t < 60_000);
+  const step = recoveryStep({
+    iceUp: iceIsUp(rtc),
+    downForMs: now - since,
+    canRestart: canRestartIce(pc, rtc),
+    signalingUp: get(roomJoined) && presentPeers.has(remotePeerId),
+    initiator: pc.initiator,
+    sinceLastRestartMs: restarts.length ? now - restarts[restarts.length - 1] : Infinity,
+    restartsLastMinute: restarts.length,
+  });
+  if (step === 'done') {
+    stopRecovery(remotePeerId);
+    return;
+  }
+  if (step === 'rebuild') {
+    stopRecovery(remotePeerId);
+    reconnectPeer(remotePeerId, pc.displayName);
+    return;
+  }
+  if (step === 'restart' && startIceRestart(pc, rtc)) iceRestartTimes.set(remotePeerId, [...restarts, now]);
+  scheduleRecovery(remotePeerId);
+}
+
+/**
+ * Restart ICE on this connection. The initiator does it itself: restartIce(), then a new offer.
+ * The other side can't make offers on this connection, so it asks the initiator for one; the
+ * initiator restarts when such a request arrives while its side is down too (restartIceOnRequest).
+ * Returns whether anything was sent.
+ */
+function startIceRestart(pc: PeerConnection, rtc: RTCPeerConnection): boolean {
+  if (!pc.sid || !signalingClient) return false;
+  if (pc.initiator) {
+    if (rtc.signalingState !== 'stable') return false; // an offer is already out: wait for it
+    rtc.restartIce();
+    (pc.peer as unknown as { negotiate(): void }).negotiate();
+    return true;
+  }
+  signalingClient.sendSignal(pc.id, { sid: pc.sid, data: { type: 'renegotiate', renegotiate: true, iceRestart: true } });
+  return true;
+}
+
+/**
+ * The other side asked us (the initiator) for an ICE restart: its connection is down, even if ours
+ * doesn't look it yet. Restarting a connection that still works is harmless (media stays on the
+ * current path until a new one is ready).
+ */
+function restartIceOnRequest(pc: PeerConnection): void {
+  const rtc = rtcOf(pc);
+  if (!pc.initiator || !rtc || !canRestartIce(pc, rtc) || rtc.signalingState !== 'stable') return;
+  const now = Date.now();
+  const restarts = (iceRestartTimes.get(pc.id) ?? []).filter((t) => now - t < 60_000);
+  if (restarts.length >= MAX_RESTARTS_PER_MIN) return;
+  iceRestartTimes.set(pc.id, [...restarts, now]);
+  if (!iceDownSince.has(pc.id)) iceDownSince.set(pc.id, now);
+  if (!disconnectTimers.has(pc.id)) scheduleRecovery(pc.id); // keep watching: rebuild if it doesn't come back
+  rtc.restartIce();
+}
+
+function cancelLeftGrace(remotePeerId: string): void {
+  const timer = leftGrace.get(remotePeerId);
+  if (timer) clearTimeout(timer);
+  leftGrace.delete(remotePeerId);
+}
+
 function reconnectPeer(remotePeerId: string, remoteDisplayName: string): void {
   // Back off if a connection keeps failing (e.g. no TURN and a strict NAT): max 5 tries/minute.
   const now = Date.now();
@@ -1672,9 +1936,8 @@ function reconnectPeer(remotePeerId: string, remoteDisplayName: string): void {
 
 /** Stop everything attached to a peer's current connection, but keep its entry in the store. */
 function teardownPeer(remotePeerId: string): void {
-  const timer = disconnectTimers.get(remotePeerId);
-  if (timer) clearTimeout(timer);
-  disconnectTimers.delete(remotePeerId);
+  stopRecovery(remotePeerId);
+  iceRestartTimes.delete(remotePeerId);
 
   speakingDetectorCleanups.get(remotePeerId)?.();
   speakingDetectorCleanups.delete(remotePeerId);
@@ -1694,6 +1957,7 @@ function teardownPeer(remotePeerId: string): void {
 }
 
 function destroyPeerConnection(remotePeerId: string): void {
+  cancelLeftGrace(remotePeerId);
   teardownPeer(remotePeerId);
   scheduleRetune(); // one peer fewer to send to
   dropRecipient(remotePeerId);

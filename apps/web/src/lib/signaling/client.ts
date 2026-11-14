@@ -39,7 +39,11 @@ interface RoomIntent {
   admitted?: boolean;
 }
 
-const PING_INTERVAL_MS = 25_000;
+/**
+ * A dead connection is noticed within PING_INTERVAL_MS + PONG_TIMEOUT_MS. Pings are cheap: on
+ * Cloudflare the runtime answers them without waking the room's Durable Object.
+ */
+const PING_INTERVAL_MS = 15_000;
 /** Must match the server (core/api.ts). The token rides as a subprotocol so it never lands in URLs/logs. */
 const WS_PROTOCOL = 'vchat.v1';
 const WS_TOKEN_PREFIX = 'vchat.t.';

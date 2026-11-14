@@ -16,6 +16,16 @@ test('earlyState keeps a validated copy of screen-state and media-state only', (
   assert.deepEqual(Object.keys(copy ?? {}).sort(), ['audio', 'type', 'video']);
 });
 
+test('earlyState also keeps what their version supports and how they show our camera, validated', () => {
+  assert.deepEqual(earlyState({ type: 'caps', iceRestart: true, extra: 1 }), { type: 'caps', iceRestart: true });
+  assert.deepEqual(earlyState({ type: 'caps', iceRestart: 'yes' }), { type: 'caps', iceRestart: false });
+  assert.deepEqual(earlyState({ type: 'view', w: 640, h: 360, fit: 'cover', extra: 'x' }), { type: 'view', w: 640, h: 360, fit: 'cover' });
+  assert.deepEqual(earlyState({ type: 'view', w: 0, h: 0, fit: 'cover' }), { type: 'view', w: 0, h: 0 });
+  assert.deepEqual(earlyState({ type: 'view', full: true }), { type: 'view', full: true });
+  assert.equal(earlyState({ type: 'view', w: 640, h: 360, fit: 'bogus' }), null);
+  assert.equal(earlyState({ type: 'view', w: -5, h: 360, fit: 'cover' }), null);
+});
+
 test('holdEarlyState keeps only the latest of each type', () => {
   const store = new Map<EarlyState['type'], EarlyState>();
   assert.equal(holdEarlyState(store, { type: 'screen-state', sharing: true, mid: '1' }), true);

@@ -37,6 +37,7 @@ import {
   idAuthor,
   itemsNearWorld,
   lastStrokeBy,
+  MAX_ID_LENGTH,
   mergeStroke,
   newStrokeId,
   quantizeWorld,
@@ -63,6 +64,13 @@ export const boardStatus = writable('');
 export const savedView: { cam: { x: number; y: number; zoom: number } | null } = { cam: null };
 
 const MAX_REMOVE = 2000;
+/**
+ * Erasures one participant may hand us through `sync` for strokes we don't have, per call. Plenty
+ * for any real board (a newcomer learns what was erased before they arrived), but it can't push
+ * out the deletions everyone else made (strokes.ts remembers 20,000) so erased strokes come back.
+ */
+const MAX_SYNC_TOMBSTONES_PER_PEER = 2000;
+const syncTombstones = new Map<string, number>();
 /** A peer may ask for the whole board at most this often (each answer can be large). */
 const SYNC_REQ_INTERVAL_MS = 5000;
 const lastSyncReq = new Map<string, number>();
@@ -172,7 +180,16 @@ registerDataHandler('wb', (fromPeerId, msg) => {
       let dirty = false;
       if (removed.length && budget > 0) {
         const n = Math.min(removed.length, budget * 10);
-        removeStrokes(board, removed.slice(0, n).filter((id: unknown): id is string => typeof id === 'string'));
+        let used = syncTombstones.get(fromPeerId) ?? 0;
+        const ids = removed.slice(0, n).filter((id: unknown): id is string => {
+          if (typeof id !== 'string' || id.length > MAX_ID_LENGTH) return false;
+          if (board.strokes.has(id) || board.removed.has(id)) return true; // nothing new to remember
+          if (used >= MAX_SYNC_TOMBSTONES_PER_PEER) return false;
+          used++;
+          return true;
+        });
+        syncTombstones.set(fromPeerId, used);
+        removeStrokes(board, ids);
         budget -= Math.ceil(n / 10);
         dirty = true;
       }
@@ -217,6 +234,7 @@ onRoomLeft(() => {
   lastSyncReq.clear();
   updateBuckets.clear();
   syncBuckets.clear();
+  syncTombstones.clear();
   savedView.cam = null;
   whiteboardOpen.set(false);
   whiteboardNotice.set(null);

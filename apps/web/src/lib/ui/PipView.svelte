@@ -9,6 +9,7 @@
    * here is muted: the call's sound keeps playing from the main window.
    */
   import { peers, speakingPeers, peerMediaState, sharingPeers } from '$lib/webrtc/mesh';
+  import { cameraView } from '$lib/webrtc/view-size';
   import { verification } from '$lib/webrtc/e2e';
   import { localStream, audioEnabled, videoEnabled, voiceOnlyMode } from '$lib/media/manager';
   import Icon from './Icon.svelte';
@@ -68,7 +69,7 @@
 <div class="pip">
   <ul class="people" class:many={people.length >= 2} aria-label="Participants">
     {#each people as p (p.id)}
-      <li class="person" class:speaking={p.speaking}>
+      <li class="person" class:speaking={p.speaking} use:cameraView={{ peerId: p.id, fit: 'cover', enabled: !p.contain }}>
         {#if p.showVideo}
           <!-- svelte-ignore a11y-media-has-caption -->
           <video use:playStream={p.stream} autoplay muted playsinline class:contain={p.contain}></video>

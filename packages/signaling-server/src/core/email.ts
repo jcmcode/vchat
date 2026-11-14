@@ -24,13 +24,23 @@ export function isValidSender(value: string): boolean {
   return normalizeEmail(m ? m[2] : v) !== null;
 }
 
-/** A uniformly random 6-digit code (rejection sampling, no modulo bias). */
-export function randomCode(): string {
-  const limit = Math.floor(0x1_0000_0000 / 1_000_000) * 1_000_000;
+/**
+ * Owner sign-in codes. A sign-in challenge isn't secret (anyone can ask for one for the owner's
+ * address), so the code is the only secret: 8 digits keeps guessing hopeless even at the
+ * throttles' ceiling, for as long as an attacker cares to try.
+ */
+export const LOGIN_CODE_DIGITS = 8;
+/** Guest passcodes: they only work together with a personal (secret) invite link. */
+export const PASSCODE_DIGITS = 6;
+
+/** A uniformly random code of `digits` digits (rejection sampling, no modulo bias). */
+export function randomCode(digits = PASSCODE_DIGITS): string {
+  const range = 10 ** digits;
+  const limit = Math.floor(0x1_0000_0000 / range) * range;
   const buf = new Uint32Array(1);
   for (;;) {
     crypto.getRandomValues(buf);
-    if (buf[0] < limit) return String(buf[0] % 1_000_000).padStart(6, '0');
+    if (buf[0] < limit) return String(buf[0] % range).padStart(digits, '0');
   }
 }
 
@@ -52,8 +62,8 @@ export function cleanInviteMessage(value: unknown): string {
   return sliceCodePoints(joined, MAX_INVITE_MESSAGE).trim();
 }
 
-export function isCode(value: unknown): value is string {
-  return typeof value === 'string' && /^\d{6}$/.test(value);
+export function isCode(value: unknown, digits = PASSCODE_DIGITS): value is string {
+  return typeof value === 'string' && value.length === digits && /^\d+$/.test(value);
 }
 
 function escapeHtml(value: string): string {

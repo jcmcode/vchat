@@ -18,8 +18,9 @@ const config = {
 				'style-src': ['self', 'unsafe-inline'],
 				'img-src': ['self', 'blob:', 'data:'],
 				'media-src': ['self', 'blob:'],
-				// ws:/wss: so a custom signaling server can be set in Settings.
-				'connect-src': ['self', 'ws:', 'wss:'],
+				// Signaling and the API are always same-origin ('self' covers ws:/wss: to this host), so
+				// injected code couldn't send a room key or invite token to anywhere else.
+				'connect-src': ['self'],
 				// The web app manifest (static/manifest.webmanifest) for installing the app.
 				'manifest-src': ['self'],
 				'object-src': ['none'],

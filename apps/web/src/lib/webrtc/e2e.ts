@@ -19,7 +19,10 @@
 //      answer keeps it closed until the user explicitly chooses "Allow anyway".
 // Someone in the middle shows each side different fingerprints and lacks the key, so it can't
 // produce proofs that match what each side sees. A 12-digit safety code per connection also lets
-// people confirm out loud that nobody (not even another key holder) is in the middle.
+// people confirm out loud that nobody (not even another key holder) is in the middle. Its inputs
+// include a nonce from each side, committed to in the proof message (`commit`) and revealed in a
+// separate `e2e-reveal` only once the other side's commitment has arrived, so a key holder in the
+// middle can't steer the two codes into agreeing (see e2e-proof.ts).
 
 import { get, writable } from 'svelte/store';
 import {
@@ -46,6 +49,7 @@ import {
   importRoomKey,
   isValidRoomKey,
   safetyCode,
+  SafetyCodeExchange,
   sdpFingerprint,
   type RoomKeys,
 } from './e2e-proof.js';
@@ -66,6 +70,11 @@ export interface PeerVerification {
   reason?: string;
   /** Safety code for this connection (same on both sides if nobody is in the middle). */
   code?: string;
+  /**
+   * Why there's no safety code for a verified connection: 'outdated' = they're on an older version
+   * of the app, which doesn't take part in the safety-code exchange (they need to reload).
+   */
+  codeNote?: 'outdated';
 }
 
 export const verification = writable<Map<string, PeerVerification>>(new Map());
@@ -148,11 +157,55 @@ async function connectionIdentity(peerId: string): Promise<{ local: string; remo
   return { local, remote };
 }
 
+// ── Safety-code exchange ─────────────────────────────────────────────────────
+
+/** The commit-then-reveal exchange for each peer's current connection session. */
+const exchanges = new Map<string, { sid: string; ex: SafetyCodeExchange; codeDone: boolean }>();
+
+function exchangeFor(peerId: string, sid: string) {
+  let rec = exchanges.get(peerId);
+  if (!rec || rec.sid !== sid) {
+    rec = { sid, ex: new SafetyCodeExchange(), codeDone: false };
+    exchanges.set(peerId, rec);
+  }
+  return rec;
+}
+
+/** Send our nonce if (and only if) both commitments are out; then try to finish the code. */
+function maybeReveal(peerId: string, sid: string): void {
+  const rec = exchanges.get(peerId);
+  if (!rec || rec.sid !== sid) return;
+  const nonce = rec.ex.reveal();
+  if (nonce) sendVerification(peerId, sid, { type: 'e2e-reveal', nonce });
+  void maybeFinishCode(peerId, sid);
+}
+
+/** Both nonces known: work out the code (once) for this session and show it. */
+async function maybeFinishCode(peerId: string, sid: string): Promise<void> {
+  const rec = exchanges.get(peerId);
+  if (!keys || !rec || rec.sid !== sid || rec.codeDone || !rec.ex.complete) return;
+  rec.codeDone = true;
+  const ids = await connectionIdentity(peerId);
+  if (!ids || currentSid(peerId) !== sid || exchanges.get(peerId) !== rec) return;
+  const code = await safetyCode(keys, keyRoomId, sid, { fp: ids.local, nonce: rec.ex.nonce }, { fp: ids.remote, nonce: rec.ex.theirNonce! });
+  const cur = entry(peerId);
+  if (currentSid(peerId) !== sid || cur?.sid !== sid) return;
+  setEntry(peerId, { ...cur, code });
+}
+
 // ── Protocol ───────────────────────────────────────────────────────────────────
+
+/**
+ * Peers who proved the room key at some point in this call. Their tab keeps the key for as long as
+ * it keeps their peer id, so a later connection from the same id claiming to have no key isn't
+ * them: it's someone in the middle trying to get "Allow anyway" clicked.
+ */
+const verifiedThisCall = new Set<string>();
 
 onPeerCreated((peerId, sid) => {
   const prev = deadlines.get(peerId);
   if (prev) clearTimeout(prev);
+  exchanges.delete(peerId); // a new connection starts a new exchange
   setEntry(peerId, { sid, state: 'pending' });
   deadlines.set(
     peerId,
@@ -169,7 +222,8 @@ onPeerCreated((peerId, sid) => {
 
 onPeerChannelOpen(async (peerId, sid) => {
   const cur = entry(peerId);
-  setEntry(peerId, { ...cur, sid, state: cur?.sid === sid ? cur.state : 'pending' });
+  if (cur?.sid === sid) setEntry(peerId, { ...cur, sid });
+  else setEntry(peerId, { sid, state: 'pending' });
 
   if (!keys) {
     // We can't verify anyone without the key: let it through, clearly marked.
@@ -197,21 +251,38 @@ onPeerChannelOpen(async (peerId, sid) => {
     toFp: ids.remote,
     fromName: name,
   });
-  const code = await safetyCode(keys, keyRoomId, ids.local, ids.remote);
-  if (currentSid(peerId) !== sid) return;
-  sendVerification(peerId, sid, { type: 'e2e-auth', mac, name });
-  setEntry(peerId, { ...entry(peerId), sid, state: entry(peerId)?.state ?? 'pending', code });
-  // Their proof may have arrived first.
+  const rec = exchangeFor(peerId, sid);
+  const commit = await rec.ex.commit;
+  if (currentSid(peerId) !== sid || exchanges.get(peerId) !== rec) return;
+  sendVerification(peerId, sid, { type: 'e2e-auth', mac, name, commit });
+  rec.ex.committed();
+  // Their proof (and commitment) may have arrived first.
+  maybeReveal(peerId, sid);
   if (entry(peerId)?.state === 'verified') trustPeer(peerId, sid);
 });
 
 registerDataHandler('e2e-auth', async (fromPeerId, msg) => {
   const sid = currentSid(fromPeerId);
   if (!sid || !keys) return; // without a key we already allowed the connection
+  const hasProof = msg.mac !== null && msg.mac !== undefined;
+  if (hasProof && msg.commit !== undefined) {
+    // Recorded before anything is awaited, so their reveal (right behind it on the ordered channel)
+    // finds it. Only the first commitment for a session counts; a different one is tampering.
+    const rec = exchangeFor(fromPeerId, sid);
+    if (rec.ex.receiveCommit(msg.commit) === 'conflict') {
+      fail(fromPeerId, sid, 'it changed its safety-code commitment');
+      return;
+    }
+    maybeReveal(fromPeerId, sid);
+  }
   const cur = entry(fromPeerId);
   if (cur?.sid === sid && (cur.state === 'verified' || cur.state === 'failed')) return; // final
 
   if (msg.mac === null || msg.mac === undefined) {
+    if (verifiedThisCall.has(fromPeerId)) {
+      fail(fromPeerId, sid, 'it proved the room key earlier in this call and now says it has none');
+      return;
+    }
     // They have no room key. Could be someone who typed the room code — or someone in the middle.
     setState(fromPeerId, sid, 'unverified', { reason: "they don't have this room's secret key" });
     return;
@@ -239,8 +310,30 @@ registerDataHandler('e2e-auth', async (fromPeerId, msg) => {
     return;
   }
   setState(fromPeerId, sid, 'verified');
+  verifiedThisCall.add(fromPeerId);
+  // An older version of the app sends no commitment and so can't share a safety code with us. (We
+  // never fall back to the old, fingerprint-only code: someone in the middle could strip the
+  // commitments to force it.)
+  if (!exchanges.get(fromPeerId)?.ex.hasTheirCommit) {
+    const now = entry(fromPeerId);
+    if (now?.sid === sid) setEntry(fromPeerId, { ...now, codeNote: 'outdated' });
+  }
   setVerifiedName(fromPeerId, sid, name);
   trustPeer(fromPeerId, sid); // no-op until our side of the channel is open; retried there
+});
+
+registerDataHandler('e2e-reveal', async (fromPeerId, msg) => {
+  const sid = currentSid(fromPeerId);
+  if (!sid || !keys) return;
+  const rec = exchanges.get(fromPeerId);
+  // A nonce must follow a commitment on the same (ordered) channel.
+  const result = rec && rec.sid === sid ? await rec.ex.receiveReveal(msg.nonce) : 'early';
+  if (currentSid(fromPeerId) !== sid) return;
+  if (result === 'bad' || result === 'early') {
+    fail(fromPeerId, sid, "its safety-code exchange didn't add up");
+    return;
+  }
+  if (result === 'ok') void maybeFinishCode(fromPeerId, sid);
 });
 
 function fail(peerId: string, sid: string | null, reason: string): void {
@@ -262,6 +355,7 @@ export function allowUnverified(peerId: string): void {
 }
 
 onPeerLeft((peerId) => {
+  exchanges.delete(peerId);
   const t = deadlines.get(peerId);
   if (t) clearTimeout(t);
   deadlines.delete(peerId);
@@ -276,6 +370,8 @@ onPeerLeft((peerId) => {
 onRoomLeft(() => {
   for (const t of deadlines.values()) clearTimeout(t);
   deadlines.clear();
+  exchanges.clear();
+  verifiedThisCall.clear();
   verification.set(new Map());
   blockedConnections.set([]);
   keys = null;

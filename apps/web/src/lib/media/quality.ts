@@ -112,6 +112,75 @@ export function encodingFor(target: VideoTarget, source?: SourceSize): EncodingS
   };
 }
 
+// ── Per-viewer camera size ─────────────────────────────────────────────────────
+//
+// Each connection has its own encoder, so each copy of the camera can be just as big as the person
+// receiving it actually shows it: a thumbnail in the strip (during a screen share, with the board
+// open) doesn't need 720p, and a viewer whose tab is hidden doesn't need video at all. Viewers tell
+// us how they show our camera (`view` messages, view-size.ts); a viewer can only ever lower what
+// it receives, never raise it above its share of the upload budget.
+
+/** How a viewer shows our camera, as it told us (sizes in device pixels). */
+export type RemoteView =
+  | { kind: 'box'; w: number; h: number; fit: 'cover' | 'contain' }
+  /** Not on screen at all (their tab is hidden, or no tile of ours is showing). */
+  | { kind: 'none' }
+  /** Shown somewhere they can't measure (a system picture-in-picture window): no limit. */
+  | { kind: 'full' };
+
+const MAX_VIEW_SIDE = 16_384;
+
+/** Validate a `view` message: `{full: true}`, `{w: 0, h: 0}` (not shown) or `{w, h, fit}`. */
+export function parseView(msg: unknown): RemoteView | null {
+  if (!msg || typeof msg !== 'object') return null;
+  const m = msg as Record<string, unknown>;
+  if (m.full === true) return { kind: 'full' };
+  const side = (v: unknown): v is number => typeof v === 'number' && Number.isInteger(v) && v >= 0 && v <= MAX_VIEW_SIDE;
+  if (!side(m.w) || !side(m.h)) return null;
+  if (m.w === 0 || m.h === 0) return { kind: 'none' };
+  if (m.fit !== 'cover' && m.fit !== 'contain') return null;
+  return { kind: 'box', w: m.w, h: m.h, fit: m.fit };
+}
+
+/** Sizes a viewer-sized camera snaps up to, so small resizes don't keep reconfiguring the encoder. */
+export const VIEW_LINE_STEPS = [180, 240, 360, 480, 540, 720, 1080];
+/** For a viewer that shows nothing: a trickle that costs next to nothing and resumes at once. */
+export const HIDDEN_VIEW = { maxBitrate: 60_000, maxFramerate: 5, maxLines: 180 };
+
+/**
+ * Lines (the source's shorter side) needed to fill a viewer's box without upscaling: `cover` fills
+ * the box (cropping), `contain` fits inside it. An unknown source size counts as 1280x720.
+ */
+export function linesForView(view: { w: number; h: number; fit: 'cover' | 'contain' }, source?: SourceSize): number {
+  const okSide = (v: number | undefined): v is number => typeof v === 'number' && Number.isFinite(v) && v > 0;
+  const srcW = okSide(source?.width) && okSide(source?.height) ? source.width : 1280;
+  const srcH = okSide(source?.width) && okSide(source?.height) ? source.height : 720;
+  const k = view.fit === 'cover' ? Math.max(view.w / srcW, view.h / srcH) : Math.min(view.w / srcW, view.h / srcH);
+  return Math.ceil(k * Math.min(srcW, srcH) - 1e-6); // (no rounding noise pushing 464.0000001 to 465)
+}
+
+/**
+ * The camera target for one viewer: `base` (this peer's share of the upload budget), lowered to
+ * what that viewer shows. Never more than `base` in any respect. The bitrate follows the size
+ * (pixels^0.75: small pictures still need some bits per pixel to look clean).
+ */
+export function cameraForViewer(base: VideoTarget, view: RemoteView | undefined, source?: SourceSize): VideoTarget {
+  if (!view || view.kind === 'full') return base;
+  if (view.kind === 'none') {
+    return {
+      ...base,
+      maxBitrate: Math.min(base.maxBitrate, HIDDEN_VIEW.maxBitrate),
+      maxFramerate: Math.min(base.maxFramerate, HIDDEN_VIEW.maxFramerate),
+      maxLines: Math.min(base.maxLines, HIDDEN_VIEW.maxLines),
+    };
+  }
+  const needed = linesForView(view, source);
+  const step = VIEW_LINE_STEPS.find((l) => l >= needed) ?? Infinity;
+  if (step >= base.maxLines) return base;
+  const maxBitrate = Math.round(Math.max(Math.min(CAMERA_MIN_BPS, base.maxBitrate), base.maxBitrate * (step / base.maxLines) ** 1.5));
+  return { ...base, maxLines: step, maxBitrate };
+}
+
 // ── Applying it ────────────────────────────────────────────────────────────────
 
 type Encoding = Partial<EncodingSettings> & Record<string, unknown>;

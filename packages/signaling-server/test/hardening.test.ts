@@ -610,6 +610,8 @@ async function requestCode(env: ServerEnv, email: string, ip: string) {
 }
 
 const codeIn = (text: string) => text.match(/\b(\d{6})\b/)![1];
+/** Owner sign-in codes are 8 digits. */
+const loginCodeIn = (text: string) => text.match(/\b(\d{8})\b/)![1];
 
 test('email config: fail-closed cases, precedence, public config', async () => {
   const err = (e: ServerEnv) => resolveConfig(e).error;
@@ -654,11 +656,13 @@ test('email sign-in: code emailed to the owner, verifies once, wrong code refuse
     assert.match(call.body.text, /expires in 10 minutes/);
     assert.match(call.body.text, /If you didn't ask for this, ignore this email\./);
     assert.ok(!/<img/i.test(call.body.html));
-    const code = codeIn(call.body.text);
+    const code = loginCodeIn(call.body.text);
     assert.ok(call.body.html.includes(code));
 
     const verify = (c: string, ch = challenge) => handleApi(post('/api/admin/login/verify', { challenge: ch, code: c }), emailEnv, { clientIp: '20.0.0.2' });
-    const wrong = await verify(code === '000000' ? '111111' : '000000');
+    const wrong = await verify(code === '00000000' ? '11111111' : '00000000');
+    // A 6-digit (guest passcode) shape is never a sign-in code.
+    assert.equal((await verify(code.slice(0, 6)))!.status, 401);
     assert.equal(wrong!.status, 401);
     assert.deepEqual(await wrong!.json(), { error: 'Wrong or expired code' });
 
@@ -682,8 +686,8 @@ test('email sign-in: at most 5 tries per challenge', async () => {
   const resend = stubResend();
   try {
     const { challenge } = (await (await requestCode(emailEnv, 'owner@example.com', '21.0.0.1')).json()) as { challenge: string };
-    const code = codeIn(resend.calls[0].body.text);
-    const bad = code === '123456' ? '654321' : '123456';
+    const code = loginCodeIn(resend.calls[0].body.text);
+    const bad = code === '12345678' ? '87654321' : '12345678';
     for (let i = 0; i < 5; i++) {
       assert.equal((await handleApi(post('/api/admin/login/verify', { challenge, code: bad }), emailEnv, { clientIp: `21.0.1.${i}` }))!.status, 401);
     }
@@ -703,7 +707,7 @@ test('email sign-in: other addresses get the same answer and nothing is sent', a
     assert.equal(resend.calls.length, 0);
     const p = await verifyToken(SECRET, body.challenge);
     assert.ok(p.ok && p.payload.role === 'login' && typeof p.payload.c === 'string' && p.payload.c.length === 43);
-    assert.equal((await handleApi(post('/api/admin/login/verify', { challenge: body.challenge, code: '000000' }), emailEnv, { clientIp: '22.0.0.2' }))!.status, 401);
+    assert.equal((await handleApi(post('/api/admin/login/verify', { challenge: body.challenge, code: '00000000' }), emailEnv, { clientIp: '22.0.0.2' }))!.status, 401);
     // 404 unless email sign-in is the method; same-origin required
     assert.equal((await handleApi(post('/api/admin/login/code', { email: 'x@y.co' }), env, { clientIp: '22.0.0.3' }))!.status, 404);
   } finally {
@@ -836,15 +840,24 @@ test('emailed invite: per-guest code, `to` reaches the host, nothing secret in t
   assert.equal(noMail!.status, 503);
 });
 
-test('sign-in codes are 6 uniform digits', async () => {
-  const { randomCode } = await import('../src/core/index.js');
-  const counts = new Array(10).fill(0);
-  for (let i = 0; i < 5000; i++) {
-    const c = randomCode();
-    assert.match(c, /^\d{6}$/);
-    counts[Number(c[0])]++;
+test('codes are uniform digits: 6 for guest passcodes, 8 for owner sign-in', async () => {
+  const { randomCode, isCode, LOGIN_CODE_DIGITS } = await import('../src/core/index.js');
+  assert.equal(LOGIN_CODE_DIGITS, 8);
+  for (const digits of [6, 8]) {
+    const first = new Array(10).fill(0);
+    const last = new Array(10).fill(0);
+    for (let i = 0; i < 5000; i++) {
+      const c = digits === 6 ? randomCode() : randomCode(digits);
+      assert.match(c, new RegExp(`^\\d{${digits}}$`));
+      assert.ok(isCode(c, digits));
+      first[Number(c[0])]++;
+      last[Number(c[digits - 1])]++;
+    }
+    assert.ok(first.every((n) => n > 350 && n < 650), first.join());
+    assert.ok(last.every((n) => n > 350 && n < 650), last.join());
   }
-  assert.ok(counts.every((n) => n > 350 && n < 650), counts.join());
+  assert.ok(isCode('123456') && !isCode('12345678') && isCode('12345678', 8) && !isCode('123456', 8));
+  assert.ok(!isCode('12 456') && !isCode('１２３４５６') && !isCode(123456));
 });
 
 // ── Emailed invites: several recipients, no passcode, calendar file ───────────

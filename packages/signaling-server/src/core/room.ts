@@ -512,9 +512,13 @@ export class Room<C> {
     if (entry) {
       const [conn, state] = entry;
       this.send(conn, { type: 'removed', roomId: this.id, reason: 'Removed by host' });
-      this.leave(conn);
+      this.leave(conn, 'removed');
       this.transport.close(conn, CLOSE_REMOVED, 'Removed by host');
       this.log(`Host removed ${state.displayName} (${peerId})`);
+    } else {
+      // Offline right now (their socket dropped): peers may still hold a working direct connection
+      // to them, kept in case they come back. Tell everyone to cut it now.
+      this.broadcast({ type: 'peer-left', peerId, reason: 'removed' });
     }
     this.metaChanged();
   }
@@ -574,8 +578,12 @@ export class Room<C> {
     this.send(target[0], { type: 'signal', fromPeerId: from.peerId, signal });
   }
 
-  /** Remove a connection (explicit leave, socket close, or error). Safe to call repeatedly. */
-  leave(conn: C): void {
+  /**
+   * Remove a connection (explicit leave, socket close, or error). Safe to call repeatedly.
+   * `reason: 'removed'` (the host removed them) tells peers to drop their direct connection at once
+   * rather than keep it briefly in case this was only a signaling blip.
+   */
+  leave(conn: C, reason?: 'removed'): void {
     const state = this.members.get(conn);
     if (!state) return;
     this.deleteMember(conn);
@@ -587,7 +595,7 @@ export class Room<C> {
       return;
     }
 
-    this.broadcast({ type: 'peer-left', peerId: state.peerId, displayName: state.displayName });
+    this.broadcast({ type: 'peer-left', peerId: state.peerId, displayName: state.displayName, ...(reason ? { reason } : {}) });
     this.log(`${state.displayName} (${state.peerId}) left`);
 
     const remaining = this.peers();

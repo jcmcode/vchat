@@ -39,6 +39,7 @@
     resumeConnection,
     clearRoomError,
     isTransientRoomError,
+    useNewMicTrack,
     type PeerConnection,
   } from '$lib/webrtc/mesh';
   import { startWaitingAlerts } from '$lib/ui/attention';
@@ -92,6 +93,8 @@
   } from '$lib/stores/room';
   import { whiteboardOpen, whiteboardNotice, openWhiteboard, closeWhiteboard } from '$lib/collab/whiteboard';
   import { clearScreen, annotationTool } from '$lib/collab/annotations';
+  import { gamesOpen, gameNotice, openGames, closeGames } from '$lib/games/games';
+  import { GAME_NAMES } from '$lib/games/session-model';
   import { roomName, initRoomName, renameRoom, MAX_ROOM_NAME } from '$lib/collab/room-meta';
   import Icon from '$lib/ui/Icon.svelte';
   import VideoTile from './VideoTile.svelte';
@@ -100,12 +103,16 @@
   import ConnectionDetails from './ConnectionDetails.svelte';
   import ConnectionHint from './ConnectionHint.svelte';
   import ChatPanel from './ChatPanel.svelte';
+  import { fileTransfers } from '$lib/webrtc/file-transfer';
+  import { markAllSeen, unreadByThread, unseenFileCount, seenMessageIds, seenFileKeys } from '$lib/chat/threads';
   import WaitingScreen from './WaitingScreen.svelte';
   import AdmissionPanel from './AdmissionPanel.svelte';
   import DeviceSettings from './DeviceSettings.svelte';
   import ReactionOverlay from './ReactionOverlay.svelte';
   import ReactionPicker from './ReactionPicker.svelte';
   import Whiteboard from './Whiteboard.svelte';
+  import GamesPanel from './games/GamesPanel.svelte';
+  import GameInvites from './games/GameInvites.svelte';
   import AnnotationLayer from './AnnotationLayer.svelte';
   import PreJoin from './PreJoin.svelte';
   import type { PreJoinResult } from '$lib/media/preview';
@@ -119,6 +126,8 @@
   import HandToasts from './HandToasts.svelte';
   import KeyboardShortcuts, { endHoldToTalk } from './KeyboardShortcuts.svelte';
   import ShortcutsHelp from './ShortcutsHelp.svelte';
+  // Tells each person how big we show their camera, so they send no bigger (view-size.ts).
+  import '$lib/webrtc/view-report';
 
   type JoinMode = 'video' | 'audio' | 'chat';
 
@@ -137,8 +146,6 @@
   let wasScreenSharing = false;
   let mediaError = '';
   let wasConnected = false;
-  let unreadCount = 0;
-  let lastSeenMessageCount = 0;
   let passwordAttempt = '';
   /** Chat-only: joined without camera or microphone. */
   let chatOnly = false;
@@ -209,6 +216,38 @@
     }
   }
 
+  function describeMediaError(err: unknown): string {
+    if (!(err instanceof DOMException)) return 'Could not access camera or microphone.';
+    if (err.name === 'NotAllowedError') {
+      return 'Camera/microphone access was denied. You can still chat. To talk, allow access in your browser and try again.';
+    }
+    if (err.name === 'NotFoundError') return 'No camera or microphone found on this device. You can still chat.';
+    return `Media error: ${err.message}`;
+  }
+
+  /** Joined without devices (blocked, unplugged, busy): try again without leaving the call. */
+  let retryingMedia = false;
+  async function retryMedia() {
+    if (retryingMedia) return;
+    retryingMedia = true;
+    try {
+      const stream = await startMedia({ voiceOnly: prejoinMode === 'audio' });
+      // Left, removed or the call ended while the browser was asking: release the devices again.
+      if (destroyed || !inCall || ($roomError && !isTransientRoomError($roomError))) {
+        stopMedia();
+        return;
+      }
+      syncCameraFacing();
+      const mic = stream.getAudioTracks()[0];
+      if (mic) useNewMicTrack(mic); // sends it to everyone and starts the speaking ring
+      mediaError = '';
+    } catch (err) {
+      mediaError = describeMediaError(err);
+    } finally {
+      retryingMedia = false;
+    }
+  }
+
   /** Step 1: check the passcode with the server before going on (joining sends it again). */
   async function handleSubmitPasscode() {
     // Codes are digits only (people often paste them with a space in the middle).
@@ -273,6 +312,7 @@
   // selectStage picks the latest such presenter with pickPresenter, and your pin outranks it.
   $: layout = selectStage({
     whiteboardOpen: $whiteboardOpen,
+    gamesOpen: $gamesOpen,
     localSharing: $isScreenSharing,
     sharingPeers: $sharingPeers,
     hasScreen: (id) => !!$peers.get(id)?.screenStream,
@@ -287,7 +327,9 @@
   $: stripPeers = stage === 'pinned' && stagePeer ? peerList.filter((p) => p.id !== stagePeer?.id) : peerList;
   // Any other screen being shared goes in the strip, so no share is ever hidden.
   $: stripScreens = peerList.filter((p) => p.screenStream && $sharingPeers.has(p.id) && p.id !== stagePeer?.id);
-  $: gridCols = getGridCols(peerList.length + 1);
+  // Nobody else here yet: the empty half of the grid says so and offers the invite link.
+  $: alone = peerList.length === 0 && $roomJoined && !$roomError;
+  $: gridCols = getGridCols(peerList.length + 1 + (alone ? 1 : 0));
 
   function getGridCols(count: number): number {
     if (count <= 1) return 1;
@@ -339,6 +381,7 @@
   // ── Tap a person: private message / send a file ──
   let selectedPeerId: string | null = null;
   let chatRecipient = '';
+  let chatTab: 'chat' | 'files' = 'chat';
   let personFileInput: HTMLInputElement;
   let personNotice = '';
   /** Two-step "Remove from call" (host only), so it can't happen by accident. */
@@ -359,6 +402,7 @@
 
   function messagePerson(peerId: string) {
     chatRecipient = peerId;
+    chatTab = 'chat';
     showChat = true;
     selectedPeerId = null;
   }
@@ -374,7 +418,8 @@
     else {
       personNotice = '';
       chatRecipient = selectedPeer.id;
-      showChat = true; // the transfer shows up in chat
+      chatTab = 'files'; // the transfer shows up in Files
+      showChat = true;
       selectedPeerId = null;
     }
   }
@@ -520,17 +565,7 @@
         mediaReady = true;
       } catch (err) {
         console.error('Failed to get media:', err);
-        if (err instanceof DOMException) {
-          if (err.name === 'NotAllowedError') {
-            mediaError = 'Camera/microphone access was denied. You can still chat — check your browser permissions to talk.';
-          } else if (err.name === 'NotFoundError') {
-            mediaError = 'No camera or microphone found on this device. You can still chat.';
-          } else {
-            mediaError = `Media error: ${err.message}`;
-          }
-        } else {
-          mediaError = 'Could not access camera or microphone.';
-        }
+        mediaError = describeMediaError(err);
         mediaReady = true;
       }
     }
@@ -554,7 +589,7 @@
       relayOnly: hideIp,
     });
     // Anything already in the chat at this point isn't "unread".
-    lastSeenMessageCount = $chatMessages.length;
+    markAllSeen($chatMessages, Array.from($fileTransfers.values()));
     if (chatOnly) showChat = true;
   });
 
@@ -649,16 +684,118 @@
     }
   }
 
-  function toggleWhiteboard() {
-    if ($whiteboardOpen) closeWhiteboard();
-    else openWhiteboard();
+  // The shared screen's sound: a small button on your stage shows whether it's going out and
+  // turns it off or on. Sound only comes along when the browser's picker offered it and it was
+  // switched on there; without it the button is greyed out and says how to get it.
+  let shareSoundOn = true;
+  $: shareHasSound = !!$screenStream?.getAudioTracks().length;
+  $: if (!$isScreenSharing) shareSoundOn = true; // each share starts with its sound on
+
+  function toggleShareSound() {
+    shareSoundOn = !shareSoundOn;
+    // A disabled track sends silence into the mix; the microphone is unaffected.
+    $screenStream?.getAudioTracks().forEach((t) => (t.enabled = shareSoundOn));
   }
 
-  function copyLink() {
+  // ── Full screen for a shared screen or a pinned person ──
+  let stageEl: HTMLElement | null = null;
+  let stageFullscreen = false;
+  const canFullscreen =
+    browser && (document.fullscreenEnabled || 'webkitEnterFullscreen' in HTMLVideoElement.prototype);
+
+  function onFullscreenChange() {
+    stageFullscreen = !!stageEl && document.fullscreenElement === stageEl;
+  }
+
+  async function toggleStageFullscreen() {
+    if (document.fullscreenElement) {
+      await document.exitFullscreen().catch(() => {});
+      return;
+    }
+    if (!stageEl) return;
+    if (document.fullscreenEnabled) {
+      try {
+        await stageEl.requestFullscreen();
+        return;
+      } catch {
+        // refused: try the video's own full screen below
+      }
+    }
+    // iPhones can't put an element full screen, only a video (with the system's player).
+    const video = stageEl.querySelector('video') as (HTMLVideoElement & { webkitEnterFullscreen?: () => void }) | null;
+    try {
+      video?.webkitEnterFullscreen?.();
+    } catch {
+      // not available
+    }
+  }
+
+  // Leave full screen when what was shown goes away, or when a dialog opens behind it.
+  $: if (stageFullscreen && ((stage !== 'remote-screen' && stage !== 'pinned') || selectedPeerId || $roomError)) {
+    document.exitFullscreen().catch(() => {});
+  }
+
+  // The whiteboard and the games view share the stage: opening one puts the other away.
+  function toggleWhiteboard() {
+    if ($whiteboardOpen) closeWhiteboard();
+    else showWhiteboard();
+  }
+
+  function showWhiteboard() {
+    closeGames();
+    openWhiteboard();
+  }
+
+  function toggleGames() {
+    if ($gamesOpen) closeGames();
+    else showGames();
+  }
+
+  function showGames() {
+    closeWhiteboard();
+    openGames();
+  }
+
+  let copyFailed = false;
+  let copyTimer: ReturnType<typeof setTimeout> | null = null;
+
+  /** Copy the invite link, and only say "Copied!" if it really was. */
+  async function copyLink() {
     if (!shareUrl) return;
-    navigator.clipboard.writeText(shareUrl).catch(() => {});
-    copied = true;
-    setTimeout(() => { copied = false; }, 2000);
+    let ok = false;
+    try {
+      await navigator.clipboard.writeText(shareUrl);
+      ok = true;
+    } catch {
+      // Clipboard API blocked (permissions, older browsers): the old selection-based copy.
+      const ta = document.createElement('textarea');
+      ta.value = shareUrl;
+      ta.setAttribute('readonly', '');
+      ta.style.cssText = 'position:fixed;top:0;left:0;opacity:0';
+      document.body.appendChild(ta);
+      ta.select();
+      try {
+        ok = document.execCommand('copy');
+      } catch {
+        ok = false;
+      }
+      ta.remove();
+    }
+    copied = ok;
+    copyFailed = !ok;
+    if (copyTimer) clearTimeout(copyTimer);
+    copyTimer = setTimeout(() => {
+      copied = false;
+      copyFailed = false;
+    }, ok ? 2000 : 4000);
+  }
+  onDestroy(() => {
+    if (copyTimer) clearTimeout(copyTimer);
+  });
+
+  // A file dropped outside the chat would make the browser open it, replacing the call.
+  function blockStrayFileDrop(e: DragEvent) {
+    if (e.dataTransfer && Array.from(e.dataTransfer.types).includes('Files')) e.preventDefault();
   }
 
   function startRename() {
@@ -719,15 +856,10 @@
   $: localHasVideo = !chatOnly && !$voiceOnlyMode && $videoEnabled && !!$localStream?.getVideoTracks().length;
   $: canFlipCamera = touchDevice && localHasVideo && $videoDevices.length > 1;
 
-  // Track unread messages when chat is closed
-  $: {
-    if (showChat) {
-      lastSeenMessageCount = $chatMessages.length;
-      unreadCount = 0;
-    } else if ($chatMessages.length > lastSeenMessageCount) {
-      unreadCount = $chatMessages.length - lastSeenMessageCount;
-    }
-  }
+  // Unread on the chat button: new messages in any conversation, plus files you haven't looked at.
+  $: unreadCount =
+    Array.from(unreadByThread($chatMessages, $seenMessageIds).values()).reduce((a, b) => a + b, 0) +
+    unseenFileCount(Array.from($fileTransfers.values()), $seenFileKeys);
 
   $: {
     if ($connectionState === 'connected') wasConnected = true;
@@ -909,7 +1041,7 @@
 {#if showCall}
   <!-- svelte-ignore a11y-click-events-have-key-events -->
   <!-- svelte-ignore a11y-no-static-element-interactions -->
-  <div class="room" on:click={handleWindowClick}>
+  <div class="room" on:click={handleWindowClick} on:dragover={blockStrayFileDrop} on:drop={blockStrayFileDrop}>
     <header>
       <div class="room-info">
         <span
@@ -956,9 +1088,10 @@
           <span class="e2e-label">{e2eLabel}</span>
         </span>
         {#if shareUrl}
-          <button class="btn small copy-btn" class:copied on:click={copyLink} title="Copy a link others can use to join">
-            <Icon name={copied ? 'check' : 'link'} size={15} />
-            <span class="copy-label">{copied ? 'Copied!' : 'Copy invite link'}</span>
+          <button class="btn small copy-btn" class:copied class:failed={copyFailed} on:click={copyLink} title="Copy a link others can use to join">
+            <Icon name={copied ? 'check' : copyFailed ? 'x' : 'link'} size={15} />
+            <span class="copy-label">{copied ? 'Copied!' : copyFailed ? "Couldn't copy" : 'Copy invite link'}</span>
+            <span class="sr-only" aria-live="polite">{copied ? 'Invite link copied' : copyFailed ? "Couldn't copy the invite link" : ''}</span>
           </button>
         {/if}
         <div class="peer-count" title="Participants">
@@ -1007,7 +1140,13 @@
 
     {#if mediaError}
       <div class="banner danger" role="alert">
-        {mediaError}
+        <span>{mediaError}</span>
+        <button class="banner-btn" on:click={retryMedia} disabled={retryingMedia}>
+          {retryingMedia ? 'Trying…' : 'Try again'}
+        </button>
+        <button class="banner-dismiss" on:click={() => (mediaError = '')} aria-label="Dismiss">
+          <Icon name="x" size={14} />
+        </button>
       </div>
     {/if}
 
@@ -1024,8 +1163,21 @@
       <div class="banner info" role="status">
         <Icon name="whiteboard" size={16} />
         <span>{$whiteboardNotice.name} opened the whiteboard.</span>
-        <button class="banner-btn" on:click={openWhiteboard}>Open it</button>
+        <button class="banner-btn" on:click={showWhiteboard}>Open it</button>
         <button class="banner-dismiss" on:click={() => whiteboardNotice.set(null)} aria-label="Dismiss">
+          <Icon name="x" size={14} />
+        </button>
+      </div>
+    {/if}
+
+    {#if $gameNotice && !$gamesOpen}
+      <div class="banner info" role="status">
+        <Icon name="gamepad" size={16} />
+        <span>
+          {$gameNotice.name} started a game of {GAME_NAMES[$gameNotice.kind]}{$gameNotice.withYou ? ' with you' : ''}.
+        </span>
+        <button class="banner-btn" on:click={showGames}>{$gameNotice.withYou ? 'Play' : 'Watch'}</button>
+        <button class="banner-dismiss" on:click={() => gameNotice.set(null)} aria-label="Dismiss">
           <Icon name="x" size={14} />
         </button>
       </div>
@@ -1035,14 +1187,31 @@
       <div class="call-col">
         <main class="call-area" class:has-stage={!!stage}>
           {#if stage}
-            <section class="stage" aria-label={stage === 'whiteboard' ? 'Whiteboard' : stage === 'pinned' ? 'Pinned participant' : 'Shared screen'}>
+            <section class="stage" bind:this={stageEl} aria-label={stage === 'whiteboard' ? 'Whiteboard' : stage === 'games' ? 'Games' : stage === 'pinned' ? 'Pinned participant' : 'Shared screen'}>
               {#if stage === 'whiteboard'}
                 <Whiteboard on:close={closeWhiteboard} />
+              {:else if stage === 'games'}
+                <GamesPanel on:close={closeGames} />
               {:else if stage === 'local-screen'}
                 <div class="stage-screen">
                   <!-- svelte-ignore a11y-media-has-caption -->
                   <video bind:this={localScreenEl} autoplay muted playsinline></video>
                   <span class="tile-name"><span class="name-text">You are presenting</span></span>
+                  <button
+                    class="stage-btn sound-btn"
+                    class:off={!shareHasSound || !shareSoundOn}
+                    on:click={toggleShareSound}
+                    disabled={!shareHasSound}
+                    aria-pressed={shareHasSound && shareSoundOn}
+                    aria-label={!shareHasSound ? 'No sound is being shared' : shareSoundOn ? 'Stop sharing sound' : 'Share sound'}
+                    title={!shareHasSound
+                      ? 'No sound is being shared. To include it, share again, pick a browser tab (or your entire screen) and switch on the audio option in the picker.'
+                      : shareSoundOn
+                        ? 'Others hear the sound from what you share. Click to stop sharing sound.'
+                        : "Others can't hear the sound from what you share. Click to share it."}
+                  >
+                    <Icon name={shareHasSound && shareSoundOn ? 'volume' : 'volume-x'} size={14} />
+                  </button>
                   {#if $localPeerIdStore}
                     <AnnotationLayer videoEl={localScreenEl} screen={$localPeerIdStore} />
                   {/if}
@@ -1087,6 +1256,17 @@
                   <Icon name="more-horizontal" size={14} /> Options
                 </button>
               {/if}
+              {#if canFullscreen && (stage === 'remote-screen' || stage === 'pinned') && stagePeer}
+                <button
+                  class="stage-btn fullscreen-btn"
+                  on:click={toggleStageFullscreen}
+                  aria-pressed={stageFullscreen}
+                  title={stageFullscreen ? 'Exit full screen (Esc)' : 'Full screen'}
+                >
+                  <Icon name={stageFullscreen ? 'minimize' : 'maximize'} size={14} />
+                  {stageFullscreen ? 'Exit full screen' : 'Full screen'}
+                </button>
+              {/if}
             </section>
           {/if}
 
@@ -1129,6 +1309,26 @@
             {#each stripScreens as pc (pc.id)}
               <VideoTile peerConnection={pc} contain screen presenting verification={$verification.get(pc.id)?.state} />
             {/each}
+
+            {#if alone && !stage}
+              <div class="tile invite-tile fade-in">
+                <span class="invite-icon"><Icon name="users" size={22} /></span>
+                <h2>You're the only one here</h2>
+                {#if shareUrl}
+                  <p>Send the invite link to the people you want in this call.</p>
+                  <button class="btn primary" on:click={copyLink}>
+                    <Icon name={copied ? 'check' : 'link'} size={16} />
+                    {copied ? 'Copied!' : 'Copy invite link'}
+                  </button>
+                  {#if copyFailed}
+                    <p role="alert">Couldn't copy it. Select the link below and copy it yourself:</p>
+                    <span class="invite-link">{shareUrl}</span>
+                  {/if}
+                {:else}
+                  <p>Others will show up here as they join.</p>
+                {/if}
+              </div>
+            {/if}
           </div>
         </main>
 
@@ -1147,6 +1347,7 @@
         {/if}
 
         <HandToasts />
+        <GameInvites />
 
         {#if showReactionPicker}
           <ReactionPicker on:react={(e) => { sendReaction(e.detail); showReactionPicker = false; }} />
@@ -1203,6 +1404,17 @@
             >
               <Icon name="whiteboard" size={22} />
               <span class="ctrl-label">Board</span>
+            </button>
+
+            <button
+              class="ctrl-btn"
+              class:active={$gamesOpen}
+              aria-pressed={$gamesOpen}
+              on:click={toggleGames}
+              title={$gamesOpen ? 'Hide games' : 'Play a game: chess, pool or Connect 4'}
+            >
+              <Icon name="gamepad" size={22} />
+              <span class="ctrl-label">Games</span>
             </button>
 
             {#if pipMode}
@@ -1318,6 +1530,11 @@
                 <strong>{$verification.get(selectedPeer.id)?.code}</strong>
                 <p>Read all of it to {selectedPeer.displayName} (by voice, or another app). If you both see the same code, nobody is in the middle of your connection.</p>
               </div>
+            {:else if $verification.get(selectedPeer.id)?.codeNote === 'outdated'}
+              <div class="safety-code">
+                <span class="muted">Safety code</span>
+                <p>{selectedPeer.displayName} is on an older version of vchat, so you can't compare safety codes yet. Ask them to reload the page.</p>
+              </div>
             {/if}
             <ConnectionDetails peerId={selectedPeer.id} />
             {#if $verification.get(selectedPeer.id)?.state === 'unverified'}
@@ -1341,12 +1558,15 @@
         <ChatPanel
           messages={$chatMessages}
           bind:recipient={chatRecipient}
+          bind:tab={chatTab}
           on:close={() => { showChat = false; }}
         />
       {/if}
     </div>
   </div>
 {/if}
+
+<svelte:document on:fullscreenchange={onFullscreenChange} />
 
 <KeyboardShortcuts
   enabled={shortcutsEnabled}
@@ -1620,6 +1840,69 @@
     background: var(--success-soft);
   }
 
+  .copy-btn.failed {
+    color: var(--danger);
+    border-color: transparent;
+    background: var(--danger-soft);
+  }
+
+  .banner-btn:disabled {
+    opacity: 0.6;
+    cursor: default;
+  }
+
+  /* ── Alone in the call: invite prompt in the empty half of the grid ─── */
+  .invite-tile {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: var(--space-2);
+    padding: var(--space-5);
+    text-align: center;
+    border-style: dashed;
+    border-color: var(--border);
+    background: transparent;
+  }
+
+  .invite-icon {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 48px;
+    height: 48px;
+    margin-bottom: var(--space-1);
+    border-radius: 50%;
+    background: var(--accent-soft);
+    color: var(--accent);
+  }
+
+  .invite-tile h2 {
+    font-size: var(--text-lg);
+    font-weight: 600;
+  }
+
+  .invite-tile p {
+    max-width: 300px;
+    color: var(--text-muted);
+    font-size: var(--text-sm);
+  }
+
+  .invite-tile .btn {
+    margin-top: var(--space-2);
+  }
+
+  .invite-link {
+    max-width: min(100%, 320px);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-family: var(--font-mono);
+    font-size: var(--text-xs);
+    color: var(--text-subtle);
+    user-select: all;
+  }
+
   .peer-count {
     display: inline-flex;
     align-items: center;
@@ -1838,9 +2121,8 @@
     height: 44px;
     border-radius: 50%;
     border: 1px solid rgba(255, 255, 255, 0.18);
-    background: rgba(11, 13, 18, 0.62);
-    -webkit-backdrop-filter: blur(6px);
-    backdrop-filter: blur(6px);
+    /* Solid, not backdrop-filter: a blur over playing video is recomputed every frame, per tile. */
+    background: rgba(11, 13, 18, 0.78);
     color: #fff;
   }
 
@@ -1888,9 +2170,8 @@
     gap: 6px;
     padding: 3px 10px;
     border-radius: var(--radius-pill);
-    background: rgba(11, 13, 18, 0.62);
-    -webkit-backdrop-filter: blur(6px);
-    backdrop-filter: blur(6px);
+    /* Solid, not backdrop-filter: a blur over playing video is recomputed every frame, per tile. */
+    background: rgba(11, 13, 18, 0.78);
     color: #fff;
     font-size: var(--text-xs);
     font-weight: 500;
@@ -1935,9 +2216,8 @@
     padding: 4px 10px;
     border: 0;
     border-radius: var(--radius-pill);
-    background: rgba(11, 13, 18, 0.62);
-    -webkit-backdrop-filter: blur(6px);
-    backdrop-filter: blur(6px);
+    /* Solid, not backdrop-filter: a blur over playing video is recomputed every frame, per tile. */
+    background: rgba(11, 13, 18, 0.78);
     color: #fff;
     font-size: var(--text-xs);
     font-weight: 500;
@@ -1980,6 +2260,33 @@
 
   .stage-btn:hover {
     background: rgba(11, 13, 18, 0.82);
+  }
+
+  /* Icon only, on your own shared screen: is its sound going out? */
+  .sound-btn {
+    padding: 6px;
+  }
+
+  .sound-btn.off {
+    color: rgba(255, 255, 255, 0.55);
+  }
+
+  .sound-btn:disabled {
+    cursor: default;
+  }
+
+  /* Sits just above the stage's other button (Options / Unpin). */
+  .fullscreen-btn {
+    bottom: calc(var(--space-2) + 32px);
+  }
+
+  .stage:fullscreen {
+    background: #000;
+  }
+
+  .stage:fullscreen > :global(.tile) {
+    border: 0;
+    border-radius: 0;
   }
 
   .stage-btn:focus-visible {

@@ -71,6 +71,8 @@ if (!/^(?=.{1,253}$)([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$/.test(do
 const config = JSON.parse(stripComments(readFileSync(join(root, 'wrangler.jsonc'), 'utf8')).replace(/,(\s*[}\]])/g, '$1'));
 delete config.$schema;
 config.workers_dev = false;
+// Per-version preview URLs live on workers.dev too: off, so the app is only reachable on your domain.
+config.preview_urls = false;
 config.routes = [{ pattern: domain, custom_domain: true }];
 const generated = join(root, '.wrangler.deploy.json');
 writeFileSync(generated, JSON.stringify(config, null, 2));

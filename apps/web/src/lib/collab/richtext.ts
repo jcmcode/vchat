@@ -224,26 +224,35 @@ export function layoutRichText(lines: RichLine[], size: number, maxWidth: number
         let w = measure(tok, size, run.b, run.i);
         if (!isSpace && x + w > avail && x > 0) pushLine();
         if (!isSpace && w > avail) {
-          // A single word wider than the box: break it by characters.
+          // A single word wider than the box: break it by characters. Each distinct character is
+          // measured once and widths are added up (linear time: re-measuring the growing piece for
+          // every character was quadratic, and a long enough word froze the board).
+          const widths = new Map<string, number>();
+          const charWidth = (ch: string) => {
+            let cw = widths.get(ch);
+            if (cw === undefined) widths.set(ch, (cw = measure(ch, size, run.b, run.i)));
+            return cw;
+          };
           let piece = '';
-          for (const ch of Array.from(tok)) {
-            const candidate = piece + ch;
-            if (x + measure(candidate, size, run.b, run.i) > avail && (piece !== '' || x > 0)) {
+          let pw = 0;
+          for (const ch of tok) {
+            const cw = charWidth(ch);
+            if (x + pw + cw > avail && (piece !== '' || x > 0)) {
               if (piece) {
-                const pw = measure(piece, size, run.b, run.i);
                 segs.push({ ...run, text: piece, x, width: pw });
                 x += pw;
               }
               pushLine();
               piece = ch;
+              pw = cw;
             } else {
-              piece = candidate;
+              piece += ch;
+              pw += cw;
             }
           }
           if (piece) {
-            w = measure(piece, size, run.b, run.i);
-            segs.push({ ...run, text: piece, x, width: w });
-            x += w;
+            segs.push({ ...run, text: piece, x, width: pw });
+            x += pw;
           }
           continue;
         }

@@ -214,3 +214,87 @@ test('tuneSender runs one change at a time per sender and ends on the latest tar
   await tuneSender(f.sender, cameraTarget(1, false), size);
   assert.equal((f.current().encodings as Record<string, unknown>[])[0].maxBitrate, cameraTarget(1, false).maxBitrate);
 });
+
+// ── Per-viewer camera size ─────────────────────────────────────────────────────
+
+test('view messages are validated strictly', async () => {
+  const { parseView } = await import('./quality.js');
+  assert.deepEqual(parseView({ type: 'view', w: 640, h: 360, fit: 'cover' }), { kind: 'box', w: 640, h: 360, fit: 'cover' });
+  assert.deepEqual(parseView({ type: 'view', w: 0, h: 0 }), { kind: 'none' });
+  assert.deepEqual(parseView({ type: 'view', full: true, w: 'x' }), { kind: 'full' });
+  for (const bad of [
+    null,
+    'view',
+    { w: 640, h: 360 }, // no fit
+    { w: 640, h: 360, fit: 'stretch' },
+    { w: -1, h: 360, fit: 'cover' },
+    { w: 1.5, h: 360, fit: 'cover' },
+    { w: 99_999, h: 360, fit: 'cover' },
+    { w: '640', h: 360, fit: 'cover' },
+    { full: 'yes' },
+  ]) {
+    assert.equal(parseView(bad), null, JSON.stringify(bad));
+  }
+});
+
+test('lines needed for a viewer box depend on how it fits and on the source shape', async () => {
+  const { linesForView } = await import('./quality.js');
+  const hd = { width: 1280, height: 720 };
+  assert.equal(linesForView({ w: 640, h: 360, fit: 'cover' }, hd), 360);
+  // A strip thumbnail (232x145 CSS px at 2x): cover fills the box, so the height decides.
+  assert.equal(linesForView({ w: 464, h: 290, fit: 'cover' }, hd), 290);
+  assert.equal(linesForView({ w: 464, h: 290, fit: 'contain' }, hd), 261);
+  // A portrait phone camera in a landscape tile: filling the width needs more lines.
+  assert.equal(linesForView({ w: 464, h: 290, fit: 'cover' }, { width: 720, height: 1280 }), 464);
+  // Unknown source size counts as 1280x720.
+  assert.equal(linesForView({ w: 640, h: 360, fit: 'cover' }), 360);
+});
+
+test('each viewer gets the camera no bigger than it shows it, and never more than its share', async () => {
+  const { cameraForViewer, HIDDEN_VIEW, VIEW_LINE_STEPS } = await import('./quality.js');
+  const hd = { width: 1280, height: 720 };
+  const base = cameraTarget(1, false); // 720 lines, 2.5 Mbps
+  assert.equal(base.maxLines, 720);
+
+  // No information (older version) or an unmeasurable window: unchanged.
+  assert.deepEqual(cameraForViewer(base, undefined, hd), base);
+  assert.deepEqual(cameraForViewer(base, { kind: 'full' }, hd), base);
+  // Big enough tile: unchanged.
+  assert.deepEqual(cameraForViewer(base, { kind: 'box', w: 2560, h: 1440, fit: 'cover' }, hd), base);
+
+  // A thumbnail: snapped up to a step, bitrate down with it.
+  const thumb = cameraForViewer(base, { kind: 'box', w: 464, h: 290, fit: 'cover' }, hd);
+  assert.equal(thumb.maxLines, 360);
+  assert.ok(VIEW_LINE_STEPS.includes(thumb.maxLines));
+  assert.ok(thumb.maxBitrate < base.maxBitrate / 2 && thumb.maxBitrate >= 150_000, String(thumb.maxBitrate));
+  assert.equal(thumb.maxFramerate, base.maxFramerate);
+  assert.equal(encodingFor(thumb, hd).scaleResolutionDownBy, 2);
+
+  // Small changes in size land on the same step (no encoder churn while resizing).
+  const a = cameraForViewer(base, { kind: 'box', w: 600, h: 338, fit: 'cover' }, hd);
+  const b = cameraForViewer(base, { kind: 'box', w: 630, h: 354, fit: 'cover' }, hd);
+  assert.deepEqual(a, b);
+
+  // Not shown at all: a trickle.
+  const hidden = cameraForViewer(base, { kind: 'none' }, hd);
+  assert.equal(hidden.maxLines, HIDDEN_VIEW.maxLines);
+  assert.equal(hidden.maxBitrate, HIDDEN_VIEW.maxBitrate);
+  assert.equal(hidden.maxFramerate, HIDDEN_VIEW.maxFramerate);
+
+  // Never above the base, in any respect, whatever the viewer claims.
+  for (const peers of PEERS) {
+    for (const presenting of [false, true]) {
+      const share = cameraTarget(peers, presenting);
+      for (const view of [
+        { kind: 'box' as const, w: 16_384, h: 16_384, fit: 'cover' as const },
+        { kind: 'box' as const, w: 1, h: 1, fit: 'contain' as const },
+        { kind: 'box' as const, w: 800, h: 450, fit: 'contain' as const },
+        { kind: 'none' as const },
+      ]) {
+        const t = cameraForViewer(share, view, hd);
+        assert.ok(t.maxLines <= share.maxLines && t.maxBitrate <= share.maxBitrate && t.maxFramerate <= share.maxFramerate);
+        assert.equal(t.priority, share.priority);
+      }
+    }
+  }
+});

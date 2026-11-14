@@ -10,6 +10,16 @@ const CHUNK_SIZE = 16 * 1024; // 16KB
 export const MAX_FILE_SIZE = 50 * 1024 * 1024; // 50MB
 /** Chunks in flight per recipient before waiting for acks. */
 const WINDOW = 8;
+/**
+ * Chunks sent per second to one recipient, across all files: about 5.6 MB/s on the wire (base64 +
+ * JSON), safely under the per-participant limits every receiver enforces (8 MB/s; see mesh.ts).
+ * Without it, a fast link (same Wi-Fi) outruns those limits, chunks are dropped and the transfer
+ * stalls. Slower links are limited by WINDOW long before this.
+ */
+const SEND_CHUNKS_PER_SECOND = 256;
+const SEND_BURST = 32;
+/** Sender progress is published every this many acks (each publish re-renders the chat). */
+const PROGRESS_EVERY = 8;
 /** Limits on what one participant can send us at the same time. */
 const MAX_INCOMING_PER_PEER = 3;
 const MAX_INCOMING_BYTES = 150 * 1024 * 1024;
@@ -18,6 +28,12 @@ const MAX_INCOMING_BYTES_TOTAL = 300 * 1024 * 1024;
 /** Lifetime limits per participant (finished files stay in memory until you leave the call). */
 const MAX_FILES_PER_PEER = 50;
 const MAX_KEPT_BYTES_PER_PEER = 300 * 1024 * 1024;
+/**
+ * …and from everyone together, people who already left included. Peer ids are chosen by each
+ * client, so someone who can rejoin under new ids would otherwise get a fresh allowance each time.
+ */
+const MAX_FILES_TOTAL = 200;
+const MAX_KEPT_BYTES_TOTAL = 1024 * 1024 * 1024;
 /** Drop an incoming transfer that stalls this long. */
 const STALL_MS = 60_000;
 /** Images up to this size are previewed inline; larger ones are download-only. */
@@ -39,7 +55,10 @@ export interface FileTransferEntry {
   /** Sent only to one person. */
   private?: boolean;
   /** For files you sent privately: who to. */
+  toPeerId?: string;
   toDisplayName?: string;
+  /** When the transfer started here (this device's clock), so chat can show it in order. */
+  startedAt?: number;
 }
 
 export const fileTransfers = writable<Map<string, FileTransferEntry>>(new Map());
@@ -78,11 +97,16 @@ export function initFileTransfer(
 export function resetFileTransfers(): void {
   outgoingFiles.clear();
   incomingFiles.clear();
+  sendBudget.clear();
+  for (const timer of pumpTimers.values()) clearTimeout(timer);
+  pumpTimers.clear();
   fileTransfers.set(new Map());
 }
 
+// Peer ids can't contain ':', so these two shapes never collide (a participant whose id is "out"
+// can't make their incoming files look like our outgoing ones).
 const outKey = (fileId: string) => `out:${fileId}`;
-const inKey = (fromPeerId: string, fileId: string) => `${fromPeerId}:${fileId}`;
+const inKey = (fromPeerId: string, fileId: string) => `in:${fromPeerId}:${fileId}`;
 
 function patchEntry(key: string, patch: Partial<FileTransferEntry>): void {
   fileTransfers.update((m) => {
@@ -128,7 +152,7 @@ export function sendFile(
   peerIds: string[],
   localPeerId: string,
   localDisplayName: string,
-  privateTo?: { displayName: string }
+  privateTo?: { peerId: string; displayName: string }
 ): string | null {
   if (file.size > MAX_FILE_SIZE || peerIds.length === 0) return null;
 
@@ -147,7 +171,8 @@ export function sendFile(
       direction: 'send',
       progress: totalChunks === 0 ? 1 : 0,
       status: totalChunks === 0 ? 'complete' : 'transferring',
-      ...(privateTo ? { private: true, toDisplayName: privateTo.displayName } : {}),
+      startedAt: Date.now(),
+      ...(privateTo ? { private: true, toPeerId: privateTo.peerId, toDisplayName: privateTo.displayName } : {}),
     })
   );
 
@@ -175,13 +200,42 @@ export function sendFile(
   return fileId;
 }
 
-/** Keep up to WINDOW unacknowledged chunks in flight to one recipient. */
+/** Per-recipient send budget (token bucket), shared by every file going to them. */
+const sendBudget = new Map<string, { tokens: number; at: number }>();
+/** Pending "send more when the budget refills" timers, per file and recipient. */
+const pumpTimers = new Map<string, ReturnType<typeof setTimeout>>();
+
+function takeSendToken(peerId: string): boolean {
+  const now = Date.now();
+  const b = sendBudget.get(peerId) ?? { tokens: SEND_BURST, at: now };
+  b.tokens = Math.min(SEND_BURST, b.tokens + ((now - b.at) / 1000) * SEND_CHUNKS_PER_SECOND);
+  b.at = now;
+  sendBudget.set(peerId, b);
+  if (b.tokens < 1) return false;
+  b.tokens -= 1;
+  return true;
+}
+
+/** Keep up to WINDOW unacknowledged chunks in flight to one recipient, within its send budget. */
 function pump(fileId: string, peerId: string): void {
   const outgoing = outgoingFiles.get(fileId);
   const r = outgoing?.recipients.get(peerId);
   if (!outgoing || !r) return;
 
   while (r.nextChunk < outgoing.totalChunks && r.nextChunk - r.acked < WINDOW) {
+    if (!takeSendToken(peerId)) {
+      const timerKey = `${fileId}|${peerId}`;
+      if (!pumpTimers.has(timerKey)) {
+        pumpTimers.set(
+          timerKey,
+          setTimeout(() => {
+            pumpTimers.delete(timerKey);
+            pump(fileId, peerId);
+          }, 20)
+        );
+      }
+      return;
+    }
     const chunkIndex = r.nextChunk++;
     const start = chunkIndex * CHUNK_SIZE;
     outgoing.file
@@ -235,15 +289,21 @@ function incomingLoad(fromPeerId: string): { count: number; bytes: number; total
  * Cancelled transfers hold no bytes but still count as files: each one stays listed in the chat,
  * so announcing and cancelling in a loop can't grow that list without limit.
  */
-function lifetimeLoad(fromPeerId: string): { files: number; bytes: number } {
+function lifetimeLoad(fromPeerId: string): { files: number; bytes: number; allFiles: number; allBytes: number } {
   let files = 0;
   let bytes = 0;
+  let allFiles = 0;
+  let allBytes = 0;
   for (const e of get(fileTransfers).values()) {
-    if (e.direction !== 'receive' || e.fromPeerId !== fromPeerId) continue;
+    if (e.direction !== 'receive') continue;
+    const kept = e.status !== 'cancelled' ? e.fileSize : 0;
+    allFiles++;
+    allBytes += kept;
+    if (e.fromPeerId !== fromPeerId) continue;
     files++;
-    if (e.status !== 'cancelled') bytes += e.fileSize;
+    bytes += kept;
   }
-  return { files, bytes };
+  return { files, bytes, allFiles, allBytes };
 }
 
 let stallTimer: ReturnType<typeof setInterval> | null = null;
@@ -287,6 +347,7 @@ export function handleFileMeta(
   if (load.count >= MAX_INCOMING_PER_PEER || load.bytes + fileSize > MAX_INCOMING_BYTES || load.totalBytes + fileSize > MAX_INCOMING_BYTES_TOTAL) return;
   const lifetime = lifetimeLoad(fromPeerId);
   if (lifetime.files >= MAX_FILES_PER_PEER || lifetime.bytes + fileSize > MAX_KEPT_BYTES_PER_PEER) return;
+  if (lifetime.allFiles >= MAX_FILES_TOTAL || lifetime.allBytes + fileSize > MAX_KEPT_BYTES_TOTAL) return;
 
   const totalChunks = Math.ceil(fileSize / CHUNK_SIZE);
   const mimeType =
@@ -303,6 +364,7 @@ export function handleFileMeta(
     status: 'transferring',
     fromPeerId,
     displayName,
+    startedAt: Date.now(),
     ...(msg.private === true ? { private: true } : {}),
   };
 
@@ -368,7 +430,8 @@ export function handleFileAck(msg: { fileId: unknown; chunkIndex: unknown }, fro
   const r = outgoingFiles.get(msg.fileId)?.recipients.get(fromPeerId);
   if (!r) return;
   r.acked = Math.min(r.acked + 1, r.nextChunk);
-  updateSendProgress(msg.fileId);
+  const total = outgoingFiles.get(msg.fileId)!.totalChunks;
+  if (r.acked % PROGRESS_EVERY === 0 || r.acked >= total) updateSendProgress(msg.fileId);
   pump(msg.fileId, fromPeerId);
 }
 

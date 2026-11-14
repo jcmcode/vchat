@@ -42,6 +42,7 @@
     eraser: '<path d="M20 20H9l-5.500-5.500a2 2 0 0 1 0-2.800L13 2.200a2 2 0 0 1 2.800 0l5.500 5.500a2 2 0 0 1 0 2.800L12 20"/><path d="M7 11l6 6"/>',
     undo: '<path d="M3 7v6h6"/><path d="M3 13a9 9 0 1 1 2.600 6.400"/>',
     trash: '<path d="M3 6h18"/><path d="M8 6V4a1 1 0 0 1 1-1h6a1 1 0 0 1 1 1v2"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/><path d="M10 11v6"/><path d="M14 11v6"/>',
+    gamepad: '<rect x="2" y="7" width="20" height="11" rx="5.5"/><path d="M7 11v3"/><path d="M5.5 12.5h3"/><path d="M15.5 11.5h.01"/><path d="M18 13.5h.01"/>',
     whiteboard: '<rect x="2" y="3" width="20" height="14" rx="2"/><path d="M7 14l3-4 3 2 4-5"/><path d="M8 21l2-4"/><path d="M16 21l-2-4"/>',
     link: '<path d="M10 14a4.500 4.500 0 0 0 6.400 0l3-3a4.500 4.500 0 0 0-6.400-6.400l-1 1"/><path d="M14 10a4.500 4.500 0 0 0-6.400 0l-3 3a4.500 4.500 0 0 0 6.400 6.400l1-1"/>',
     share: '<circle cx="18" cy="5" r="3"/><circle cx="6" cy="12" r="3"/><circle cx="18" cy="19" r="3"/><path d="M8.600 13.500l6.800 4"/><path d="M15.400 6.500l-6.800 4"/>',

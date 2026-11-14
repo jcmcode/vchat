@@ -4,15 +4,16 @@
 //
 //   WS  /ws?room=<id>  -> SignalingRoom Durable Object for that room
 //   /api/*             -> shared API (core/api.ts): config, ICE servers, owner sign-in, invites
-//                         (POST /api/invite/check is finished in the room's Durable Object)
+//                         (POST /api/invite/check is finished in the room's Durable Object;
+//                         owner sign-in runs in one sign-in Durable Object, see AUTH_PATHS)
 //
 // Owner sign-in: Cloudflare Access (CF_ACCESS_TEAM_DOMAIN + CF_ACCESS_AUD), an emailed code
 // (OWNER_EMAIL + RESEND_API_KEY + EMAIL_FROM) or ADMIN_PASSWORD.
 // Either one also requires SECRET_KEY. With nothing configured (or OPEN_MODE=1), the app runs in
 // open mode; anything in between is reported as a configuration error.
 
-import { authorizeSocket, handleApi, isValidRoomId, resolveConfig, throttleClientId } from '@vchat/signaling-server/core';
-import { CLIENT_HEADER, INVITE_CHECK_PATH, type Env } from './env.ts';
+import { handleApi, isValidRoomId, resolveConfig, socketRole, throttleClientId } from '@vchat/signaling-server/core';
+import { AUTH_OBJECT, AUTH_PATHS, CLIENT_HEADER, INVITE_CHECK_PATH, ROLE_HEADER, type Env } from './env.ts';
 
 export { SignalingRoom } from './room.ts';
 
@@ -94,12 +95,14 @@ export default {
         return text('Invalid room', 400);
       }
       // Private mode: no valid invite/host token for this room, no Durable Object.
-      if (!(await authorizeSocket(env, roomId, request.headers.get('Sec-WebSocket-Protocol')))) {
+      const role = await socketRole(env, roomId, request.headers.get('Sec-WebSocket-Protocol'));
+      if (!role) {
         return text('Invite required', 401);
       }
-      // Overwrite whatever the client may have sent in our internal header.
+      // Overwrite whatever the client may have sent in our internal headers.
       const headers = new Headers(request.headers);
       headers.set(CLIENT_HEADER, await clientId(request, env));
+      headers.set(ROLE_HEADER, role); // the room keeps its last few seats for the owner
       const stub = env.ROOMS.get(env.ROOMS.idFromName(roomId));
       const response = await stub.fetch(new Request(request, { headers }));
       return response.status === 101 ? response : secure(response);
@@ -118,6 +121,18 @@ export default {
             headers: { ...cors, 'Access-Control-Allow-Methods': 'GET', 'Access-Control-Allow-Headers': 'X-Vchat-Token' },
           })
         );
+      }
+      if (request.method === 'POST' && AUTH_PATHS.has(url.pathname)) {
+        // Owner sign-in runs in a single Durable Object: its throttles, per-challenge try limit and
+        // one-time challenges are in-memory state, which would otherwise be per isolate (and could
+        // be multiplied by spreading guesses across Cloudflare's machines). The object gets the
+        // same keyed client hash as rooms do, never the raw address.
+        const headers = new Headers(request.headers);
+        headers.set(CLIENT_HEADER, await clientId(request, env));
+        const stub = env.ROOMS.get(env.ROOMS.idFromName(AUTH_OBJECT));
+        const res = secure(await stub.fetch(new Request(request, { headers })));
+        for (const [k, v] of Object.entries(cors)) res.headers.set(k, v);
+        return res;
       }
       const response = await handleApi(request, env, {
         clientIp: request.headers.get('CF-Connecting-IP') ?? undefined,

@@ -86,6 +86,12 @@ function measure(text: string, size: number, bold: boolean, italic: boolean): nu
 }
 
 const layoutCache = new WeakMap<Stroke, { key: string; layout: TextLayout }>();
+/**
+ * Layouts by content, so an update that replaces a text box's object with an identical copy (or
+ * moves it) doesn't lay it out again. Small and least-recently-used first out.
+ */
+const layoutsByContent = new Map<string, TextLayout>();
+const MAX_LAYOUTS_BY_CONTENT = 256;
 
 /** Word-wrapped layout of a text box, in its own (world) units. */
 export function textLayout(stroke: Stroke): TextLayout {
@@ -94,7 +100,14 @@ export function textLayout(stroke: Stroke): TextLayout {
   const key = `${stroke.width}|${boxW}|${text}`;
   const cached = layoutCache.get(stroke);
   if (cached && cached.key === key) return cached.layout;
-  const layout = layoutRichText(parseRichText(text), stroke.width, boxW, measure);
+  let layout = layoutsByContent.get(key);
+  if (layout) {
+    layoutsByContent.delete(key); // re-insert: most recently used last
+  } else {
+    layout = layoutRichText(parseRichText(text), stroke.width, boxW, measure);
+    if (layoutsByContent.size >= MAX_LAYOUTS_BY_CONTENT) layoutsByContent.delete(layoutsByContent.keys().next().value!);
+  }
+  layoutsByContent.set(key, layout);
   layoutCache.set(stroke, { key, layout });
   return layout;
 }

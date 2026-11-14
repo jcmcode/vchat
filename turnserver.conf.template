@@ -35,13 +35,17 @@ no-multicast-peers
 no-loopback-peers
 no-rfc5780
 no-stun-backward-compatibility
+# Don't announce coturn's version to anyone who asks (even unauthenticated Binding requests).
+no-software-attribute
 # Allocations per credential / in total, bandwidth per session / in total. coturn counts
-# bandwidth in BYTES per second: 500000 is 4 Mbit/s per session, 25000000 is 200 Mbit/s in total.
-# A credential is shared by the people in one room behind one address (housemates, an office),
-# and each of them uses up to two allocations per other participant — hence 48, not 12.
-user-quota=48
+# bandwidth in BYTES per second: 750000 is 6 Mbit/s per session (room for a screen share plus
+# camera to one person, with headroom, so the relay doesn't drop media), 25000000 is 200 Mbit/s
+# in total. A credential is shared by the people in one room behind one address (housemates, an
+# office), and each of them uses up to three allocations per other participant (one per TURN URL:
+# UDP, TCP and, with the add-on, TLS on 443) — hence 72, not 12.
+user-quota=72
 total-quota=300
-max-bps=500000
+max-bps=750000
 bps-capacity=25000000
 stale-nonce=600
 
@@ -68,6 +72,8 @@ denied-peer-ip=224.0.0.0-239.255.255.255
 denied-peer-ip=240.0.0.0-255.255.255.255
 denied-peer-ip=::
 denied-peer-ip=::1
+# IPv4-compatible addresses (deprecated ::/96): tunneled to IPv4 on some hosts.
+denied-peer-ip=::-::ffff:ffff
 denied-peer-ip=::ffff:0.0.0.0-::ffff:255.255.255.255
 denied-peer-ip=64:ff9b::-64:ff9b::ffff:ffff
 # NAT64 (64:ff9b:1::/48) and Teredo (2001::/32)
