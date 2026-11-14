@@ -80,6 +80,7 @@
   import Icon from '$lib/ui/Icon.svelte';
   import VideoTile from './VideoTile.svelte';
   import { setE2EKey, verification, blockedConnections, hasRoomKey, isValidRoomKey, allowUnverified } from '$lib/webrtc/e2e';
+  import { pipMode, pipOpen, pipAvailable, togglePip } from '$lib/ui/pip';
   import ConnectionDetails from './ConnectionDetails.svelte';
   import ConnectionHint from './ConnectionHint.svelte';
   import ChatPanel from './ChatPanel.svelte';
@@ -908,6 +909,20 @@
             <span class="ctrl-label">Board</span>
           </button>
 
+          {#if pipMode}
+            <button
+              class="ctrl-btn"
+              class:active={$pipOpen}
+              aria-pressed={$pipOpen}
+              disabled={!$pipAvailable}
+              on:click={() => togglePip({ displayName, chatOnly, onToggleAudio: handleToggleAudio, onToggleVideo: handleToggleVideo, onLeave: handleLeave })}
+              title={$pipOpen ? 'Close the pop-out window' : $pipAvailable ? 'Pop the call out into a small window that stays on top' : 'No video to pop out yet'}
+            >
+              <Icon name="pip" size={22} />
+              <span class="ctrl-label">Pop out</span>
+            </button>
+          {/if}
+
           <button
             class="ctrl-btn"
             class:active={showChat}
@@ -1467,6 +1482,11 @@
 
   .ctrl-btn.active:hover {
     border-color: var(--accent);
+  }
+
+  .ctrl-btn:disabled {
+    opacity: 0.45;
+    cursor: not-allowed;
   }
 
   .ctrl-sep {
