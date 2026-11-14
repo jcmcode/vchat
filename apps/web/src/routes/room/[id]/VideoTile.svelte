@@ -4,6 +4,7 @@
   import type { Verification } from '$lib/webrtc/e2e';
   import { selectedAudioOutput } from '$lib/media/manager';
   import Icon from '$lib/ui/Icon.svelte';
+  import TileQuality from './TileQuality.svelte';
 
   export let peerConnection: PeerConnection;
   export let speaking = false;
@@ -21,6 +22,7 @@
   export let selectable = false;
 
   const dispatch = createEventDispatcher<{ select: void }>();
+  let qualityShown = false;
 
   function onKey(e: KeyboardEvent) {
     if (selectable && (e.key === 'Enter' || e.key === ' ')) {
@@ -55,6 +57,7 @@
   role={selectable ? 'button' : undefined}
   tabindex={selectable ? 0 : undefined}
   aria-label={selectable ? `${peerConnection.displayName}: message privately or send a file` : undefined}
+  aria-describedby={qualityShown ? `quality-${peerConnection.id}` : undefined}
   on:click={() => selectable && dispatch('select')}
   on:keydown={onKey}
 >
@@ -69,6 +72,10 @@
     </div>
   {/if}
   <slot />
+  {#if !screen}
+    <!-- Once per person: on their own tile, not on their shared screen (ids must stay unique). -->
+    <TileQuality peerId={peerConnection.id} id="quality-{peerConnection.id}" bind:shown={qualityShown} />
+  {/if}
   <span class="tile-name">
     {#if verification === 'verified'}
       <span class="ver verified" title="Verified end-to-end"><Icon name="shield-check" size={13} /><span class="sr-only">verified</span></span>

@@ -37,8 +37,10 @@ export class AttemptCounter {
   /** Undo the newest attempt (e.g. it turned out to be a success). */
   refund(key: string, now = Date.now()): void {
     const recent = this.recent(key, now);
-    recent.pop();
+    if (recent.length === 0) return;
+    recent.pop(); // `recent` is a filtered copy: store it back
     if (recent.length === 0) this.hits.delete(key);
+    else this.hits.set(key, recent);
   }
 
   /** Drop every key whose newest attempt is outside the window. */
