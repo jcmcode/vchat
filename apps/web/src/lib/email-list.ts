@@ -4,7 +4,8 @@
 export const MAX_RECIPIENTS = 20;
 
 const BAD = String.raw`\s@<>(),;:"\[\]\\`;
-const EMAIL_RE = new RegExp(`^[^${BAD}]+@[^${BAD}.]+(\\.[^${BAD}.]+)*\\.[^${BAD}.\\d]{2,}$`);
+// The last label is a TLD: starts with a letter (punycode TLDs like xn--p1ai contain digits).
+const EMAIL_RE = new RegExp(`^[^${BAD}]+@[^${BAD}.]+(\\.[^${BAD}.]+)*\\.[^${BAD}.\\d][^${BAD}.]+$`);
 
 /** A plausible email address (one @, a dotted domain, no spaces or list punctuation). */
 export function isValidEmail(value: string): boolean {

@@ -209,12 +209,14 @@
     color: var(--text-muted);
   }
 
+  /* Spinner above the heading, so a heading that wraps on a phone stays centred. */
   .status {
     display: flex;
+    flex-direction: column;
     align-items: center;
-    justify-content: center;
     gap: var(--space-2);
     margin-top: var(--space-2);
+    text-align: center;
   }
 
   .status h1 {

@@ -60,6 +60,7 @@
     wasRoomCreated,
     rememberRoomPassword,
     recallRoomPassword,
+    forgetRoomPassword,
     peerId,
     getPeerSecret,
     useRoomIdentity,
@@ -185,9 +186,9 @@
         const reason = typeof body.error === 'string' ? body.error : '';
         roomError.set(friendlyJoinError(reason) ?? friendlyJoinError('Invalid invite') ?? "This invite link isn't valid.");
       }
-      // A server without this check: go on; it checks the passcode when we join.
-      else if (res.status === 404 || res.status === 405) accept(true);
-      else passcodeError = "Couldn't check your passcode right now. Try again.";
+      // Any other answer (an older server without this check, a proxy, a server error): go on.
+      // Joining checks the passcode anyway, and asks again if it's wrong.
+      else accept(true);
     } catch {
       passcodeError = "Couldn't reach the server. Check your connection and try again.";
     } finally {
@@ -359,7 +360,12 @@
     // of the address bar so it isn't shown, bookmarked or kept in history.
     const fragment = new URLSearchParams(window.location.hash.slice(1));
     const inviteParam = fragment.get('invite');
-    if (inviteParam) setRoomToken(roomId, inviteParam);
+    if (inviteParam) {
+      // A newly opened link replaces any earlier one in this tab, along with its passcode, so an
+      // old code isn't replayed against the new invite.
+      if (inviteParam !== getRoomToken(roomId)) forgetRoomPassword(roomId);
+      setRoomToken(roomId, inviteParam);
+    }
     // The room's end-to-end key (only ever in the "#" part of links, never sent to a server).
     const keyParam = fragment.get('k');
     if (isValidRoomKey(keyParam)) setRoomKey(roomId, keyParam);

@@ -259,7 +259,7 @@
       <input type="checkbox" bind:checked={includeKey} />
       <span>
         <strong>Include the end-to-end key in the link</strong>
-        <small>One-click join. The key then passes through this server and the email service, and either could use it to listen in unnoticed. For full protection, untick this and send the guest the invite link yourself.</small>
+        <small>One-click join. The key then passes through this server, the email service and (with a calendar invite) the guest's calendar, and anyone with access to those could use it to listen in unnoticed. For full protection, untick this and send the guest the invite link yourself.</small>
       </span>
     </label>
   {/if}

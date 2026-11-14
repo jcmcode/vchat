@@ -30,7 +30,7 @@ test('validates addresses', () => {
   for (const ok of ['a@example.com', 'first.last+tag@mail.example.co.uk', 'x@xn--bcher-kva.example']) {
     assert.ok(isValidEmail(ok), ok);
   }
-  for (const bad of ['nope', 'a@b', 'a@@example.com', 'a b@example.com', '@example.com', 'a@example.', 'a@.example.com', 'a@example.c0m']) {
+  for (const bad of ['nope', 'a@b', 'a@@example.com', 'a b@example.com', '@example.com', 'a@example.', 'a@.example.com']) {
     assert.ok(!isValidEmail(bad), bad);
   }
   assert.ok(!isValidEmail(`${'a'.repeat(250)}@example.com`));
@@ -59,4 +59,11 @@ test('meeting helpers', () => {
   const ms = new Date(2026, 11, 24, 9, 5).getTime();
   assert.equal(toDatetimeLocal(ms), '2026-12-24T09:05');
   assert.equal(new Date(toDatetimeLocal(ms)).getTime(), ms);
+});
+
+test('TLDs may contain digits after the first letter (punycode), but not be all digits', () => {
+  assert.equal(isValidEmail('user@example.xn--p1ai'), true);
+  assert.equal(isValidEmail('user@example.co'), true);
+  assert.equal(isValidEmail('user@example.123'), false);
+  assert.equal(isValidEmail('user@example.c'), false);
 });

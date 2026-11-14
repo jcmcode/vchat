@@ -297,6 +297,10 @@ const CODES_SENT_PER_WINDOW = 5;
 const VERIFY_ATTEMPTS_PER_CHALLENGE = 5;
 const INVITE_WINDOW_MS = 60 * 60 * 1000;
 const INVITES_PER_WINDOW = 30;
+/** Pause between invite emails (Resend's default limit is 2 requests a second). */
+const INVITE_SEND_SPACING_MS = 550;
+/** Stop sending after this long; the rest are reported back to retry. */
+const INVITE_SEND_BUDGET_MS = 25_000;
 /** Recipients per email-invite request (each one is a separate email and counts against the cap). */
 const MAX_INVITE_RECIPIENTS = 20;
 /** Room for 20 addresses plus the invite token, key and schedule (Node reads at most 16 KB). */
@@ -812,10 +816,19 @@ export async function handleApi(request: Request, env: ServerEnv, opts: ApiOptio
       const organizer = parseSender(env.EMAIL_FROM!);
       const sent: string[] = [];
       let retryAfter = 0;
+      // Keep the request short: pace sends to the provider's rate and stop after a time budget, so
+      // a slow provider can't make the request time out (and the owner resend, duplicating invites).
+      const deadline = Date.now() + INVITE_SEND_BUDGET_MS;
 
       // One email per recipient (nobody sees anyone else's address), each counted against the cap.
       for (let i = 0; i < recipients.length; i++) {
         const email = recipients[i];
+        if (i > 0) await new Promise((r) => setTimeout(r, INVITE_SEND_SPACING_MS));
+        if (Date.now() > deadline) {
+          retryAfter = Math.max(retryAfter, 30);
+          for (const rest of recipients.slice(i)) failed.push({ email: rest, reason: 'rate-limited' });
+          break;
+        }
         const cap = underCap(invitesSent, INVITE_WINDOW_MS, INVITES_PER_WINDOW, Date.now());
         invitesSent = cap.list;
         if (!cap.ok) {
