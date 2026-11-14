@@ -16,18 +16,43 @@ test('finds http and https links and splits around them', () => {
   const parts = linkify('see https://example.com/a?b=1#c and http://test.org now');
   assert.deepEqual(parts, [
     { kind: 'text', text: 'see ' },
-    { kind: 'link', href: 'https://example.com/a?b=1#c', prefix: 'https://', host: 'example.com', rest: '/a?b=1#c' },
+    { kind: 'link', href: 'https://example.com/a?b=1#c', before: 'https://', domain: 'example.com', after: '/a?b=1#c' },
     { kind: 'text', text: ' and ' },
-    { kind: 'link', href: 'http://test.org/', prefix: 'http://', host: 'test.org', rest: '/' },
+    { kind: 'link', href: 'http://test.org/', before: 'http://', domain: 'test.org', after: '/' },
     { kind: 'text', text: ' now' },
   ]);
 });
 
-test('every link part is prefix + host + rest', () => {
-  for (const p of linkify('https://Example.COM:8443/x https://a.b/c?d#e')) {
-    if (p.kind === 'link') assert.equal(p.prefix + p.host + p.rest, p.href);
+test('every link part is before + domain + after', () => {
+  for (const p of linkify('https://Example.COM:8443/x https://a.b/c?d#e https://x.y.example.co.uk./ http://[::1]:80/')) {
+    if (p.kind === 'link') assert.equal(p.before + p.domain + p.after, p.href);
   }
   assert.deepEqual(links('HTTPS://EXAMPLE.COM:8443/Path'), ['https://example.com:8443/Path']);
+});
+
+test('only the end of the hostname that identifies the site is emphasized', () => {
+  const split = (text: string) =>
+    linkify(text)
+      .filter((p) => p.kind === 'link')
+      .map((p) => (p.kind === 'link' ? [p.before, p.domain, p.after] : []));
+  assert.deepEqual(split('https://example.com/x'), [['https://', 'example.com', '/x']]);
+  assert.deepEqual(split('https://paypal.com.evil.example/login'), [['https://paypal.com.', 'evil.example', '/login']]);
+  assert.deepEqual(split('https://login.bbc.co.uk:8443/a'), [['https://login.', 'bbc.co.uk', ':8443/a']]);
+  assert.deepEqual(split('https://shop.example.com.au/'), [['https://shop.', 'example.com.au', '/']]);
+  // A short domain under a country code is not mistaken for a suffix like co.uk.
+  assert.deepEqual(split('https://paypal.xyz.de/'), [['https://paypal.', 'xyz.de', '/']]);
+  assert.deepEqual(split('https://www.example.com./'), [['https://www.', 'example.com.', '/']]);
+  assert.deepEqual(split('http://localhost:5173/'), [['http://', 'localhost', ':5173/']]);
+  assert.deepEqual(split('http://192.168.1.10/admin'), [['http://', '192.168.1.10', '/admin']]);
+  assert.deepEqual(split('http://[::1]:8080/'), [['http://', '[::1]', ':8080/']]);
+});
+
+test('hostnames over 253 characters stay text', () => {
+  const label = 'a'.repeat(50);
+  const long = `https://${Array(5).fill(label).join('.')}.com/`; // a 258-character hostname
+  assert.deepEqual(links(long), []);
+  const ok = `https://${Array(4).fill(label).join('.')}.com/`;
+  assert.deepEqual(links(ok), [ok]);
 });
 
 test('only http and https ever become links', () => {
@@ -68,6 +93,13 @@ test('trailing punctuation is not part of the link', () => {
   assert.deepEqual(parts.at(-1), { kind: 'text', text: '.' });
 });
 
+test('underscores, asterisks and tildes at the end are kept', () => {
+  assert.deepEqual(links('https://en.wikipedia.org/wiki/C_'), ['https://en.wikipedia.org/wiki/C_']);
+  assert.deepEqual(links('https://example.com/~'), ['https://example.com/~']);
+  assert.deepEqual(links('https://example.com/a*'), ['https://example.com/a*']);
+  assert.deepEqual(links('see https://example.com/x_.'), ['https://example.com/x_']);
+});
+
 test('unbalanced closing brackets are trimmed, balanced ones kept', () => {
   assert.deepEqual(links('(see https://example.com/a)'), ['https://example.com/a']);
   assert.deepEqual(links('https://en.wikipedia.org/wiki/Foo_(bar)'), ['https://en.wikipedia.org/wiki/Foo_(bar)']);
@@ -89,7 +121,7 @@ test('internationalized hostnames are shown as punycode', () => {
   // Cyrillic small a (U+0430) in place of Latin "a": shown as punycode, so it can't pass as apple.com.
   const [link] = linkify('https://\u0430pple.com/login').filter((p) => p.kind === 'link');
   assert.ok(link && link.kind === 'link');
-  assert.equal(link.host, 'xn--pple-43d.com');
+  assert.equal(link.domain, 'xn--pple-43d.com');
   assert.equal(link.href, 'https://xn--pple-43d.com/login');
   assert.deepEqual(links('https://bücher.example/'), ['https://xn--bcher-kva.example/']);
 });

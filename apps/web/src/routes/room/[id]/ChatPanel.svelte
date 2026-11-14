@@ -5,7 +5,6 @@
   import Icon from '$lib/ui/Icon.svelte';
   import { fileTransfers, MAX_FILE_SIZE, MAX_PREVIEW_BYTES, type FileTransferEntry } from '$lib/webrtc/file-transfer';
   import { isSafeToPreview } from '$lib/webrtc/image-size';
-  import { page } from '$app/stores';
   import { getLocalDisplayName } from '$lib/webrtc/mesh';
   import { roomName } from '$lib/collab/room-meta';
   import { linkify, type ChatPart } from '$lib/chat/linkify';
@@ -146,7 +145,8 @@
   function saveChat() {
     if (messages.length === 0 && transfers.length === 0) return;
     const savedAt = new Date();
-    const room = $roomName || ($page.params.id ?? '');
+    // Only the room's name, never its code: a room without a name is "Unnamed room".
+    const room = $roomName;
     const text = formatTranscript({ roomName: room, localName: getLocalDisplayName(), savedAt, messages, files: transfers });
     downloadFile(new Blob([text], { type: 'text/plain;charset=utf-8' }), transcriptFileName(room, savedAt));
   }
@@ -224,7 +224,7 @@
         </div>
         <div class="bubble">
           <!-- Kept on one line: with pre-wrap, whitespace between these tags would show. -->
-          <div class="msg-text">{#each partsOf(msg) as part}{#if part.kind === 'link'}<a class="msg-link" href={part.href} target="_blank" rel="noopener noreferrer nofollow" referrerpolicy="no-referrer">{part.prefix}<span class="link-host">{part.host}</span>{part.rest}</a>{:else}{part.text}{/if}{/each}</div>
+          <div class="msg-text">{#each partsOf(msg) as part}{#if part.kind === 'link'}<a class="msg-link" href={part.href} target="_blank" rel="noopener noreferrer nofollow" referrerpolicy="no-referrer">{part.before}<span class="link-domain">{part.domain}</span>{part.after}</a>{:else}{part.text}{/if}{/each}</div>
         </div>
         {#if !msg.isLocal && $peers.has(msg.fromPeerId)}
           <button class="reply-private" on:click={() => replyPrivately(msg.fromPeerId)}>
@@ -472,18 +472,20 @@
     white-space: pre-wrap;
   }
 
-  /* Links show their full, normalized address (see lib/chat/linkify.ts), with the host in bold. */
+  /* Links show their full, normalized address (see lib/chat/linkify.ts), with the site's domain in
+     bold. No long-press preview on iOS/macOS, which would fetch the page. */
   .msg-link {
     color: inherit;
     text-decoration: underline;
     text-underline-offset: 2px;
+    -webkit-touch-callout: none;
   }
 
   .msg-link:hover {
     text-decoration-thickness: 2px;
   }
 
-  .link-host {
+  .link-domain {
     font-weight: 700;
   }
 

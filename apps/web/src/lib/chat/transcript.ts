@@ -6,9 +6,11 @@
 // - control, bidi, zero-width and other invisible format characters are removed (ESC too, so the
 //   file is safe to `cat` in a terminal);
 // - every line that continues a message is indented, so a line starting with "[" is always a real
-//   entry, never one typed inside someone's message;
+//   entry, never one typed inside someone's message; and runs of spaces and tabs are collapsed, so
+//   padding can't push fake entry text to the start of a soft-wrapped line in a viewer;
 // - square brackets in names become parentheses, so the "[you]" and "[private]" markers can only
-//   come from vchat, never from someone's chosen name.
+//   come from vchat, never from someone's chosen name; colons, ">" and arrows are removed from
+//   names, so a name can't pose as a private "sender -> recipient" or end the sender early.
 
 /** The parts of a chat message the transcript uses (a `ChatMessage` from mesh.ts fits). */
 export interface TranscriptMessage {
@@ -34,7 +36,7 @@ export interface TranscriptFile {
 }
 
 export interface TranscriptInput {
-  /** Room name, or the room code when it has none. */
+  /** Room name ('' when it has none; the room code is never used, it's not for the file). */
   roomName: string;
   /** Your own display name. */
   localName: string;
@@ -53,11 +55,16 @@ const MAX_SLUG = 40;
 // eslint-disable-next-line no-control-regex
 const STRIP = /[\u0000-\u0008\u000b-\u001f\u007f-\u009f\p{Cf}\ud800-\udfff]/gu;
 
-/** Message text: line breaks normalized to \n, invisible and control characters removed. */
+/**
+ * Message text: line breaks normalized to \n, invisible and control characters removed, and any run
+ * of other whitespace (spaces, tabs, no-break and wide spaces) made a single space.
+ */
 export function cleanTranscriptText(value: string): string {
   return value
     .replace(/\r\n?|[\u2028\u2029]/g, '\n')
     .replace(STRIP, '')
+    .replace(/[^\S\n]+/g, ' ')
+    .replace(/ ?\n ?/g, '\n')
     .replace(/\n{3,}/g, '\n\n')
     .trim();
 }
@@ -68,9 +75,21 @@ export function cleanTranscriptLine(value: string): string {
   return Array.from(line).slice(0, MAX_LINE_FIELD).join('').trim();
 }
 
-/** A person's name: one line, and no square brackets (those mark [you] and [private]). */
+// Colons (and look-alikes) end the sender; ">" and arrows point from sender to private recipient.
+const NAME_STRUCTURE = /[:>\u02d0\u02f8\u0589\u2236\ua789\ufe13\ufe55\ufe65\uff1a\uff1e\u203a\u2190-\u21ff\u27f0-\u27ff\u2900-\u297f]/gu;
+
+/**
+ * A person's name: one line, with nothing that reads as transcript structure. Square brackets
+ * become parentheses ([you] and [private] are vchat's markers); colons, ">" and arrows become spaces.
+ */
 function personName(value: string | undefined, fallback: string): string {
-  return cleanTranscriptLine(value ?? '').replace(/\[/g, '(').replace(/\]/g, ')') || fallback;
+  const name = cleanTranscriptLine(value ?? '')
+    .replace(/\[/g, '(')
+    .replace(/\]/g, ')')
+    .replace(NAME_STRUCTURE, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  return name || fallback;
 }
 
 const pad = (n: number) => String(n).padStart(2, '0');
