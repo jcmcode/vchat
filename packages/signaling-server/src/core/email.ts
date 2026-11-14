@@ -5,6 +5,7 @@
 const EMAIL_RE = /^[^\s@<>()[\]\\,;:"]+@[^\s@<>()[\]\\,;:"]+\.[^\s@<>()[\]\\,;:"]+$/;
 const RESEND_URL = 'https://api.resend.com/emails';
 const RESEND_TIMEOUT_MS = 10_000;
+const RESEND_RETRY_MS = 1100;
 
 /** Trimmed, lowercased address, or null if it doesn't look like one. */
 export function normalizeEmail(value: unknown): string | null {
@@ -44,11 +45,19 @@ function oneLine(value: string): string {
   return value.replace(/[\r\n\t\u0000-\u001f\u007f]+/g, ' ').trim();
 }
 
+export interface EmailAttachment {
+  filename: string;
+  /** Base64 (standard alphabet). */
+  content: string;
+  content_type: string;
+}
+
 export interface EmailMessage {
   to: string;
   subject: string;
   text: string;
   html: string;
+  attachments?: EmailAttachment[];
 }
 
 function layout(body: string): string {
@@ -75,33 +84,183 @@ export function formatUtc(unixSeconds: number): string {
   return `${new Date(unixSeconds * 1000).toISOString().slice(0, 16).replace('T', ' ')} UTC`;
 }
 
-export function inviteEmail(to: string, opts: { link: string; code: string; label?: string; exp: number }): EmailMessage {
+const WEEKDAYS = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
+const MONTHS = ['January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December'];
+
+/** "1 hour", "45 min", "1 h 30 min" */
+export function formatDuration(minutes: number): string {
+  const h = Math.floor(minutes / 60);
+  const m = minutes % 60;
+  if (h === 0) return `${m} min`;
+  if (m === 0) return `${h} hour${h === 1 ? '' : 's'}`;
+  return `${h} h ${m} min`;
+}
+
+/** "Saturday, 14 November 2026, 18:30 UTC (1 hour)" */
+export function formatMeetingTime(startsAtMs: number, durationMinutes: number): string {
+  const d = new Date(startsAtMs);
+  const pad = (n: number) => String(n).padStart(2, '0');
+  return (
+    `${WEEKDAYS[d.getUTCDay()]}, ${d.getUTCDate()} ${MONTHS[d.getUTCMonth()]} ${d.getUTCFullYear()}, ` +
+    `${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())} UTC (${formatDuration(durationMinutes)})`
+  );
+}
+
+export interface InviteEmailOptions {
+  link: string;
+  /** The guest's 6-digit code; omitted for invites without a passcode (the host admits them). */
+  code?: string;
+  label?: string;
+  /** Invite expiry, unix seconds. */
+  exp: number;
+  /** Scheduled meeting: shown as a "When:" line. */
+  schedule?: { startsAt: number; durationMinutes: number };
+  /** Calendar file to attach as invite.ics (scheduled invites). Must never contain the code. */
+  ics?: string;
+}
+
+export function inviteEmail(to: string, opts: InviteEmailOptions): EmailMessage {
   const what = opts.label ? oneLine(opts.label) : 'a video call';
   const expires = formatUtc(opts.exp);
-  const instructions = 'Open the link, enter the code, and the host will let you in.';
+  const when = opts.schedule ? formatMeetingTime(opts.schedule.startsAt, opts.schedule.durationMinutes) : null;
+  const instructions = opts.code
+    ? 'Open the link, enter the code, and the host will let you in.'
+    : 'Open the link, enter your name, and the host will let you in.';
+  const attached = opts.ics ? 'A calendar invite is attached.' : null;
+  const text = [
+    `You're invited to ${what}.`,
+    '',
+    ...(when ? [`When: ${when}`, ''] : []),
+    `Join the call: ${opts.link}`,
+    '',
+    ...(opts.code ? [`Your code: ${opts.code}`, ''] : []),
+    instructions,
+    '',
+    ...(attached ? [attached, ''] : []),
+    `This invite expires ${expires}.`,
+    '',
+  ].join('\n');
+  const html = layout(
+    `<p>You're invited to <strong>${escapeHtml(what)}</strong>.</p>` +
+      (when ? `<p><strong>When:</strong> ${escapeHtml(when)}</p>` : '') +
+      `<p><a href="${escapeHtml(opts.link)}" style="display:inline-block;background:#111;color:#fff;text-decoration:none;padding:12px 20px;border-radius:8px;font-weight:600">Join the call</a></p>` +
+      (opts.code ? `<p>Your code:</p>${codeBlock(opts.code)}` : '') +
+      `<p>${escapeHtml(instructions)}</p>` +
+      (attached ? `<p>${escapeHtml(attached)}</p>` : '') +
+      `<p style="color:#666">This invite expires ${escapeHtml(expires)}.</p>`
+  );
   return {
     to,
     subject: oneLine(`You're invited to ${what}`),
-    text: [
-      `You're invited to ${what}.`,
-      '',
-      `Join the call: ${opts.link}`,
-      '',
-      `Your code: ${opts.code}`,
-      '',
-      instructions,
-      '',
-      `This invite expires ${expires}.`,
-      '',
-    ].join('\n'),
-    html: layout(
-      `<p>You're invited to <strong>${escapeHtml(what)}</strong>.</p>` +
-        `<p><a href="${escapeHtml(opts.link)}" style="display:inline-block;background:#111;color:#fff;text-decoration:none;padding:12px 20px;border-radius:8px;font-weight:600">Join the call</a></p>` +
-        `<p>Your code:</p>${codeBlock(opts.code)}` +
-        `<p>${escapeHtml(instructions)}</p>` +
-        `<p style="color:#666">This invite expires ${escapeHtml(expires)}.</p>`
-    ),
+    text,
+    html,
+    ...(opts.ics
+      ? { attachments: [{ filename: 'invite.ics', content: base64Utf8(opts.ics), content_type: 'text/calendar; method=REQUEST; charset=UTF-8' }] }
+      : {}),
   };
+}
+
+// ── Calendar invites (RFC 5545) ──────────────────────────────────────────────
+
+/** Standard base64 of a string's UTF-8 bytes. */
+export function base64Utf8(value: string): string {
+  let binary = '';
+  for (const b of new TextEncoder().encode(value)) binary += String.fromCharCode(b);
+  return btoa(binary);
+}
+
+/** EMAIL_FROM split into display name and address. */
+export function parseSender(from: string): { name?: string; address: string } {
+  const v = from.trim();
+  const m = v.match(/^([^<>"\r\n]{1,100}?)\s*<([^<>\s]+)>$/);
+  if (!m) return { address: normalizeEmail(v) ?? v };
+  const name = oneLine(m[1]);
+  return { ...(name ? { name } : {}), address: normalizeEmail(m[2]) ?? m[2] };
+}
+
+/** RFC 5545 TEXT escaping: backslash, semicolon, comma and newlines. */
+export function icsText(value: string): string {
+  return value.replace(/\\/g, '\\\\').replace(/;/g, '\\;').replace(/,/g, '\\,').replace(/\r\n|\r|\n/g, '\\n');
+}
+
+/** Parameter value (e.g. CN): quoted when it holds ":", ";" or ","; DQUOTE and controls removed. */
+function icsParam(value: string): string {
+  const v = oneLine(value).replace(/"/g, '');
+  return /[:;,]/.test(v) ? `"${v}"` : v;
+}
+
+/** RFC 5545 folding: lines over 75 octets continue after CRLF + space, never splitting a character. */
+export function icsFold(line: string): string {
+  const encoder = new TextEncoder();
+  if (encoder.encode(line).length <= 75) return line;
+  const out: string[] = [];
+  let current = '';
+  let size = 0;
+  for (const ch of line) {
+    const len = encoder.encode(ch).length;
+    // The first line holds 75 octets; continuation lines a space plus 74.
+    if (size + len > (out.length === 0 ? 75 : 74)) {
+      out.push(current);
+      current = '';
+      size = 0;
+    }
+    current += ch;
+    size += len;
+  }
+  out.push(current);
+  return out.join('\r\n ');
+}
+
+function icsDate(ms: number): string {
+  return new Date(ms).toISOString().replace(/[-:]/g, '').replace(/\.\d{3}/, '');
+}
+
+export interface CalendarInvite {
+  uid: string;
+  /** Times in ms since the epoch. */
+  now: number;
+  startsAt: number;
+  durationMinutes: number;
+  summary: string;
+  link: string;
+  /** The guest has a passcode. It is never put in the calendar file: calendars sync widely. */
+  passcode: boolean;
+  organizer: { name?: string; address: string };
+  attendee: string;
+}
+
+/** A METHOD:REQUEST calendar invite for one attendee. Holds the link, never the code. */
+export function buildInviteIcs(inv: CalendarInvite): string {
+  const description = `Join: ${inv.link}` + (inv.passcode ? '\nYour passcode is in the invitation email.' : '');
+  const organizerCn = inv.organizer.name ? `;CN=${icsParam(inv.organizer.name)}` : '';
+  const lines = [
+    'BEGIN:VCALENDAR',
+    'VERSION:2.0',
+    'PRODID:-//vchat//invite//EN',
+    'CALSCALE:GREGORIAN',
+    'METHOD:REQUEST',
+    'BEGIN:VEVENT',
+    `UID:${inv.uid}`,
+    `DTSTAMP:${icsDate(inv.now)}`,
+    `DTSTART:${icsDate(inv.startsAt)}`,
+    `DTEND:${icsDate(inv.startsAt + inv.durationMinutes * 60_000)}`,
+    `SUMMARY:${icsText(oneLine(inv.summary) || 'Video call')}`,
+    `DESCRIPTION:${icsText(description)}`,
+    `URL:${inv.link}`,
+    `LOCATION:${icsText(inv.link)}`,
+    `ORGANIZER${organizerCn}:mailto:${inv.organizer.address}`,
+    `ATTENDEE;CN=${icsParam(inv.attendee)};RSVP=FALSE;PARTSTAT=NEEDS-ACTION;ROLE=REQ-PARTICIPANT:mailto:${inv.attendee}`,
+    'STATUS:CONFIRMED',
+    'SEQUENCE:0',
+    'BEGIN:VALARM',
+    'ACTION:DISPLAY',
+    'DESCRIPTION:Video call starting',
+    'TRIGGER:-PT10M',
+    'END:VALARM',
+    'END:VEVENT',
+    'END:VCALENDAR',
+  ];
+  return lines.map(icsFold).join('\r\n') + '\r\n';
 }
 
 export interface ResendEnv {
@@ -111,24 +270,34 @@ export interface ResendEnv {
 
 /** Send one email through Resend. Throws a generic error on failure (no provider details). */
 export async function sendEmail(env: ResendEnv, message: EmailMessage): Promise<void> {
-  let res: Response;
-  try {
-    res = await fetch(RESEND_URL, {
-      method: 'POST',
-      headers: { Authorization: `Bearer ${env.RESEND_API_KEY}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        from: env.EMAIL_FROM!.trim(),
-        to: [message.to],
-        subject: message.subject,
-        html: message.html,
-        text: message.text,
-      }),
-      signal: AbortSignal.timeout(RESEND_TIMEOUT_MS),
-    });
-  } catch {
-    throw new Error('Email provider unreachable');
+  const body = JSON.stringify({
+    from: env.EMAIL_FROM!.trim(),
+    to: [message.to],
+    subject: message.subject,
+    html: message.html,
+    text: message.text,
+    ...(message.attachments?.length ? { attachments: message.attachments } : {}),
+  });
+  // Resend rate-limits each account to a few requests per second: one retry after a short pause.
+  for (let attempt = 0; ; attempt++) {
+    let res: Response;
+    try {
+      res = await fetch(RESEND_URL, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${env.RESEND_API_KEY}`, 'Content-Type': 'application/json' },
+        body,
+        signal: AbortSignal.timeout(RESEND_TIMEOUT_MS),
+      });
+    } catch {
+      throw new Error('Email provider unreachable');
+    }
+    // Drain the body without reading it into logs.
+    await res.body?.cancel().catch(() => {});
+    if (res.ok) return;
+    if (res.status === 429 && attempt === 0) {
+      await new Promise((r) => setTimeout(r, RESEND_RETRY_MS));
+      continue;
+    }
+    throw new Error(`Email provider returned ${res.status}`);
   }
-  // Drain the body without reading it into logs.
-  await res.body?.cancel().catch(() => {});
-  if (!res.ok) throw new Error(`Email provider returned ${res.status}`);
 }

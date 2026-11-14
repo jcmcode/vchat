@@ -9,7 +9,8 @@
 //   POST /api/admin/login/verify        -> sets owner session cookie        email sign-in only
 //   POST /api/admin/logout
 //   POST /api/admin/rooms               -> new room + invite/host links     owner only
-//   POST /api/admin/rooms/email-invite  -> emails a per-guest invite + code owner only, Resend configured
+//   POST /api/admin/rooms/email-invite  -> emails personal invites (+ codes, calendar file)  owner only, Resend
+//   POST /api/invite/check              -> checks an invite's passcode/room password before joining  public
 //
 // Modes:
 //   open    — nothing configured at all (local dev), or OPEN_MODE=1; anyone can create rooms
@@ -19,10 +20,20 @@
 // server refuses to run open by accident.
 
 import { verifyAccessJwt } from './access.js';
-import { inviteEmail, isCode, isValidSender, loginCodeEmail, normalizeEmail, randomCode, sendEmail } from './email.js';
+import {
+  buildInviteIcs,
+  inviteEmail,
+  isCode,
+  isValidSender,
+  loginCodeEmail,
+  normalizeEmail,
+  parseSender,
+  randomCode,
+  sendEmail,
+} from './email.js';
 import { getIceServers, turnTtl, type IceEnv } from './ice.js';
 import { isValidRoomId, sliceCodePoints, stripInvisible } from './protocol.js';
-import { AttemptCounter, ipKey, LoginThrottle, passwordAttempts } from './throttle.js';
+import { AttemptCounter, ipKey, LoginThrottle, PASSWORD_WINDOW_MS, passwordAttempts } from './throttle.js';
 import {
   base64UrlEncode,
   hashRoomPassword,
@@ -225,10 +236,10 @@ async function readLimitedText(request: Request, max: number): Promise<string | 
   return new TextDecoder().decode(all);
 }
 
-async function readJson(request: Request): Promise<Record<string, unknown> | null> {
+async function readJson(request: Request, max = MAX_JSON_BODY_BYTES): Promise<Record<string, unknown> | null> {
   if (!(request.headers.get('Content-Type') ?? '').includes('application/json')) return null;
   try {
-    const text = await readLimitedText(request, MAX_JSON_BODY_BYTES);
+    const text = await readLimitedText(request, max);
     if (text === null) return null;
     const body = JSON.parse(text);
     return body && typeof body === 'object' ? (body as Record<string, unknown>) : null;
@@ -286,6 +297,33 @@ const CODES_SENT_PER_WINDOW = 5;
 const VERIFY_ATTEMPTS_PER_CHALLENGE = 5;
 const INVITE_WINDOW_MS = 60 * 60 * 1000;
 const INVITES_PER_WINDOW = 30;
+/** Recipients per email-invite request (each one is a separate email and counts against the cap). */
+const MAX_INVITE_RECIPIENTS = 20;
+/** Room for 20 addresses plus the invite token, key and schedule (Node reads at most 16 KB). */
+const INVITE_BODY_MAX_BYTES = 12 * 1024;
+const DAY_MS = 24 * 60 * 60 * 1000;
+
+export interface InviteSchedule {
+  /** Meeting start, ms since the epoch. */
+  startsAt: number;
+  durationMinutes: number;
+}
+
+/** Start from 1 day ago to 400 days ahead; a whole number of minutes from 5 to 1440. */
+export function isValidSchedule(value: unknown, now = Date.now()): value is InviteSchedule {
+  if (!value || typeof value !== 'object') return false;
+  const { startsAt, durationMinutes } = value as Record<string, unknown>;
+  return (
+    typeof startsAt === 'number' &&
+    Number.isFinite(startsAt) &&
+    startsAt >= now - DAY_MS &&
+    startsAt <= now + 400 * DAY_MS &&
+    typeof durationMinutes === 'number' &&
+    Number.isInteger(durationMinutes) &&
+    durationMinutes >= 5 &&
+    durationMinutes <= 1440
+  );
+}
 
 const codeRequests = new AttemptCounter(CODE_WINDOW_MS);
 let codesSent: number[] = [];
@@ -439,6 +477,55 @@ export async function authorizeJoin(
   };
 }
 
+/**
+ * Opaque client id for room-password throttling: HMAC of the client address (IPv6 by /64). The Node
+ * server and the Cloudflare Worker derive the ids they hand to rooms the same way, so the invite
+ * check and joining count against the same budget.
+ */
+export async function throttleClientId(secret: string, ip: string | undefined): Promise<string> {
+  return (await hmacBase64Url(secret, `client:${ipKey(ip)}`)).slice(0, 22);
+}
+
+export interface InviteCheckInput {
+  roomId: string;
+  token: string;
+  code: string;
+}
+
+type GuestInvite = { ok: true; payload: TokenPayload } | { ok: false; error: 'Invalid invite' | 'Invite expired' };
+
+async function verifyGuestInvite(env: ServerEnv, roomId: string, token: string): Promise<GuestInvite> {
+  const result = await verifyToken(env.SECRET_KEY!, token);
+  if (!result.ok) return { ok: false, error: result.reason === 'expired' ? 'Invite expired' : 'Invalid invite' };
+  if (result.payload.role !== 'guest' || result.payload.room !== roomId) return { ok: false, error: 'Invalid invite' };
+  return { ok: true, payload: result.payload };
+}
+
+/**
+ * Checks an invite's code (emailed passcode or room password) without joining. Uses the same
+ * throttle, key (room + client id) and keyed hash as joining, so checking adds no extra guesses and
+ * grants nothing: joining verifies the code again. Must run where joins for the room are throttled
+ * (on Cloudflare: inside the room's Durable Object).
+ */
+export async function checkInviteCode(env: ServerEnv, input: InviteCheckInput, opts: { clientId?: string } = {}): Promise<Response> {
+  const config = resolveConfig(env);
+  if (config.error) return json({ error: 'Server misconfigured' }, { status: 503 });
+  if (config.mode !== 'private') return json({ error: 'Invalid invite' }, { status: 400 });
+  const invite = await verifyGuestInvite(env, input.roomId, input.token);
+  if (!invite.ok) return json({ error: invite.error }, { status: 400 });
+  const p = invite.payload;
+  if (!p.pw) return json({ ok: true, required: false });
+  // An empty code is never a guess (and costs nothing), like joining without a password.
+  if (!input.code) return json({ error: 'Wrong code' }, { status: 401 });
+  if (!passwordAttempts.take(input.roomId, opts.clientId)) {
+    return json({ error: 'Too many attempts' }, { status: 429, headers: { 'Retry-After': String(Math.ceil(PASSWORD_WINDOW_MS / 1000)) } });
+  }
+  const attempt = await hashRoomPassword(env.SECRET_KEY!, input.roomId, input.code);
+  if (!safeEqual(attempt, p.pw)) return json({ error: 'Wrong code' }, { status: 401 });
+  passwordAttempts.refund(input.roomId, opts.clientId);
+  return json({ ok: true, required: true });
+}
+
 // ── WebSocket gate ───────────────────────────────────────────────────────────
 // Browsers send the invite/host token as a WebSocket subprotocol ("vchat.t.<token>") next to the
 // protocol name "vchat.v1". Unlike a URL parameter, that never ends up in request logs. In private
@@ -492,6 +579,12 @@ export interface ApiOptions {
    * ctx.waitUntil. Without it the promise just runs on (fine on Node).
    */
   waitUntil?: (promise: Promise<unknown>) => void;
+  /**
+   * Where the room-password throttle for joins lives elsewhere (Cloudflare: one Durable Object per
+   * room), run the invite code check there instead of here. Called only for a valid guest token that
+   * has a code. Without it, the check runs in this process with `throttleClientId(clientIp)`.
+   */
+  checkInvite?: (input: InviteCheckInput) => Promise<Response>;
 }
 
 /** Handles /api/* requests. Returns null for any other path. */
@@ -668,50 +761,129 @@ export async function handleApi(request: Request, env: ServerEnv, opts: ApiOptio
       if (!(await getAdmin(request, env, config))) return json({ error: 'Not signed in' }, { status: 401 });
       if (!publicConfig(config, env).emailInvites) return json({ error: 'Email is not configured on this server' }, { status: 503 });
 
-      const body = await readJson(request);
-      const email = normalizeEmail(body?.email);
+      const body = await readJson(request, INVITE_BODY_MAX_BYTES);
       const roomId = body?.roomId;
       const inviteToken = body?.inviteToken;
-      if (!body || !email || !isValidRoomId(roomId) || typeof inviteToken !== 'string') {
-        return json({ error: 'Enter a valid email address' }, { status: 400 });
+      if (!body || !isValidRoomId(roomId) || typeof inviteToken !== 'string') {
+        return json({ error: 'Invalid request' }, { status: 400 });
       }
+
+      // Recipients: `emails` (or the older single `email`), trimmed, lowercased and deduplicated.
+      const raw: unknown[] = Array.isArray(body.emails) ? body.emails : body.email !== undefined ? [body.email] : [];
+      const failed: { email: string; reason: 'invalid' | 'rate-limited' | 'send-failed' }[] = [];
+      const recipients: string[] = [];
+      const seen = new Set<string>();
+      for (const item of raw) {
+        const entry = typeof item === 'string' ? item.trim().toLowerCase() : '';
+        if (typeof item === 'string' && !entry) continue; // blank line: ignore
+        if (seen.has(entry)) continue;
+        seen.add(entry);
+        if (seen.size > MAX_INVITE_RECIPIENTS) {
+          return json({ error: `Up to ${MAX_INVITE_RECIPIENTS} addresses at a time` }, { status: 400 });
+        }
+        const email = normalizeEmail(entry);
+        if (email) recipients.push(email);
+        else failed.push({ email: entry.slice(0, 254), reason: 'invalid' });
+      }
+      if (recipients.length === 0) return json({ error: 'Enter a valid email address' }, { status: 400 });
+
       const key = typeof body.key === 'string' && E2E_KEY_RE.test(body.key) ? body.key : null;
       const source = await verifyToken(env.SECRET_KEY!, inviteToken);
       const p = source.ok ? source.payload : null;
       if (!p || p.role !== 'guest' || p.room !== roomId) return json({ error: 'Invalid or expired invite' }, { status: 400 });
 
+      // Without a passcode the host must admit each guest from the lobby.
+      const passcode = body.passcode !== false;
       const now = Date.now();
-      const cap = underCap(invitesSent, INVITE_WINDOW_MS, INVITES_PER_WINDOW, now);
-      invitesSent = cap.list;
-      if (!cap.ok) {
-        return json({ error: 'Too many invites sent. Try again later.' }, { status: 429, headers: { 'Retry-After': String(cap.retryAfter) } });
+      const warnings: string[] = [];
+      let schedule: InviteSchedule | null = null;
+      if (body.schedule !== undefined && body.schedule !== null) {
+        if (isValidSchedule(body.schedule, now)) {
+          schedule = { startsAt: body.schedule.startsAt, durationMinutes: body.schedule.durationMinutes };
+          if (schedule.startsAt + schedule.durationMinutes * 60_000 > p.exp * 1000) warnings.push('meeting-ends-after-invite-expires');
+        } else {
+          warnings.push('schedule-ignored');
+        }
       }
 
-      // A fresh token for this person: same room, expiry, approval and label; their own code as the
-      // password (replacing any room password); and who it was sent to, for the host to see.
-      const code = randomCode();
       const secret = env.SECRET_KEY!;
-      const token = await signToken(secret, {
-        role: 'guest',
-        room: roomId,
-        exp: p.exp,
-        approval: !!p.approval,
-        ...(p.label ? { label: p.label } : {}),
-        pw: await hashRoomPassword(secret, roomId, code),
-        to: email,
-      });
       const origin = new URL(request.headers.get('Origin')!).origin;
-      const link = `${origin}/room/${roomId}#invite=${token}${key ? `&k=${key}` : ''}`;
+      const host = new URL(origin).hostname;
+      const organizer = parseSender(env.EMAIL_FROM!);
+      const sent: string[] = [];
+      let retryAfter = 0;
 
-      invitesSent.push(now);
-      try {
-        await sendEmail(env, inviteEmail(email, { link, code, label: p.label, exp: p.exp }));
-      } catch (err) {
-        invitesSent.pop();
-        console.error('Invite email failed:', err instanceof Error ? err.message : 'unknown error');
-        return json({ error: 'Could not send the email. Try again later.' }, { status: 502 });
+      // One email per recipient (nobody sees anyone else's address), each counted against the cap.
+      for (let i = 0; i < recipients.length; i++) {
+        const email = recipients[i];
+        const cap = underCap(invitesSent, INVITE_WINDOW_MS, INVITES_PER_WINDOW, Date.now());
+        invitesSent = cap.list;
+        if (!cap.ok) {
+          retryAfter = cap.retryAfter;
+          for (const rest of recipients.slice(i)) failed.push({ email: rest, reason: 'rate-limited' });
+          break;
+        }
+        // A fresh token for this person: same room, expiry and label; who it was sent to (for the
+        // host to see); and either their own code as the password (replacing any room password, and
+        // keeping the room's approval setting) or no password and approval forced on.
+        const code = passcode ? randomCode() : undefined;
+        const token = await signToken(secret, {
+          role: 'guest',
+          room: roomId,
+          exp: p.exp,
+          approval: passcode ? !!p.approval : true,
+          ...(p.label ? { label: p.label } : {}),
+          ...(code ? { pw: await hashRoomPassword(secret, roomId, code) } : {}),
+          to: email,
+        });
+        const link = `${origin}/room/${roomId}#invite=${token}${key ? `&k=${key}` : ''}`;
+        const ics = schedule
+          ? buildInviteIcs({
+              uid: `${randomB64(18)}@${host}`,
+              now: Date.now(),
+              startsAt: schedule.startsAt,
+              durationMinutes: schedule.durationMinutes,
+              summary: p.label || 'Video call',
+              link,
+              passcode,
+              organizer,
+              attendee: email,
+            })
+          : undefined;
+
+        const stamp = Date.now();
+        invitesSent.push(stamp);
+        try {
+          await sendEmail(env, inviteEmail(email, { link, code, label: p.label, exp: p.exp, ...(schedule ? { schedule, ics } : {}) }));
+          sent.push(email);
+        } catch (err) {
+          const at = invitesSent.lastIndexOf(stamp);
+          if (at >= 0) invitesSent.splice(at, 1); // nothing was delivered: don't count it
+          console.error('Invite email failed:', err instanceof Error ? err.message : 'unknown error');
+          failed.push({ email, reason: 'send-failed' });
+        }
       }
-      return json({ ok: true, expiresAt: p.exp * 1000 });
+      return json(
+        { ok: true, sent, failed, expiresAt: p.exp * 1000, warnings },
+        retryAfter ? { headers: { 'Retry-After': String(retryAfter) } } : {}
+      );
+    }
+
+    case 'POST /api/invite/check': {
+      if (!sameOrigin(request)) return json({ error: 'Bad origin' }, { status: 403 });
+      if (config.error) return json({ error: 'Server misconfigured' }, { status: 503 });
+      if (config.mode !== 'private') return json({ error: 'Invalid invite' }, { status: 400 });
+      const body = await readJson(request);
+      const roomId = body?.roomId;
+      const token = body?.token;
+      if (!isValidRoomId(roomId) || typeof token !== 'string') return json({ error: 'Invalid invite' }, { status: 400 });
+      const input: InviteCheckInput = { roomId, token, code: typeof body?.code === 'string' ? body.code : '' };
+      // Cheap checks here; the throttled comparison runs where joins for this room are throttled.
+      const invite = await verifyGuestInvite(env, roomId, token);
+      if (!invite.ok) return json({ error: invite.error }, { status: 400 });
+      if (!invite.payload.pw) return json({ ok: true, required: false });
+      if (opts.checkInvite) return opts.checkInvite(input);
+      return checkInviteCode(env, input, { clientId: await throttleClientId(env.SECRET_KEY!, opts.clientIp) });
     }
 
     default:

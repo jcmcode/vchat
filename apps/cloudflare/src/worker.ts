@@ -4,14 +4,15 @@
 //
 //   WS  /ws?room=<id>  -> SignalingRoom Durable Object for that room
 //   /api/*             -> shared API (core/api.ts): config, ICE servers, owner sign-in, invites
+//                         (POST /api/invite/check is finished in the room's Durable Object)
 //
 // Owner sign-in: Cloudflare Access (CF_ACCESS_TEAM_DOMAIN + CF_ACCESS_AUD), an emailed code
 // (OWNER_EMAIL + RESEND_API_KEY + EMAIL_FROM) or ADMIN_PASSWORD.
 // Either one also requires SECRET_KEY. With nothing configured (or OPEN_MODE=1), the app runs in
 // open mode; anything in between is reported as a configuration error.
 
-import { authorizeSocket, handleApi, hmacBase64Url, ipKey, isValidRoomId, resolveConfig } from '@vchat/signaling-server/core';
-import { CLIENT_HEADER, type Env } from './env.ts';
+import { authorizeSocket, handleApi, isValidRoomId, resolveConfig, throttleClientId } from '@vchat/signaling-server/core';
+import { CLIENT_HEADER, INVITE_CHECK_PATH, type Env } from './env.ts';
 
 export { SignalingRoom } from './room.ts';
 
@@ -64,8 +65,7 @@ function text(body: string, status: number): Response {
  * (Open mode has no secret; the fixed key there only keeps the id consistent across isolates.)
  */
 async function clientId(request: Request, env: Env): Promise<string> {
-  const ip = request.headers.get('CF-Connecting-IP');
-  return (await hmacBase64Url(env.SECRET_KEY || 'vchat-open-mode', `client:${ipKey(ip)}`)).slice(0, 22);
+  return throttleClientId(env.SECRET_KEY || 'vchat-open-mode', request.headers.get('CF-Connecting-IP') ?? undefined);
 }
 
 let loggedConfigError = false;
@@ -123,6 +123,20 @@ export default {
         clientIp: request.headers.get('CF-Connecting-IP') ?? undefined,
         // Sign-in code emails are sent after the response (same timing for every address).
         waitUntil: (p) => ctx.waitUntil(p),
+        // Invite code checks run in the room's Durable Object, against the same guess throttle
+        // (room + client id) as joining.
+        checkInvite: async (input) => {
+          const stub = env.ROOMS.get(env.ROOMS.idFromName(input.roomId));
+          const internal = new URL(INVITE_CHECK_PATH, request.url);
+          internal.searchParams.set('room', input.roomId);
+          return stub.fetch(
+            new Request(internal, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json', [CLIENT_HEADER]: await clientId(request, env) },
+              body: JSON.stringify(input),
+            })
+          );
+        },
       });
       if (response) {
         const res = secure(response);
