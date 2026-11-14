@@ -36,9 +36,8 @@
     align-items: center;
     padding: 4px 6px;
     border-radius: var(--radius-pill);
-    background: rgba(11, 13, 18, 0.62);
-    -webkit-backdrop-filter: blur(6px);
-    backdrop-filter: blur(6px);
+    /* Solid, not backdrop-filter: a blur over playing video is recomputed every frame, per tile. */
+    background: rgba(11, 13, 18, 0.78);
     /* Purely informational: never in the way of tapping the tile or drawing on a shared screen. */
     pointer-events: none;
   }

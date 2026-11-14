@@ -100,3 +100,21 @@ test('Enter continues and ends lists', async () => {
   assert.equal(e.text, '9. nine\n10. ');
   assert.equal(continueList('plain', 5), null);
 });
+
+test('a huge unbroken word is wrapped in linear time (no per-character re-measuring)', () => {
+  let calls = 0;
+  let chars = 0;
+  const counting: Measure = (text, size) => {
+    calls++;
+    chars += text.length;
+    return text.length * size * 0.6;
+  };
+  const word = 'x'.repeat(4000) + 'y'.repeat(4000);
+  const l = layoutRichText(parseRichText(word), 10, 200, counting);
+  // Every character lands on some line, in order.
+  assert.equal(l.lines.flatMap((line) => line.segments.map((s) => s.text)).join(''), word);
+  assert.ok(l.lines.every((line) => line.segments.reduce((w, s) => w + s.width, 0) <= 200 + 1e-9));
+  // The word is measured once whole and each distinct character once: not once per character.
+  assert.ok(calls <= 4, `measure called ${calls} times`);
+  assert.ok(chars <= word.length + 2, `measured ${chars} characters`);
+});

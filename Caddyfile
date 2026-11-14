@@ -48,6 +48,9 @@ import turn-tls-{$TURN_TLS}/site*.caddy
 
 	handle {
 		root * /srv/web
+		encode zstd gzip
+		# Content-hashed scripts and styles never change under the same name.
+		header /_app/immutable/* Cache-Control "public, max-age=31536000, immutable"
 		# Pages are never kept in the browser's HTTP cache, so no copy stored under a room's address
 		# outlives the call. (Scripts and styles under /_app/ are content-hashed and stay cacheable.)
 		@pages path / /room/* /admin /admin/*

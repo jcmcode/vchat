@@ -8,6 +8,7 @@
   import { raisedHands } from '$lib/collab/hands';
   import Icon from '$lib/ui/Icon.svelte';
   import TileQuality from './TileQuality.svelte';
+  import { cameraView } from '$lib/webrtc/view-size';
 
   export let peerConnection: PeerConnection;
   export let speaking = false;
@@ -74,6 +75,7 @@
 <!-- svelte-ignore a11y-no-noninteractive-tabindex -->
 <div
   class="tile"
+  use:cameraView={{ peerId: peerConnection.id, fit: contain ? 'contain' : 'cover', enabled: !screen }}
   class:speaking
   class:contain
   class:selectable
@@ -220,9 +222,8 @@
     gap: 6px;
     padding: 3px 10px;
     border-radius: var(--radius-pill);
-    background: rgba(11, 13, 18, 0.62);
-    -webkit-backdrop-filter: blur(6px);
-    backdrop-filter: blur(6px);
+    /* Solid, not backdrop-filter: a blur over playing video is recomputed every frame, per tile. */
+    background: rgba(11, 13, 18, 0.78);
     color: #fff;
     font-size: var(--text-xs);
     font-weight: 500;

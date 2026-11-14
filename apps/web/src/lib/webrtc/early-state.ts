@@ -1,4 +1,5 @@
-// State that arrives before we trust a connection.
+// State that arrives before we trust a connection (screen and media state, what their version
+// supports, and how they show our camera).
 //
 // Each side opens the trust gate when *it* has checked the other's proof, so one side can be
 // trusted a moment before the other. The side that's ahead sends its current state straight away
@@ -10,11 +11,16 @@
 //
 // Pure, so it's unit-testable.
 
+import { parseView } from '../media/quality.js';
 import { isValidMid } from './media-slots.js';
 
 export type EarlyState =
   | { type: 'screen-state'; sharing: boolean; mid?: string }
-  | { type: 'media-state'; audio: boolean; video: boolean };
+  | { type: 'media-state'; audio: boolean; video: boolean }
+  /** What their version supports (ice-recovery.ts). */
+  | { type: 'caps'; iceRestart: boolean }
+  /** How they show our camera (quality.ts parseView): copied as validated. */
+  | { type: 'view'; w?: number; h?: number; fit?: 'cover' | 'contain'; full?: true };
 
 /** A validated copy of a state message worth keeping until trust, or null for anything else. */
 export function earlyState(msg: unknown): EarlyState | null {
@@ -25,6 +31,14 @@ export function earlyState(msg: unknown): EarlyState | null {
     return sharing && isValidMid(m.mid) ? { type: 'screen-state', sharing, mid: m.mid } : { type: 'screen-state', sharing };
   }
   if (m.type === 'media-state') return { type: 'media-state', audio: m.audio !== false, video: m.video !== false };
+  if (m.type === 'caps') return { type: 'caps', iceRestart: m.iceRestart === true };
+  if (m.type === 'view') {
+    const view = parseView(m);
+    if (!view) return null;
+    if (view.kind === 'full') return { type: 'view', full: true };
+    if (view.kind === 'none') return { type: 'view', w: 0, h: 0 };
+    return { type: 'view', w: view.w, h: view.h, fit: view.fit };
+  }
   return null;
 }
 

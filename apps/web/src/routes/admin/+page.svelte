@@ -354,7 +354,7 @@
         {#if !loginChallenge}
           <form class="panel form" on:submit|preventDefault={requestCode}>
             <h2><Icon name="lock" size={18} /> Owner sign in</h2>
-            <p class="muted small-text">We'll email you a 6-digit code.</p>
+            <p class="muted small-text">We'll email you an 8-digit code.</p>
             <label class="sr-only" for="owneremail">Email</label>
             <!-- svelte-ignore a11y-autofocus -->
             <input id="owneremail" class="input" type="email" bind:value={loginEmail} placeholder="you@example.com" autocomplete="email" autofocus />
@@ -367,7 +367,7 @@
           <form class="panel form" on:submit|preventDefault={verifyCode}>
             <h2><Icon name="lock" size={18} /> Enter your code</h2>
             <p class="muted small-text">If {codeSentTo} is the owner's address, a code is on its way. It expires in 10 minutes.</p>
-            <label class="sr-only" for="ownercode">6-digit code</label>
+            <label class="sr-only" for="ownercode">8-digit code</label>
             <!-- svelte-ignore a11y-autofocus -->
             <input
               id="ownercode"
@@ -375,13 +375,13 @@
               type="text"
               inputmode="numeric"
               autocomplete="one-time-code"
-              maxlength="7"
+              maxlength="10"
               bind:value={loginCode}
-              placeholder="123456"
+              placeholder="12345678"
               autofocus
             />
             {#if loginError}<span class="error" role="alert">{loginError}</span>{/if}
-            <button class="btn primary" type="submit" disabled={loginCode.replace(/\D/g, '').length !== 6 || loggingIn}>
+            <button class="btn primary" type="submit" disabled={loginCode.replace(/\D/g, '').length !== 8 || loggingIn}>
               {loggingIn ? 'Checking…' : 'Sign in'}
             </button>
             <button class="link-btn" type="button" on:click={startOver}>Use a different email or send a new code</button>

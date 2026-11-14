@@ -2,6 +2,7 @@
 // can be changed by the host during the call. Shared peer-to-peer; only the host's rename counts.
 
 import { get, writable } from 'svelte/store';
+import { stripInvisible } from '../webrtc/name-key.js';
 import {
   broadcastData,
   getLocalPeerId,
@@ -19,7 +20,8 @@ let renamedHere = false;
 
 function clean(name: unknown): string {
   // eslint-disable-next-line no-control-regex
-  return typeof name === 'string' ? name.replace(/[\u0000-\u001f\u007f]/g, '').trim().slice(0, MAX_ROOM_NAME) : '';
+  // Also strips direction overrides and invisible characters (they could disguise the name).
+  return typeof name === 'string' ? Array.from(stripInvisible(name).replace(/[\u0000-\u001f\u007f]/g, '').trim()).slice(0, MAX_ROOM_NAME).join('') : '';
 }
 
 registerDataHandler('room-name', (fromPeerId, msg) => {

@@ -763,3 +763,40 @@ test('lock: a waiting guest re-entering with a second (no-approval) invite goes 
   assert.equal(room.waiting().length, 1);
 });
 
+
+// ── Removal vs. signaling blips ───────────────────────────────────────────────
+
+test('remove: peers are told the person was removed (so they cut the direct connection at once)', async () => {
+  const { room, h } = await privateRoom();
+  const a = new Conn('a');
+  const b = new Conn('b');
+  await room.enter(a, who('a'), GUEST_OPEN);
+  await room.enter(b, who('b'), GUEST_OPEN);
+  room.removePeer(h, 'a');
+  assert.deepEqual(b.last('peer-left'), { type: 'peer-left', peerId: 'a', displayName: 'a', reason: 'removed' });
+  assert.deepEqual(h.last('peer-left'), { type: 'peer-left', peerId: 'a', displayName: 'a', reason: 'removed' });
+});
+
+test('remove: an ordinary leave or socket drop carries no reason (peers may keep a working connection briefly)', async () => {
+  const { room, h } = await privateRoom();
+  const a = new Conn('a');
+  await room.enter(a, who('a'), GUEST_OPEN);
+  room.leave(a);
+  assert.deepEqual(h.last('peer-left'), { type: 'peer-left', peerId: 'a', displayName: 'a' });
+});
+
+test('remove: someone removed while offline is announced too, so a connection kept through their blip is cut', async () => {
+  const { room, h } = await privateRoom();
+  const a = new Conn('a');
+  const b = new Conn('b');
+  await room.enter(a, who('a'), GUEST_OPEN);
+  await room.enter(b, who('b'), GUEST_OPEN);
+  room.leave(a); // their socket dropped; they're still in the admitted list
+  b.inbox.length = 0;
+  room.removePeer(h, 'a');
+  assert.deepEqual(b.inbox, [{ type: 'peer-left', peerId: 'a', reason: 'removed' }]);
+  // And they can't come back.
+  const again = new Conn('a2');
+  await room.enter(again, who('a'), GUEST_OPEN);
+  assert.equal(again.last().type, 'removed');
+});

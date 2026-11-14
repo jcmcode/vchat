@@ -19,6 +19,63 @@ function releaseContext(): void {
   }
 }
 
+/** Speaking starts after this many loud checks in a row, and stops after this many quiet ones. */
+export const SPEAKING_ON_CHECKS = 2;
+export const SPEAKING_OFF_CHECKS = 6;
+/** How often every detector is checked (one shared timer, not an animation loop per person). */
+const SPEAKING_CHECK_MS = 75;
+
+export interface SpeakingState {
+  on: boolean;
+  /** Loud checks in a row. */
+  above: number;
+  /** Quiet checks in a row. */
+  below: number;
+}
+
+/**
+ * One check of a detector, with hysteresis: the speaking ring doesn't flicker between syllables
+ * (each flip repaints the tiles), and a click or a breath doesn't light it up. Returns the new state.
+ */
+export function nextSpeaking(state: SpeakingState, loud: boolean): boolean {
+  if (loud) {
+    state.above = Math.min(state.above + 1, SPEAKING_ON_CHECKS);
+    state.below = 0;
+  } else {
+    state.below = Math.min(state.below + 1, SPEAKING_OFF_CHECKS);
+    state.above = 0;
+  }
+  if (!state.on && state.above >= SPEAKING_ON_CHECKS) state.on = true;
+  else if (state.on && state.below >= SPEAKING_OFF_CHECKS) state.on = false;
+  return state.on;
+}
+
+interface Detector {
+  analyser: AnalyserNode;
+  samples: Float32Array<ArrayBuffer>;
+  threshold: number;
+  state: SpeakingState;
+  onSpeaking: (isSpeaking: boolean) => void;
+}
+
+const detectors = new Set<Detector>();
+let checkTimer: ReturnType<typeof setInterval> | null = null;
+
+function checkDetectors(): void {
+  for (const d of detectors) {
+    d.analyser.getFloatTimeDomainData(d.samples);
+    let sum = 0;
+    for (let i = 0; i < d.samples.length; i++) sum += d.samples[i] * d.samples[i];
+    const was = d.state.on;
+    if (nextSpeaking(d.state, Math.sqrt(sum / d.samples.length) > d.threshold) !== was) d.onSpeaking(d.state.on);
+  }
+}
+
+/**
+ * Calls `onSpeaking(true/false)` when the stream starts or stops carrying speech. All detectors share
+ * one timer, which (unlike requestAnimationFrame) keeps running while the tab is hidden, e.g. with
+ * the call popped out into picture-in-picture.
+ */
 export function createSpeakingDetector(
   stream: MediaStream,
   onSpeaking: (isSpeaking: boolean) => void,
@@ -33,34 +90,28 @@ export function createSpeakingDetector(
     return () => {};
   }
   const analyser = audioContext.createAnalyser();
-  analyser.fftSize = 512;
-  analyser.smoothingTimeConstant = 0.4;
+  analyser.fftSize = 2048; // ~43 ms of audio per check at 48 kHz
   source.connect(analyser);
 
-  const dataArray = new Float32Array(analyser.fftSize);
-  let wasSpeaking = false;
-  let animFrameId = 0;
+  const detector: Detector = {
+    analyser,
+    samples: new Float32Array(analyser.fftSize),
+    threshold,
+    state: { on: false, above: 0, below: 0 },
+    onSpeaking,
+  };
+  detectors.add(detector);
+  checkTimer ??= setInterval(checkDetectors, SPEAKING_CHECK_MS);
+
   let stopped = false;
-
-  function check() {
-    if (stopped) return;
-    analyser.getFloatTimeDomainData(dataArray);
-    let sum = 0;
-    for (let i = 0; i < dataArray.length; i++) sum += dataArray[i] * dataArray[i];
-    const isSpeaking = Math.sqrt(sum / dataArray.length) > threshold;
-    if (isSpeaking !== wasSpeaking) {
-      wasSpeaking = isSpeaking;
-      onSpeaking(isSpeaking);
-    }
-    animFrameId = requestAnimationFrame(check);
-  }
-
-  check();
-
   return () => {
     if (stopped) return;
     stopped = true;
-    cancelAnimationFrame(animFrameId);
+    detectors.delete(detector);
+    if (detectors.size === 0 && checkTimer) {
+      clearInterval(checkTimer);
+      checkTimer = null;
+    }
     source.disconnect();
     analyser.disconnect();
     releaseContext();

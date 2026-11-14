@@ -114,7 +114,7 @@ To test locally with the real Workers runtime: `pnpm cf:dev` (http://localhost:8
 
 Optional, on either deployment. With [Resend](https://resend.com) set up:
 
-- **Owner sign-in by email** (when `OWNER_EMAIL` is set): at `/admin` you enter your address and get a 6-digit code by email, valid for 10 minutes. There's no password to leak. Anyone can ask for a code, but only your address ever receives one, and the page answers the same way for every address.
+- **Owner sign-in by email** (when `OWNER_EMAIL` is set): at `/admin` you enter your address and get an 8-digit code by email, valid for 10 minutes. There's no password to leak. Anyone can ask for a code, but only your address ever receives one, and the page answers the same way for every address.
 - **Emailed invites** (whenever Resend is configured in private mode): from the dashboard, enter up to 20 guest addresses. Each guest gets their own email (nobody sees the other addresses) with a "Join the call" link and, by default, a 6-digit code that is theirs alone; they need both to get in. You then admit them as usual, and you see which address each invite was sent to. A forwarded link is useless without the code, and you can still deny or remove anyone.
   - **No passcode:** turn the code off and guests just open the link and enter their name. They always wait in the lobby until you let them in, so you decide who joins.
   - **Calendar invites:** give a date, time and length, and each email shows the time (in UTC) and carries a calendar invite (`invite.ics`) that adds the call to the guest's calendar, with a reminder 10 minutes before. If the invite has a passcode, the calendar event shows it too, next to the link.
@@ -218,7 +218,7 @@ The same settings work on every backend (Node environment variables or Cloudflar
 |---|---|
 | `SECRET_KEY` | Signs invite links and owner sessions. 32+ random characters; keep it stable. **Required for private mode** (and setting it means you want private mode) |
 | `CF_ACCESS_TEAM_DOMAIN` + `CF_ACCESS_AUD` | Owner signs in with Cloudflare Access |
-| `OWNER_EMAIL` | Owner signs in with a 6-digit code emailed to this address. Needs `RESEND_API_KEY` + `EMAIL_FROM`. Used instead of `ADMIN_PASSWORD` if both are set |
+| `OWNER_EMAIL` | Owner signs in with an 8-digit code emailed to this address. Needs `RESEND_API_KEY` + `EMAIL_FROM`. Used instead of `ADMIN_PASSWORD` if both are set |
 | `ADMIN_PASSWORD` | Owner signs in with a password (used if neither Access nor `OWNER_EMAIL` is configured) |
 | `RESEND_API_KEY` + `EMAIL_FROM` | Send email through Resend: sign-in codes and per-guest invites. `EMAIL_FROM` is `you@example.com` or `Name <you@example.com>` on a domain verified in Resend |
 | `CF_TURN_KEY_ID` + `CF_TURN_API_TOKEN` | Relay via Cloudflare Realtime TURN |

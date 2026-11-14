@@ -285,10 +285,22 @@ export function switchVideoDevice(deviceId: string): Promise<MediaStreamTrack | 
 
 export async function startScreenShare(): Promise<MediaStream | null> {
   try {
+    // Ask for the shared tab's or screen's sound too. Whether it comes is up to the browser and
+    // the picker ("Also share tab audio"): tabs in Chrome/Edge, the whole screen on some systems,
+    // never a single window. It's sent as it is (no voice processing, which mangles music and
+    // video sound). The options TypeScript doesn't know yet are hints that browsers without them
+    // ignore: offer system sound for a whole screen, but leave this call's own sound out of it,
+    // so the people in the call don't hear themselves back.
     const stream = await navigator.mediaDevices.getDisplayMedia({
       video: { frameRate: { ideal: 30 } },
-      audio: true,
-    });
+      audio: {
+        echoCancellation: false,
+        noiseSuppression: false,
+        autoGainControl: false,
+        restrictOwnAudio: true,
+      } as MediaTrackConstraints,
+      systemAudio: 'include',
+    } as DisplayMediaStreamOptions);
 
     const video = stream.getVideoTracks()[0];
     // Tell the encoder this is screen content: keep text sharp and let the frame rate give way.

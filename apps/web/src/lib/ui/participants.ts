@@ -3,11 +3,13 @@
 
 import { pickPresenter } from '../webrtc/media-slots.js';
 
-export type StageKind = 'whiteboard' | 'local-screen' | 'remote-screen' | 'pinned';
+export type StageKind = 'whiteboard' | 'games' | 'local-screen' | 'remote-screen' | 'pinned';
 
 export interface StageInput {
   /** You opened the whiteboard. */
   whiteboardOpen: boolean;
+  /** You opened the games view. */
+  gamesOpen?: boolean;
   /** You are sharing your screen. */
   localSharing: boolean;
   /** Remote participants who say they're sharing their screen (oldest first). */
@@ -29,7 +31,7 @@ export interface StageLayout {
 }
 
 /**
- * What takes the big stage, in order: the whiteboard (if you opened it), your own screen share,
+ * What takes the big stage, in order: the whiteboard or the games view (if you opened it), your own screen share,
  * the person you pinned (their screen, if it's arriving), then the latest remote screen that's
  * actually arriving (pickPresenter, so a bare claim can't take the stage). Your pin outranks other
  * people's shares; while it does, `otherSharer` names the presenter you can switch to. A pin for
@@ -38,6 +40,7 @@ export interface StageLayout {
 export function selectStage(input: StageInput): StageLayout {
   const none = { stagePeerId: null, otherSharer: null };
   if (input.whiteboardOpen) return { stage: 'whiteboard', ...none };
+  if (input.gamesOpen) return { stage: 'games', ...none };
   if (input.localSharing) return { stage: 'local-screen', ...none };
   const present = new Set(input.peerIds);
   const sharers = [...input.sharingPeers];
