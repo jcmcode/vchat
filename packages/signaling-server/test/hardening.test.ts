@@ -248,7 +248,7 @@ test('config: SECRET_KEY without owner sign-in is an error; OPEN_MODE=1 opts in;
 test('config: /api/config and /api/admin/session never leak error text', async () => {
   const bad: ServerEnv = { SECRET_KEY: SECRET };
   const cfg = await (await handleApi(new Request('https://x.test/api/config'), bad))!.json();
-  assert.deepEqual(cfg, { mode: 'private', auth: null, misconfigured: true });
+  assert.deepEqual(cfg, { mode: 'private', auth: null, misconfigured: true, emailInvites: false });
   const session = (await (await handleApi(new Request('https://x.test/api/admin/session'), bad))!.json()) as Record<string, unknown>;
   assert.equal(session.misconfigured, true);
   assert.equal(session.authenticated, false);
@@ -443,4 +443,269 @@ test('TURN: ICE endpoint takes host/guest tokens only, and never caches coturn c
   const second = (await (await ice(invite))!.json()) as { iceServers: { username?: string }[] };
   assert.notEqual(first.iceServers.find((s) => s.username)?.username, second.iceServers.find((s) => s.username)?.username);
   assert.ok(first.ttl <= 600);
+});
+
+// ── Email sign-in and emailed invites (Resend) ────────────────────────────────
+
+const RESEND = { RESEND_API_KEY: 're_test_key', EMAIL_FROM: 'vchat <invites@example.com>' };
+const emailEnv: ServerEnv = { SECRET_KEY: SECRET, OWNER_EMAIL: 'Owner@Example.com', ...RESEND };
+const SITE = 'https://call.example.com';
+
+function post(path: string, body: unknown, cookie?: string) {
+  return new Request(`${SITE}${path}`, {
+    method: 'POST',
+    headers: { Origin: SITE, Host: 'call.example.com', 'Content-Type': 'application/json', ...(cookie ? { Cookie: cookie } : {}) },
+    body: JSON.stringify(body),
+  });
+}
+
+/** Stub Resend: records each payload; `fail` makes it answer 500. */
+function stubResend(fail = false) {
+  const calls: { url: string; auth: string | null; body: any }[] = [];
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    calls.push({ url: String(input), auth: new Headers(init?.headers).get('Authorization'), body: JSON.parse(String(init?.body)) });
+    return new Response(fail ? '{"message":"provider detail"}' : '{"id":"x"}', { status: fail ? 500 : 200 });
+  }) as typeof fetch;
+  return { calls, restore: () => (globalThis.fetch = realFetch) };
+}
+
+async function requestCode(env: ServerEnv, email: string, ip: string) {
+  const pending: Promise<unknown>[] = [];
+  const res = await handleApi(post('/api/admin/login/code', { email }), env, { clientIp: ip, waitUntil: (p) => pending.push(p) });
+  await Promise.all(pending);
+  return res!;
+}
+
+const codeIn = (text: string) => text.match(/\b(\d{6})\b/)![1];
+
+test('email config: fail-closed cases, precedence, public config', async () => {
+  const err = (e: ServerEnv) => resolveConfig(e).error;
+  assert.ok(err({ SECRET_KEY: SECRET, OWNER_EMAIL: 'o@example.com' })); // no Resend
+  assert.ok(err({ SECRET_KEY: SECRET, OWNER_EMAIL: 'o@example.com', RESEND_API_KEY: 'k' })); // half Resend
+  assert.ok(err({ ...env, EMAIL_FROM: 'vchat <a@b.co>' })); // half Resend, password mode
+  assert.ok(err({ ...emailEnv, OWNER_EMAIL: 'not-an-email' }));
+  assert.ok(err({ ...emailEnv, EMAIL_FROM: 'vchat <nope>' }));
+  assert.ok(err({ OWNER_EMAIL: 'o@example.com', ...RESEND })); // no SECRET_KEY
+  assert.ok(err({ OWNER_EMAIL: '', SECRET_KEY: SECRET })); // empty owner setting: closed, not open
+  assert.deepEqual(resolveConfig(emailEnv), { mode: 'private', auth: 'email' });
+  assert.equal(resolveConfig({ ...emailEnv, ADMIN_PASSWORD: 'short' }).auth, 'email'); // email > password
+  assert.equal(resolveConfig({ ...emailEnv, CF_ACCESS_TEAM_DOMAIN: 't.cloudflareaccess.com', CF_ACCESS_AUD: 'a' }).auth, 'access');
+  assert.equal(resolveConfig({ ...emailEnv, EMAIL_FROM: 'invites@example.com' }).error, undefined);
+
+  const cfg = async (e: ServerEnv) => (await handleApi(new Request(`${SITE}/api/config`), e))!.json();
+  assert.deepEqual(await cfg(emailEnv), { mode: 'private', auth: 'email', misconfigured: false, emailInvites: true });
+  assert.deepEqual(await cfg({ ...env, ...RESEND }), { mode: 'private', auth: 'password', misconfigured: false, emailInvites: true });
+  assert.deepEqual(await cfg(env), { mode: 'private', auth: 'password', misconfigured: false, emailInvites: false });
+  assert.deepEqual(await cfg({ SECRET_KEY: SECRET, OWNER_EMAIL: 'o@example.com' }), {
+    mode: 'private',
+    auth: 'email',
+    misconfigured: true,
+    emailInvites: false,
+  });
+});
+
+test('email sign-in: code emailed to the owner, verifies once, wrong code refused', async () => {
+  const resend = stubResend();
+  try {
+    const res = await requestCode(emailEnv, '  OWNER@example.COM ', '20.0.0.1');
+    assert.equal(res.status, 200);
+    const { challenge } = (await res.json()) as { challenge: string };
+    assert.equal(resend.calls.length, 1);
+    const call = resend.calls[0];
+    assert.equal(call.url, 'https://api.resend.com/emails');
+    assert.equal(call.auth, 'Bearer re_test_key');
+    assert.deepEqual(Object.keys(call.body).sort(), ['from', 'html', 'subject', 'text', 'to']);
+    assert.deepEqual(call.body.to, ['owner@example.com']);
+    assert.equal(call.body.from, 'vchat <invites@example.com>');
+    assert.equal(call.body.subject, 'Your sign-in code');
+    assert.match(call.body.text, /expires in 10 minutes/);
+    assert.match(call.body.text, /If you didn't ask for this, ignore this email\./);
+    assert.ok(!/<img/i.test(call.body.html));
+    const code = codeIn(call.body.text);
+    assert.ok(call.body.html.includes(code));
+
+    const verify = (c: string, ch = challenge) => handleApi(post('/api/admin/login/verify', { challenge: ch, code: c }), emailEnv, { clientIp: '20.0.0.2' });
+    const wrong = await verify(code === '000000' ? '111111' : '000000');
+    assert.equal(wrong!.status, 401);
+    assert.deepEqual(await wrong!.json(), { error: 'Wrong or expired code' });
+
+    const ok = await verify(code);
+    assert.equal(ok!.status, 200);
+    const cookie = ok!.headers.get('Set-Cookie')!.split(';')[0];
+    const session = (await (await handleApi(new Request(`${SITE}/api/admin/session`, { headers: { Cookie: cookie } }), emailEnv))!.json()) as any;
+    assert.equal(session.authenticated, true);
+    assert.equal(session.email, 'owner@example.com');
+    // Changing OWNER_EMAIL signs the session out.
+    const moved = { ...emailEnv, OWNER_EMAIL: 'new@example.com' };
+    assert.equal(((await (await handleApi(new Request(`${SITE}/api/admin/session`, { headers: { Cookie: cookie } }), moved))!.json()) as any).authenticated, false);
+
+    assert.equal((await verify(code))!.status, 401); // single use
+  } finally {
+    resend.restore();
+  }
+});
+
+test('email sign-in: at most 5 tries per challenge', async () => {
+  const resend = stubResend();
+  try {
+    const { challenge } = (await (await requestCode(emailEnv, 'owner@example.com', '21.0.0.1')).json()) as { challenge: string };
+    const code = codeIn(resend.calls[0].body.text);
+    const bad = code === '123456' ? '654321' : '123456';
+    for (let i = 0; i < 5; i++) {
+      assert.equal((await handleApi(post('/api/admin/login/verify', { challenge, code: bad }), emailEnv, { clientIp: `21.0.1.${i}` }))!.status, 401);
+    }
+    assert.equal((await handleApi(post('/api/admin/login/verify', { challenge, code }), emailEnv, { clientIp: '21.0.2.1' }))!.status, 401);
+  } finally {
+    resend.restore();
+  }
+});
+
+test('email sign-in: other addresses get the same answer and nothing is sent', async () => {
+  const resend = stubResend();
+  try {
+    const res = await requestCode(emailEnv, 'stranger@example.com', '22.0.0.1');
+    assert.equal(res.status, 200);
+    const body = (await res.json()) as { challenge: string };
+    assert.deepEqual(Object.keys(body), ['challenge']);
+    assert.equal(resend.calls.length, 0);
+    const p = await verifyToken(SECRET, body.challenge);
+    assert.ok(p.ok && p.payload.role === 'login' && typeof p.payload.c === 'string' && p.payload.c.length === 43);
+    assert.equal((await handleApi(post('/api/admin/login/verify', { challenge: body.challenge, code: '000000' }), emailEnv, { clientIp: '22.0.0.2' }))!.status, 401);
+    // 404 unless email sign-in is the method; same-origin required
+    assert.equal((await handleApi(post('/api/admin/login/code', { email: 'x@y.co' }), env, { clientIp: '22.0.0.3' }))!.status, 404);
+  } finally {
+    resend.restore();
+  }
+});
+
+test('email sign-in: per-address request cap answers the same for owner and stranger', async () => {
+  const resend = stubResend();
+  try {
+    const statuses = async (email: string, ipBase: number) => {
+      const out: number[] = [];
+      for (let i = 0; i < 6; i++) out.push((await requestCode(emailEnv, email, `23.0.${ipBase}.${i}`)).status);
+      return out;
+    };
+    const stranger = await statuses('someone@example.org', 1);
+    assert.deepEqual(stranger, [200, 200, 200, 200, 200, 429]);
+    const owner = (await requestCode(emailEnv, 'owner@example.com', '23.0.9.9')).status;
+    // The owner already used 2 of the 5 sends in earlier tests; either way the cap holds.
+    assert.ok(owner === 200 || owner === 429);
+    assert.ok(resend.calls.length <= 5);
+  } finally {
+    resend.restore();
+  }
+});
+
+test('a login challenge is useless as a session, invite, host or ICE token', async () => {
+  const login = await signToken(SECRET, { role: 'login', room: 'abc', exp: now() + 600, n: 'n', c: 'c' });
+  const session = (await (await handleApi(new Request(`${SITE}/api/admin/session`, { headers: { Cookie: `vchat_admin=${login}` } }), emailEnv))!.json()) as any;
+  assert.equal(session.authenticated, false);
+  assert.deepEqual(await authorizeJoin(emailEnv, { roomId: 'abc', token: login }), { ok: false, error: 'Invalid invite', fatal: true });
+  assert.equal(await authorizeSocket(emailEnv, 'abc', `vchat.v1, vchat.t.${login}`), false);
+  const ice = await handleApi(new Request(`${SITE}/api/ice-servers`, { headers: { 'X-Vchat-Token': login } }), emailEnv);
+  assert.equal(ice!.status, 401);
+  const invite = await handleApi(post('/api/admin/rooms/email-invite', { roomId: 'abc', inviteToken: login, email: 'g@example.com' }), emailEnv);
+  assert.equal(invite!.status, 401); // not signed in either
+});
+
+test('emailed invite: per-guest code, `to` reaches the host, nothing secret in the response', async () => {
+  const pwEnv: ServerEnv = { ...env, ...RESEND };
+  const login = await handleApi(post('/api/admin/login', { password: 'correct horse battery' }), pwEnv, { clientIp: '24.0.0.1' });
+  const cookie = login!.headers.get('Set-Cookie')!.split(';')[0];
+  const created = (await (await handleApi(post('/api/admin/rooms', { label: '<b>Fam & co</b>', password: 'roompw', approval: true }, cookie), pwEnv))!.json()) as {
+    roomId: string;
+    inviteToken: string;
+    expiresAt: number;
+  };
+  const key = 'A'.repeat(43);
+
+  assert.equal((await handleApi(post('/api/admin/rooms/email-invite', { roomId: created.roomId, inviteToken: created.inviteToken, email: 'g@example.com' }), pwEnv))!.status, 401);
+  const bad = await handleApi(post('/api/admin/rooms/email-invite', { roomId: created.roomId, inviteToken: created.inviteToken, email: 'nope' }, cookie), pwEnv);
+  assert.equal(bad!.status, 400);
+  const wrongRoom = await handleApi(post('/api/admin/rooms/email-invite', { roomId: 'zzzzzz', inviteToken: created.inviteToken, email: 'g@example.com' }, cookie), pwEnv);
+  assert.equal(wrongRoom!.status, 400);
+
+  const resend = stubResend();
+  let res: Response;
+  try {
+    res = (await handleApi(
+      post('/api/admin/rooms/email-invite', { roomId: created.roomId, inviteToken: created.inviteToken, email: ' Guest@Example.com ', key }, cookie),
+      pwEnv
+    ))!;
+  } finally {
+    resend.restore();
+  }
+  assert.equal(res.status, 200);
+  const out = (await res.json()) as Record<string, unknown>;
+  assert.deepEqual(out, { ok: true, expiresAt: created.expiresAt });
+
+  const mail = resend.calls[0].body;
+  assert.deepEqual(mail.to, ['guest@example.com']);
+  assert.equal(mail.subject, "You're invited to <b>Fam & co</b>");
+  assert.ok(mail.html.includes('&lt;b&gt;Fam &amp; co&lt;/b&gt;') && !mail.html.includes('<b>Fam'));
+  assert.match(mail.text, /Open the link, enter the code, and the host will let you in\./);
+  assert.match(mail.text, /UTC/);
+  assert.ok(mail.html.includes('Join the call'));
+  const code = codeIn(mail.text.split('Your code:')[1]);
+  const link = mail.text.match(/https:\/\/call\.example\.com\/room\/\S+/)![0];
+  assert.ok(link.startsWith(`${SITE}/room/${created.roomId}#invite=`));
+  assert.ok(link.endsWith(`&k=${key}`));
+  const token = link.split('#invite=')[1].split('&')[0];
+  const p = await verifyToken(SECRET, token);
+  assert.ok(p.ok && p.payload.to === 'guest@example.com' && p.payload.role === 'guest' && p.payload.approval);
+  assert.equal(p.ok && p.payload.exp * 1000, created.expiresAt);
+
+  // The code is this guest's password (the room password no longer works with this token).
+  assert.deepEqual(await authorizeJoin(pwEnv, { roomId: created.roomId, token, password: 'roompw' }, { clientId: 'e1' }), {
+    ok: false,
+    passwordRequired: true,
+    invalid: true,
+  });
+  const good = await authorizeJoin(pwEnv, { roomId: created.roomId, token, password: code }, { clientId: 'e1' });
+  assert.ok(good.ok);
+
+  // …and the host sees who it was sent to.
+  const room = new Room<Conn>(created.roomId, transport);
+  const h = new Conn();
+  await room.enter(h, who('h'), HOST);
+  const g = new Conn();
+  await room.enter(g, who('g'), good.ok ? good.grant : HOST);
+  assert.deepEqual(h.last('admission-request'), { type: 'admission-request', peerId: 'g', displayName: 'g', email: 'guest@example.com' });
+
+  // A bad key is ignored rather than put in the link.
+  const resend2 = stubResend();
+  try {
+    await handleApi(post('/api/admin/rooms/email-invite', { roomId: created.roomId, inviteToken: created.inviteToken, email: 'g2@example.com', key: 'short' }, cookie), pwEnv);
+  } finally {
+    resend2.restore();
+  }
+  assert.ok(!resend2.calls[0].body.text.includes('&k='));
+
+  // Resend failure: generic 502, no provider details.
+  const failing = stubResend(true);
+  let failed: Response;
+  try {
+    failed = (await handleApi(post('/api/admin/rooms/email-invite', { roomId: created.roomId, inviteToken: created.inviteToken, email: 'g3@example.com' }, cookie), pwEnv))!;
+  } finally {
+    failing.restore();
+  }
+  assert.equal(failed.status, 502);
+  assert.ok(!JSON.stringify(await failed.json()).includes('provider detail'));
+
+  // Not configured: 503.
+  const noMail = await handleApi(post('/api/admin/rooms/email-invite', { roomId: created.roomId, inviteToken: created.inviteToken, email: 'g@example.com' }, cookie), env);
+  assert.equal(noMail!.status, 503);
+});
+
+test('sign-in codes are 6 uniform digits', async () => {
+  const { randomCode } = await import('../src/core/index.js');
+  const counts = new Array(10).fill(0);
+  for (let i = 0; i < 5000; i++) {
+    const c = randomCode();
+    assert.match(c, /^\d{6}$/);
+    counts[Number(c[0])]++;
+  }
+  assert.ok(counts.every((n) => n > 350 && n < 650), counts.join());
 });

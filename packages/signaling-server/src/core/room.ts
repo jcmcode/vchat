@@ -28,6 +28,8 @@ export interface MemberState {
   waitingSince?: number;
   /** Private mode only: invited guests can never hold host powers. Undefined in open mode. */
   role?: 'host' | 'guest';
+  /** Emailed invites: the address the invite was sent to (from the signed token). */
+  email?: string;
 }
 
 export interface AdmittedEntry {
@@ -86,6 +88,8 @@ export interface EnterGrant {
   role: 'host' | 'guest';
   /** Guests must be approved by the host before joining. */
   approval: boolean;
+  /** Emailed invites: the verified address, shown to the host in admission-request. */
+  email?: string;
 }
 
 /** Remember at most this many admitted peers (for rejoin-without-approval); oldest are dropped. */
@@ -136,6 +140,11 @@ function randomSalt(): string {
 
 async function hashPassword(salt: string, password: string): Promise<string> {
   return sha256Hex(`room-password:${salt}:${password}`);
+}
+
+/** What the host is told about someone waiting: `email` only for emailed invites. */
+function admissionRequest(s: MemberState): object {
+  return { type: 'admission-request', peerId: s.peerId, displayName: s.displayName, ...(s.email ? { email: s.email } : {}) };
 }
 
 export class Room<C> {
@@ -325,6 +334,7 @@ export class Room<C> {
       status: 'peer',
       secretHash,
       role: grant.role,
+      ...(grant.role === 'guest' && grant.email ? { email: grant.email } : {}),
     };
     if (isHost || isReturning || !grant.approval) {
       this.admit(conn, state);
@@ -337,7 +347,7 @@ export class Room<C> {
     }
     this.setMember(conn, { ...state, status: 'waiting', waitingSince: Date.now() });
     this.send(conn, { type: 'waiting-for-admission', roomId: this.id, hostPresent: !!this.currentHost() });
-    this.notifyHost({ type: 'admission-request', peerId: args.peerId, displayName: state.displayName });
+    this.notifyHost(admissionRequest(state));
     this.log(`${state.displayName} (${args.peerId}) waiting for admission`);
   }
 
@@ -577,7 +587,7 @@ export class Room<C> {
     this.metaChanged();
     this.broadcast({ type: 'host-changed', hostPeerId: peerId });
     for (const [, w] of this.waiting()) {
-      this.notifyHost({ type: 'admission-request', peerId: w.peerId, displayName: w.displayName });
+      this.notifyHost(admissionRequest(w));
     }
   }
 

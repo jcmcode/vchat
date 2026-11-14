@@ -46,7 +46,7 @@ vchat runs in one of two modes, decided by configuration:
 
 | | Private mode | Open mode |
 |---|---|---|
-| Enabled by | `SECRET_KEY` + (`CF_ACCESS_TEAM_DOMAIN`/`CF_ACCESS_AUD` or `ADMIN_PASSWORD`) | Nothing configured at all, or `OPEN_MODE=1` |
+| Enabled by | `SECRET_KEY` + (`CF_ACCESS_TEAM_DOMAIN`/`CF_ACCESS_AUD`, `OWNER_EMAIL` + Resend, or `ADMIN_PASSWORD`) | Nothing configured at all, or `OPEN_MODE=1` |
 | Who creates rooms | Only the signed-in owner (`/admin`) | Anyone, from the home page |
 | Who can join | Holders of a valid invite link (plus password / approval if set) | Anyone with the room code (plus password / approval) |
 | TURN credentials | Only with a valid invite/host token or owner session | Nobody, unless `OPEN_MODE_TURN=1` |
@@ -55,7 +55,11 @@ Any other combination (for example `SECRET_KEY` without an owner sign-in, or an 
 
 **Owner sign-in.** With Cloudflare Access, Access protects `/admin` and `/api/admin` at the edge, and the server independently verifies the `Cf-Access-Jwt-Assertion` JWT (RS256, team certs, audience, issuer, expiry). With `ADMIN_PASSWORD`, `/api/admin/login` sets an `HttpOnly; Secure; SameSite=Strict` session cookie (a signed token, valid 7 days). Logins are throttled: 10 attempts per IP address (IPv6: per /64) per 15 minutes, and above 100 attempts per window across all clients, checks are queued 2 seconds apart. That slows a distributed guesser to a crawl without locking the owner out for the whole window. State-changing requests must come from the same origin. The session cookie is tied to the current password with `HMAC(SECRET_KEY, password)`, so changing `ADMIN_PASSWORD` signs everyone out.
 
-**Invites are stateless.** A token is `base64url(payload).HMAC-SHA256(SECRET_KEY)`, decoded strictly (canonical unpadded base64url only, so a token has exactly one valid spelling). The payload holds the role (`host`/`guest`), room id, expiry, whether approval is needed, an optional label, and an optional room-password hash keyed with `SECRET_KEY`, so the password can't be brute-forced offline from a link. The server stores nothing about rooms or invites. Rotating `SECRET_KEY` revokes every link at once.
+**Email sign-in** (`OWNER_EMAIL`, sent through Resend; precedence is Access > email > password). `POST /api/admin/login/code {email}` always answers `200 {challenge}` for any well-formed address. Only if it is the owner's (trimmed, case-insensitive) is a code emailed, in the background so the response time is the same. The challenge is a signed token (`role: 'login'`, 10-minute expiry) holding a random nonce and `HMAC(SECRET_KEY, nonce + owner address + code)`. For any other address that MAC is random, so the challenge can never verify. The code is 6 crypto-random digits (rejection sampling, no bias). `POST /api/admin/login/verify {challenge, code}` compares in constant time and sets the same session cookie as password sign-in, tied to `HMAC(SECRET_KEY, owner address)` so changing `OWNER_EMAIL` signs sessions out. Limits, in memory and best effort: the login throttle above applies to both endpoints; at most 5 tries per challenge, and a challenge works once; 5 code requests per address per 15 minutes, and 5 codes sent in total per 15 minutes. These caps answer the same way for every address, so the endpoint doesn't reveal which one is the owner's. A `login` token is accepted nowhere else (not as a session, invite, host or ICE token).
+
+**Emailed invites** (private mode with `RESEND_API_KEY` + `EMAIL_FROM`, whatever the sign-in method; `/api/config` shows `emailInvites: true`). The owner posts a room's guest token, a guest address and optionally the room key. The server checks the token, then mints a new guest token with the same room, expiry, approval and label, plus `to: <address>` and a fresh 6-digit code as that token's password (replacing any room password). It emails the guest the link (`/room/<id>#invite=<token>&k=<key>`) and the code, and returns neither. The guest needs both. Code guesses fall under the room-password limits below. When the guest waits for approval, the host's `admission-request` includes `email`, taken from the signed token. Invite emails are capped at 30 per hour per process/isolate.
+
+**Invites are stateless.** A token is `base64url(payload).HMAC-SHA256(SECRET_KEY)`, decoded strictly (canonical unpadded base64url only, so a token has exactly one valid spelling). The payload holds the role (`host`/`guest`), room id, expiry, whether approval is needed, an optional label, an optional room-password hash keyed with `SECRET_KEY` (so the password can't be brute-forced offline from a link), and for emailed invites the address it was sent to (`to`, readable by whoever holds the link). The server stores nothing about rooms or invites. Rotating `SECRET_KEY` revokes every link at once.
 
 **Host powers.** Only a host-role peer (the owner) can approve, deny or remove guests. A denied guest can't ask again for 5 minutes; a removed participant is disconnected and their peer id and tab secret are refused for the rest of the room's life. If the owner leaves, guests keep talking but nobody can admit newcomers until the owner returns. Invited guests are never promoted to host, and can never take over an identity (peer id) already admitted to the room, even one that's offline. The owner can always get in: one seat over the 6-person limit if guests filled the room.
 
@@ -66,6 +70,7 @@ Any other combination (for example `SECRET_KEY` without an owner sign-in, or an 
 | Room codes, display names, who is in which room, IP addresses | Audio, video, screen shares |
 | SDP and ICE candidates (network addresses) | Chat messages, reactions, files |
 | The room password in plain text (over TLS) when a guest enters it, to check it. Private mode compares it with the keyed hash in the invite; open mode keeps a per-room salted SHA-256 hash in memory | The room key in the invite link's `#fragment` |
+| With email set up: the owner's address, guests' addresses (only while sending the invite and, from the signed token, while they wait), and the codes as they're generated and checked. None of it is stored or logged | |
 | | Anything after the room empties: no logs, and no storage beyond the live room |
 
 On Cloudflare, Cloudflare terminates TLS, so it sees the same signaling traffic and IP addresses as the Worker does. TURN servers only relay already-encrypted packets. Browsers also contact a STUN server to learn their public address: `stun:stun.cloudflare.com:3478` by default, your own coturn in the Docker setup (`STUN_URLS=stun:<domain>:3478`), or whatever `STUN_URLS` lists. The web app has no third-party fallback.
@@ -178,7 +183,7 @@ JSON over WebSocket. The client connects to `/ws?room=<roomId>` (the Node server
 | `host-changed` | `hostPeerId` (null when the owner is away in private mode) |
 | `password-required` | `roomId`, `invalid` (true if a wrong password was sent) |
 | `waiting-for-admission` | `roomId`, `hostPresent` |
-| `admission-request` / `admission-cancelled` | `peerId`, `displayName?` (to host) |
+| `admission-request` / `admission-cancelled` | `peerId`, `displayName?`, `email?` (to host; `email` only for emailed invites, from the signed token) |
 | `admission-granted` / `admission-denied` | `roomId`, `reason?` |
 | `removed` | `roomId`, `reason`: the host removed you; the socket is then closed with `4002` |
 | `signal` | `fromPeerId`, `signal` |
@@ -188,11 +193,14 @@ JSON over WebSocket. The client connects to `/ws?room=<roomId>` (the Node server
 
 | Endpoint | Purpose |
 |---|---|
-| `GET /api/config` | `{ mode, auth, misconfigured }`: open or private, how the owner signs in, and whether the server is misconfigured (details are only in the server's startup log) |
+| `GET /api/config` | `{ mode, auth, misconfigured, emailInvites }`: open or private, how the owner signs in (`access`, `email`, `password` or null), whether the server is misconfigured (details are only in the server's startup log), and whether the owner can email invites |
 | `GET /api/ice-servers` | `{ iceServers, ttl? }`. Private mode needs an `X-Vchat-Token` header (invite or host token) or owner session. `ttl` is in seconds: 4h by default, never past the token's expiry |
 | `GET /api/admin/session` | `{ mode, auth, misconfigured, authenticated, email }` |
 | `POST /api/admin/login` / `logout` | Password sign-in (only when `ADMIN_PASSWORD` is the method) |
+| `POST /api/admin/login/code` | Email sign-in: `{ email }` → `200 { challenge }` for every well-formed address (400 if malformed, 429 + `Retry-After` over a cap, 404 unless email sign-in is the method) |
+| `POST /api/admin/login/verify` | Email sign-in: `{ challenge, code }` → `200 { ok: true }` + session cookie, or `401 { error: 'Wrong or expired code' }` |
 | `POST /api/admin/rooms` | Owner only: `{ label, password, approval, expiresInHours }` → `{ roomId, inviteToken, hostToken, expiresAt }` |
+| `POST /api/admin/rooms/email-invite` | Owner only: `{ roomId, inviteToken, email, key? }` → `200 { ok: true, expiresAt }`. Never returns the token or code. 400 bad input or invite, 401 not signed in, 503 email not configured, 429 over the cap, 502 if sending failed |
 | `GET /healthz` | `ok` |
 
 Close codes (clients must not reconnect automatically after 4000, 4002 or 4003):

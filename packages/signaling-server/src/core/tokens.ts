@@ -2,12 +2,13 @@
 //
 //   invite token  -> lets a guest into one room until it expires
 //   host token    -> lets the owner into one room as host
-//   admin session -> owner is signed in (cookie, built-in password auth only)
+//   admin session -> owner is signed in (cookie; password or email sign-in)
+//   login challenge -> pending email sign-in: binds a nonce to the emailed code (10 minutes)
 //
 // Nothing about rooms or invites is stored server-side: the token *is* the permission.
 // Format: base64url(JSON payload) + "." + base64url(signature)
 
-export type TokenRole = 'host' | 'guest' | 'admin';
+export type TokenRole = 'host' | 'guest' | 'admin' | 'login';
 
 export interface TokenPayload {
   v: 1;
@@ -22,8 +23,14 @@ export interface TokenPayload {
   pw?: string;
   /** Display label for the room (shown on the join screen). */
   label?: string;
-  /** Admin sessions: version of the owner password they were issued under. */
+  /** Admin sessions: version of the owner credential (password or email) they were issued under. */
   pv?: string;
+  /** Emailed invites: the (normalized) address it was sent to. Shown to the host on admission. */
+  to?: string;
+  /** Login challenges: random nonce. */
+  n?: string;
+  /** Login challenges: HMAC of the nonce and the emailed code (random when nothing was sent). */
+  c?: string;
 }
 
 const encoder = new TextEncoder();
@@ -118,7 +125,7 @@ export async function verifyToken(
     return { ok: false, reason: 'invalid' };
   }
   if (!payload || typeof payload !== 'object') return { ok: false, reason: 'invalid' };
-  if (payload.v !== 1 || !['host', 'guest', 'admin'].includes(payload.role)) return { ok: false, reason: 'invalid' };
+  if (payload.v !== 1 || !['host', 'guest', 'admin', 'login'].includes(payload.role)) return { ok: false, reason: 'invalid' };
   if (typeof payload.exp !== 'number' || !Number.isFinite(payload.exp)) return { ok: false, reason: 'invalid' };
   if (payload.exp * 1000 + (opts.allowExpiredSeconds ?? 0) * 1000 <= now) return { ok: false, reason: 'expired' };
   return { ok: true, payload };

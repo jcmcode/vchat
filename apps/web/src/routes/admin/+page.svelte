@@ -27,6 +27,19 @@
   let loginError = '';
   let loggingIn = false;
 
+  // Email sign-in: ask for a code, then enter it.
+  let loginEmail = '';
+  let loginChallenge = '';
+  let loginCode = '';
+  let codeSentTo = '';
+
+  // Emailed invites (sent by the server through Resend).
+  let invitingRoomId = '';
+  let inviteEmail = '';
+  let inviteIncludeKey = true;
+  let sendingInvite = false;
+  let inviteStatus: { ok: boolean; text: string } | null = null;
+
   let label = '';
   let roomPassword = '';
   let approval = true;
@@ -88,6 +101,99 @@
       }
     } finally {
       loggingIn = false;
+    }
+  }
+
+  async function postJson(path: string, payload: unknown): Promise<{ res: Response; body: Record<string, unknown> }> {
+    const res = await fetch(apiUrl(path), {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      credentials: 'same-origin',
+      body: JSON.stringify(payload),
+    });
+    const body = (await res.json().catch(() => ({}))) as Record<string, unknown>;
+    return { res, body };
+  }
+
+  async function requestCode() {
+    loginError = '';
+    loggingIn = true;
+    try {
+      const { res, body } = await postJson('/api/admin/login/code', { email: loginEmail.trim() });
+      if (!res.ok || typeof body.challenge !== 'string') {
+        loginError = res.status === 429 ? 'Too many codes requested. Wait a few minutes and try again.' : 'Could not send a code. Try again.';
+        return;
+      }
+      loginChallenge = body.challenge;
+      codeSentTo = loginEmail.trim();
+      loginCode = '';
+    } catch {
+      loginError = 'Could not reach the server.';
+    } finally {
+      loggingIn = false;
+    }
+  }
+
+  async function verifyCode() {
+    loginError = '';
+    loggingIn = true;
+    try {
+      const { res } = await postJson('/api/admin/login/verify', { challenge: loginChallenge, code: loginCode.replace(/\D/g, '') });
+      if (res.ok) {
+        loginChallenge = '';
+        loginCode = '';
+        await refreshSession();
+      } else {
+        loginError = res.status === 429 ? 'Too many attempts. Wait a few minutes and try again.' : 'Wrong or expired code.';
+      }
+    } catch {
+      loginError = 'Could not reach the server.';
+    } finally {
+      loggingIn = false;
+    }
+  }
+
+  function startOver() {
+    loginChallenge = '';
+    loginCode = '';
+    loginError = '';
+  }
+
+  function openInviteForm(room: SavedRoom) {
+    invitingRoomId = invitingRoomId === room.roomId ? '' : room.roomId;
+    inviteEmail = '';
+    inviteIncludeKey = true;
+    inviteStatus = null;
+  }
+
+  async function sendEmailInvite(room: SavedRoom) {
+    const to = inviteEmail.trim();
+    if (!to) return;
+    sendingInvite = true;
+    inviteStatus = null;
+    try {
+      const { res, body } = await postJson('/api/admin/rooms/email-invite', {
+        roomId: room.roomId,
+        inviteToken: room.inviteToken,
+        email: to,
+        ...(inviteIncludeKey && room.key ? { key: room.key } : {}),
+      });
+      if (res.ok) {
+        inviteStatus = { ok: true, text: `Invite sent to ${to}, with their own 6-digit code.` };
+        inviteEmail = '';
+      } else {
+        if (res.status === 401) authenticated = false;
+        const msg =
+          res.status === 400 ? "That email address doesn't look right." :
+          res.status === 429 ? 'Too many invites sent recently. Try again later.' :
+          res.status === 503 ? "This server isn't set up to send email." :
+          typeof body.error === 'string' ? body.error : "The invite couldn't be sent. Try again.";
+        inviteStatus = { ok: false, text: msg };
+      }
+    } catch {
+      inviteStatus = { ok: false, text: 'Could not reach the server.' };
+    } finally {
+      sendingInvite = false;
     }
   }
 
@@ -257,13 +363,50 @@
     {:else if config?.mode === 'open'}
       <section class="panel stack">
         <p>Owner sign-in isn't enabled on this server, so it runs in <strong>open mode</strong>: anyone can create rooms from the home page.</p>
-        <p class="muted">To make it private, set <code>SECRET_KEY</code> plus <code>ADMIN_PASSWORD</code> (or Cloudflare Access). See the README.</p>
+        <p class="muted">To make it private, set <code>SECRET_KEY</code> plus an owner sign-in: <code>OWNER_EMAIL</code> (email codes), Cloudflare Access, or <code>ADMIN_PASSWORD</code>. See the README.</p>
         <a class="btn secondary" href="/">Go to home page</a>
       </section>
     {:else if config?.misconfigured}
       <section class="panel"><p class="error" role="alert">This server isn't set up correctly, so it won't accept calls yet. If it's yours, check its startup log.</p></section>
     {:else if !authenticated}
-      {#if config?.auth === 'password'}
+      {#if config?.auth === 'email'}
+        {#if !loginChallenge}
+          <form class="panel form" on:submit|preventDefault={requestCode}>
+            <h2><Icon name="lock" size={18} /> Owner sign in</h2>
+            <p class="muted small-text">We'll email you a 6-digit code.</p>
+            <label class="sr-only" for="owneremail">Email</label>
+            <!-- svelte-ignore a11y-autofocus -->
+            <input id="owneremail" class="input" type="email" bind:value={loginEmail} placeholder="you@example.com" autocomplete="email" autofocus />
+            {#if loginError}<span class="error" role="alert">{loginError}</span>{/if}
+            <button class="btn primary" type="submit" disabled={!loginEmail.includes('@') || loggingIn}>
+              {loggingIn ? 'Sending…' : 'Email me a code'}
+            </button>
+          </form>
+        {:else}
+          <form class="panel form" on:submit|preventDefault={verifyCode}>
+            <h2><Icon name="lock" size={18} /> Enter your code</h2>
+            <p class="muted small-text">If {codeSentTo} is the owner's address, a code is on its way. It expires in 10 minutes.</p>
+            <label class="sr-only" for="ownercode">6-digit code</label>
+            <!-- svelte-ignore a11y-autofocus -->
+            <input
+              id="ownercode"
+              class="input code-input"
+              type="text"
+              inputmode="numeric"
+              autocomplete="one-time-code"
+              maxlength="7"
+              bind:value={loginCode}
+              placeholder="123456"
+              autofocus
+            />
+            {#if loginError}<span class="error" role="alert">{loginError}</span>{/if}
+            <button class="btn primary" type="submit" disabled={loginCode.replace(/\D/g, '').length !== 6 || loggingIn}>
+              {loggingIn ? 'Checking…' : 'Sign in'}
+            </button>
+            <button class="link-btn" type="button" on:click={startOver}>Use a different email or send a new code</button>
+          </form>
+        {/if}
+      {:else if config?.auth === 'password'}
         <form class="panel form" on:submit|preventDefault={login}>
           <h2><Icon name="lock" size={18} /> Owner sign in</h2>
           <label class="sr-only" for="ownerpw">Owner password</label>
@@ -340,9 +483,15 @@
               <Icon name={copiedKey === 'msg' ? 'check' : 'message'} size={16} />
               {copiedKey === 'msg' ? 'Copied!' : 'Copy invite message'}
             </button>
-            <button class="btn secondary small" on:click={() => created && emailInvite(created.room)} title="Opens your own email app with the invite drafted">
-              <Icon name="send" size={16} /> Email invite
-            </button>
+            {#if config?.emailInvites}
+              <button class="btn secondary small" on:click={() => created && openInviteForm(created.room)} title="Email someone their own invite link and code">
+                <Icon name="send" size={16} /> Email invite
+              </button>
+            {:else}
+              <button class="btn secondary small" on:click={() => created && emailInvite(created.room)} title="Opens your own email app with the invite drafted">
+                <Icon name="send" size={16} /> Email invite
+              </button>
+            {/if}
             <button class="btn secondary small" on:click={() => created && downloadIcs(inviteFor(created.room))} title="Download a calendar event (.ics) with the link — attach it to an email or open it to add to your calendar">
               <Icon name="calendar" size={16} /> Calendar file
             </button>
@@ -351,6 +500,21 @@
             {/if}
             <button class="btn primary small" on:click={() => created && startCall(created.room)}><Icon name="video" size={16} /> Start call</button>
           </div>
+          {#if invitingRoomId === created.room.roomId}
+            {@const room = created.room}
+            <form class="invite-form" on:submit|preventDefault={() => sendEmailInvite(room)}>
+              <label class="field-label" for="invite-email-new">Guest's email</label>
+              <div class="row">
+                <input id="invite-email-new" class="input" type="email" bind:value={inviteEmail} placeholder="guest@example.com" autocomplete="off" />
+                <button class="btn primary" type="submit" disabled={!inviteEmail.includes('@') || sendingInvite}>{sendingInvite ? 'Sending…' : 'Send'}</button>
+              </div>
+              <label class="toggle-row small-text">
+                <input type="checkbox" bind:checked={inviteIncludeKey} />
+                <span>Include the end-to-end key in the link (one-click join; the email service can see it)</span>
+              </label>
+              {#if inviteStatus}<p class={inviteStatus.ok ? 'ok small-text' : 'error'} role="status">{inviteStatus.text}</p>{/if}
+            </form>
+          {/if}
           {#if created.password}
             <p class="pw">
               <span class="muted">Password:</span> <code>{created.password}</code>
@@ -383,11 +547,29 @@
                     <Icon name={copiedKey === room.roomId ? 'check' : 'copy'} size={16} />
                     {copiedKey === room.roomId ? 'Copied!' : 'Copy link'}
                   </button>
-                  <button class="btn ghost small icon" on:click={() => emailInvite(room)} title="Email invite" aria-label="Email invite"><Icon name="send" size={16} /></button>
+                  {#if config?.emailInvites}
+                    <button class="btn ghost small icon" class:active={invitingRoomId === room.roomId} on:click={() => openInviteForm(room)} title="Email someone an invite" aria-label="Email someone an invite"><Icon name="send" size={16} /></button>
+                  {:else}
+                    <button class="btn ghost small icon" on:click={() => emailInvite(room)} title="Email invite" aria-label="Email invite"><Icon name="send" size={16} /></button>
+                  {/if}
                   <button class="btn ghost small icon" on:click={() => downloadIcs(inviteFor(room))} title="Calendar file (.ics)" aria-label="Download calendar file"><Icon name="calendar" size={16} /></button>
                   <button class="btn primary small" on:click={() => startCall(room)}>Start</button>
                   <button class="btn ghost danger small icon" on:click={() => removeRoom(room)} title="Remove from this list" aria-label="Remove from this list"><Icon name="trash" size={16} /></button>
                 </div>
+                {#if invitingRoomId === room.roomId && created?.room.roomId !== room.roomId}
+                  <form class="invite-form" on:submit|preventDefault={() => sendEmailInvite(room)}>
+                    <label class="field-label" for="invite-email-{room.roomId}">Guest's email</label>
+                    <div class="row">
+                      <input id="invite-email-{room.roomId}" class="input" type="email" bind:value={inviteEmail} placeholder="guest@example.com" autocomplete="off" />
+                      <button class="btn primary" type="submit" disabled={!inviteEmail.includes('@') || sendingInvite}>{sendingInvite ? 'Sending…' : 'Send'}</button>
+                    </div>
+                    <label class="toggle-row small-text">
+                      <input type="checkbox" bind:checked={inviteIncludeKey} />
+                      <span>Include the end-to-end key in the link (one-click join; the email service can see it)</span>
+                    </label>
+                    {#if inviteStatus}<p class={inviteStatus.ok ? 'ok small-text' : 'error'} role="status">{inviteStatus.text}</p>{/if}
+                  </form>
+                {/if}
               </li>
             {/each}
           </ul>
@@ -622,6 +804,38 @@
   .error {
     color: var(--danger);
     font-size: var(--text-sm);
+  }
+
+  .ok {
+    color: var(--success, #22c55e);
+  }
+
+  .invite-form {
+    flex-basis: 100%;
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-2);
+    padding: var(--space-3);
+    margin-top: var(--space-2);
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--radius);
+    background: var(--bg-elevated);
+  }
+
+  .invite-form .row .input {
+    flex: 1;
+    min-width: 0;
+  }
+
+  .code-input {
+    font-family: var(--font-mono, monospace);
+    font-size: var(--text-xl);
+    letter-spacing: 0.3em;
+    text-align: center;
+  }
+
+  .link-btn {
+    align-self: center;
   }
 
   code {

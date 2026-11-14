@@ -114,6 +114,8 @@
   let showPrejoin = false;
   let prejoinName = '';
   let prejoinMode: JoinMode = 'video';
+  /** Joined with a personal invite emailed to one person (asks for their 6-digit code). */
+  let personalInvite = false;
   /** Connect only through the relay server, so other participants never learn your IP address. */
   let hideIp = getRelayOnly();
   let resolvePrejoin: (() => void) | null = null;
@@ -132,9 +134,11 @@
   }
 
   function handleSubmitPassword() {
-    if (!passwordAttempt) return;
-    rememberRoomPassword(roomId, passwordAttempt);
-    submitRoomPassword(passwordAttempt);
+    // Codes are digits only (people often paste them with a space in the middle).
+    const value = personalInvite ? passwordAttempt.replace(/\D/g, '') : passwordAttempt;
+    if (!value) return;
+    rememberRoomPassword(roomId, value);
+    submitRoomPassword(value);
     passwordAttempt = '';
   }
 
@@ -271,6 +275,21 @@
     }
   }
 
+  /**
+   * Remove the invite token and key ("#...") from the address bar, history and bookmarks.
+   * SvelteKit's replaceState throws if its router hasn't finished starting (fresh page loads);
+   * fall back to the browser's own history API, keeping SvelteKit's state object intact.
+   */
+  function stripInviteFromAddressBar() {
+    const clean = `/room/${roomId}`;
+    if (!window.location.hash) return;
+    try {
+      replaceState(clean, {});
+    } catch {
+      history.replaceState(history.state, '', clean);
+    }
+  }
+
   onMount(async () => {
     if (!browser) return;
 
@@ -292,17 +311,19 @@
     // Strip the token and key from the address bar before anything else happens.
     await tick();
     if (destroyed) return;
-    replaceState(`/room/${roomId}`, {});
+    stripInviteFromAddressBar();
     const config = await fetchServerConfig();
     if (destroyed) return;
     const token = getRoomToken(roomId);
     const tokenInfo = readToken(token);
+    personalInvite = tokenInfo.role === 'guest' && !!tokenInfo.to;
     initRoomName(takePendingRoomName(roomId) ?? tokenInfo.label);
     const roomKey = getRoomKey(roomId);
     // Load the end-to-end key now, so the status shown before joining is already right.
     await setE2EKey(roomId, roomKey);
     if (destroyed) return;
-    if (tokenInfo.role === 'guest' && token) shareUrl = inviteUrl(roomId, token, roomKey);
+    // A personal (emailed) invite is for one person, so it isn't offered for sharing.
+    if (tokenInfo.role === 'guest' && token && !personalInvite) shareUrl = inviteUrl(roomId, token, roomKey);
     else if (tokenInfo.role === 'host') {
       const saved = getSavedRooms().find((r) => r.roomId === roomId);
       if (saved) shareUrl = inviteUrl(roomId, saved.inviteToken, saved.key ?? roomKey);
@@ -600,20 +621,39 @@
       on:submit|preventDefault={handleSubmitPassword}
     >
       <div class="dialog-icon"><Icon name="lock" size={22} /></div>
-      <h2 id="password-title">Password required</h2>
-      <p class="dialog-sub" class:invalid={$passwordInvalid} role={$passwordInvalid ? 'alert' : undefined}>
-        {$passwordInvalid ? 'That password was wrong. Try again.' : 'This room is password protected.'}
-      </p>
-      <!-- svelte-ignore a11y-autofocus -->
-      <input
-        class="input"
-        type="password"
-        bind:value={passwordAttempt}
-        placeholder="Room password"
-        aria-label="Room password"
-        autocomplete="off"
-        autofocus
-      />
+      {#if personalInvite}
+        <h2 id="password-title">Enter your code</h2>
+        <p class="dialog-sub" class:invalid={$passwordInvalid} role={$passwordInvalid ? 'alert' : undefined}>
+          {$passwordInvalid ? "That code didn't match. Check the email and try again." : 'Type the 6-digit code from your invite email.'}
+        </p>
+        <!-- svelte-ignore a11y-autofocus -->
+        <input
+          class="input code-input"
+          type="text"
+          inputmode="numeric"
+          maxlength="7"
+          bind:value={passwordAttempt}
+          placeholder="123456"
+          aria-label="6-digit code"
+          autocomplete="one-time-code"
+          autofocus
+        />
+      {:else}
+        <h2 id="password-title">Password required</h2>
+        <p class="dialog-sub" class:invalid={$passwordInvalid} role={$passwordInvalid ? 'alert' : undefined}>
+          {$passwordInvalid ? 'That password was wrong. Try again.' : 'This room is password protected.'}
+        </p>
+        <!-- svelte-ignore a11y-autofocus -->
+        <input
+          class="input"
+          type="password"
+          bind:value={passwordAttempt}
+          placeholder="Room password"
+          aria-label="Room password"
+          autocomplete="off"
+          autofocus
+        />
+      {/if}
       <div class="dialog-actions">
         <button type="button" class="btn ghost" on:click={handleLeave}>Cancel</button>
         <button type="submit" class="btn primary" disabled={!passwordAttempt}>Join</button>
@@ -1546,6 +1586,13 @@
   .join-modes legend {
     margin-bottom: var(--space-2);
     padding: 0;
+  }
+
+  .code-input {
+    font-family: var(--font-mono, monospace);
+    font-size: var(--text-xl, 1.25rem);
+    letter-spacing: 0.3em;
+    text-align: center;
   }
 
   .hide-ip {

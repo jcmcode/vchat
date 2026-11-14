@@ -214,9 +214,11 @@ export async function fetchIceServers(token?: string): Promise<{ servers: RTCIce
 export interface ServerConfig {
   /** open: anyone can create rooms. private: the owner signs in, guests need an invite link. */
   mode: 'open' | 'private';
-  auth: 'access' | 'password' | null;
+  auth: 'access' | 'password' | 'email' | null;
   /** The server's settings are incomplete or contradictory (details are only in its own log). */
   misconfigured?: boolean;
+  /** The server can email invites itself (Resend is configured). */
+  emailInvites?: boolean;
 }
 
 let configPromise: Promise<ServerConfig> | null = null;
@@ -255,6 +257,8 @@ export interface TokenInfo {
   label?: string;
   exp?: number;
   hasPassword?: boolean;
+  /** Personal invite: the email address it was sent to (it then needs that person's code). */
+  to?: string;
 }
 
 /** Read the public parts of a token for display. (The server verifies it; we never trust this.) */
@@ -264,7 +268,7 @@ export function readToken(token: string | undefined): TokenInfo {
     const body = token.split('.')[0].replace(/-/g, '+').replace(/_/g, '/');
     const bytes = Uint8Array.from(atob(body + '='.repeat((4 - (body.length % 4)) % 4)), (c) => c.charCodeAt(0));
     const p = JSON.parse(new TextDecoder().decode(bytes));
-    return { role: p.role, label: p.label, exp: p.exp, hasPassword: !!p.pw };
+    return { role: p.role, label: p.label, exp: p.exp, hasPassword: !!p.pw, ...(typeof p.to === 'string' ? { to: p.to } : {}) };
   } catch {
     return {};
   }

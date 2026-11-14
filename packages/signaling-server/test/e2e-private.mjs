@@ -13,7 +13,7 @@ const expect = (cond, msg) => {
 
 const cfg = await fetch(`${base}/api/config`).then((r) => r.json());
 expect(cfg.mode === 'private' && !cfg.misconfigured, `server not in private mode: ${JSON.stringify(cfg)}`);
-expect(Object.keys(cfg).sort().join() === 'auth,misconfigured,mode', `config leaks extra fields: ${JSON.stringify(cfg)}`);
+expect(Object.keys(cfg).sort().join() === 'auth,emailInvites,misconfigured,mode', `config leaks extra fields: ${JSON.stringify(cfg)}`);
 ok(`private mode (${cfg.auth})`);
 
 expect((await fetch(`${base}/api/ice-servers`)).status === 401, 'ICE servers should need an invite');

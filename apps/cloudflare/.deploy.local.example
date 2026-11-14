@@ -1,0 +1,4 @@
+# Copy to .deploy.local (ignored by git) and set your own domain.
+# The domain must already be on your Cloudflare account. `pnpm cf:deploy` deploys the app to it
+# and switches off the *.workers.dev address.
+DOMAIN=call.example.com

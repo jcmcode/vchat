@@ -5,7 +5,7 @@
   "type": "module",
   "scripts": {
     "dev": "pnpm --filter @vchat/web build && wrangler dev",
-    "deploy": "pnpm --filter @vchat/web build && wrangler deploy",
+    "deploy": "pnpm --filter @vchat/web build && node scripts/deploy.mjs",
     "typecheck": "tsc --noEmit",
     "cf-typegen": "wrangler types"
   },

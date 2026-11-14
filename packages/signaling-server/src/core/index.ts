@@ -6,3 +6,4 @@ export * from './tokens.js';
 export * from './access.js';
 export * from './api.js';
 export * from './throttle.js';
+export * from './email.js';

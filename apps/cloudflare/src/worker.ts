@@ -5,7 +5,8 @@
 //   WS  /ws?room=<id>  -> SignalingRoom Durable Object for that room
 //   /api/*             -> shared API (core/api.ts): config, ICE servers, owner sign-in, invites
 //
-// Owner sign-in: Cloudflare Access (CF_ACCESS_TEAM_DOMAIN + CF_ACCESS_AUD) or ADMIN_PASSWORD.
+// Owner sign-in: Cloudflare Access (CF_ACCESS_TEAM_DOMAIN + CF_ACCESS_AUD), an emailed code
+// (OWNER_EMAIL + RESEND_API_KEY + EMAIL_FROM) or ADMIN_PASSWORD.
 // Either one also requires SECRET_KEY. With nothing configured (or OPEN_MODE=1), the app runs in
 // open mode; anything in between is reported as a configuration error.
 
@@ -70,7 +71,7 @@ async function clientId(request: Request, env: Env): Promise<string> {
 let loggedConfigError = false;
 
 export default {
-  async fetch(request: Request, env: Env): Promise<Response> {
+  async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const url = new URL(request.url);
 
     if (!loggedConfigError) {
@@ -118,7 +119,11 @@ export default {
           })
         );
       }
-      const response = await handleApi(request, env, { clientIp: request.headers.get('CF-Connecting-IP') ?? undefined });
+      const response = await handleApi(request, env, {
+        clientIp: request.headers.get('CF-Connecting-IP') ?? undefined,
+        // Sign-in code emails are sent after the response (same timing for every address).
+        waitUntil: (p) => ctx.waitUntil(p),
+      });
       if (response) {
         const res = secure(response);
         for (const [k, v] of Object.entries(cors)) res.headers.set(k, v);

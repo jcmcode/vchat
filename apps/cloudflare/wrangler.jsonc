@@ -1,16 +1,15 @@
 // Cloudflare deployment for vchat: static web app + signaling (Durable Objects) in one Worker.
 //
 // Nothing account-specific belongs in this file. Wrangler picks your account from `wrangler login`,
-// secrets are set with `wrangler secret put`, and a custom domain can be attached in the
-// Cloudflare dashboard (Workers & Pages → vchat → Settings → Domains & Routes).
+// secrets are set with `wrangler secret put`, and your domain goes in apps/cloudflare/.deploy.local
+// (ignored by git): `pnpm cf:deploy` then deploys to it and switches the workers.dev address off.
 // See README.md → "Deploy on Cloudflare".
 {
   "$schema": "../../node_modules/wrangler/config-schema.json",
   "name": "vchat",
   "main": "src/worker.ts",
   "compatibility_date": "2025-09-01",
-  // The free *.workers.dev address. Once your custom domain is attached, set this to false so the
-  // app is only reachable on your own domain (and behind your Cloudflare Access policy).
+  // The free *.workers.dev address, used until you set a domain in .deploy.local.
   "workers_dev": true,
 
   "assets": {
@@ -42,9 +41,14 @@
   //   Owner sign-in — pick one:
   //     CF_ACCESS_TEAM_DOMAIN  e.g. yourteam.cloudflareaccess.com   } Cloudflare Access
   //     CF_ACCESS_AUD          Access application audience tag      } (recommended)
+  //     OWNER_EMAIL            your email: sign in with an emailed code (needs Resend, below)
   //     ADMIN_PASSWORD         built-in owner password
   //   With nothing set, the app runs in open mode (anyone can create rooms). SECRET_KEY without an
   //   owner sign-in is a configuration error; set OPEN_MODE=1 to run an open server on purpose.
+  //
+  //   RESEND_API_KEY         Resend API key (sending access only)  } email sign-in codes and
+  //   EMAIL_FROM             e.g. "vchat <invites@example.com>"    } emailed invites (Resend)
+  //   Precedence if several sign-in methods are set: Access > email > password.
   //
   //   CF_TURN_KEY_ID         Cloudflare Realtime TURN key ID      } optional relay for strict
   //   CF_TURN_API_TOKEN      Cloudflare Realtime TURN API token   } NATs / mobile networks

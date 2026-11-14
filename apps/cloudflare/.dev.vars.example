@@ -9,3 +9,8 @@
 # Optional: Cloudflare Realtime TURN (dashboard → Realtime → TURN Server → Create)
 # CF_TURN_KEY_ID=
 # CF_TURN_API_TOKEN=
+
+# Optional: owner signs in with an emailed code, and can email invites (https://resend.com).
+# OWNER_EMAIL=you@example.com
+# RESEND_API_KEY=re_...
+# EMAIL_FROM=vchat <invites@example.com>

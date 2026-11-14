@@ -73,6 +73,8 @@ export interface Reaction {
 export interface AdmissionRequest {
   peerId: string;
   displayName: string;
+  /** Verified by the server: the address their personal invite was emailed to. */
+  email?: string;
 }
 
 export const peers = writable<Map<string, PeerConnection>>(new Map());
@@ -551,10 +553,11 @@ export async function joinRoom(opts: JoinOptions): Promise<void> {
   });
 
   on('admission-request', (event) => {
-    const { peerId: reqPeerId, displayName: reqName } = event as unknown as AdmissionRequest;
+    const { peerId: reqPeerId, displayName: reqName, email } = event as unknown as AdmissionRequest;
+    const verifiedEmail = typeof email === 'string' && email.length <= 254 ? cleanPeerText(email) : undefined;
     admissionRequests.update((reqs) => [
       ...reqs.filter((r) => r.peerId !== reqPeerId),
-      { peerId: reqPeerId, displayName: reqName },
+      { peerId: reqPeerId, displayName: reqName, ...(verifiedEmail ? { email: verifiedEmail } : {}) },
     ]);
   });
 

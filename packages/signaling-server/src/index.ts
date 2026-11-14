@@ -23,6 +23,7 @@ import {
   resolveConfig,
   sweepApiState,
   type ClientMessage,
+  type JoinGrant,
   type ServerEnv,
   type Transport,
 } from './core/index.js';
@@ -252,7 +253,7 @@ async function handleMessage(ws: WebSocket, msg: ClientMessage): Promise<void> {
       // A socket is authorized for one room at the upgrade and can't be used for another.
       if (msg.roomId !== info.roomId) return sendError(ws, 'Room ID does not match connection');
       // Private mode: every entry needs a valid invite or host token (checked before touching rooms).
-      let grant: { role: 'host' | 'guest'; approval: boolean } | null = null;
+      let grant: JoinGrant | null = null;
       if (config.mode === 'private') {
         if (msg.type === 'create-room') return sendError(ws, 'Invite required');
         const decision = await authorizeJoin(env, msg, { clientId: info.clientId });

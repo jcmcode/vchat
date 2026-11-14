@@ -17,9 +17,9 @@ Your own private, end-to-end encrypted video calls. Deploy it on your domain, si
 
 ## How it works for you
 
-1. **You sign in** at `https://your-domain/admin`, with Cloudflare Access or an owner password.
+1. **You sign in** at `https://your-domain/admin`, with Cloudflare Access, a code emailed to you, or an owner password.
 2. **Create a room**: give it a name, optionally a password, choose whether guests wait for your approval, and pick how long the invite lasts.
-3. **Send the invite link** (or the ready-made invite message). Send the password separately if you set one.
+3. **Send the invite link** (or the ready-made invite message). Send the password separately if you set one. With [email set up](#email-sign-in-and-invites-resend), the server can also email each guest their own link and a 6-digit code.
 4. **Guests open the link**, type their name, and join. No sign-up, no app.
 
 Anyone visiting your site without an invite link sees a "private server" page and can't create rooms, join calls or use your relay server.
@@ -28,8 +28,8 @@ Anyone visiting your site without an invite link sees a "private server" page an
 
 | | Cost | Needs | Owner sign-in |
 |---|---|---|---|
-| [**Cloudflare**](#deploy-on-cloudflare) | Free for personal use | Cloudflare account + a domain | Cloudflare Access (recommended) or password |
-| [**Docker on any server**](#deploy-with-docker) | ~$5/mo VPS | Linux server + a domain | Password (or Cloudflare Access via Tunnel) |
+| [**Cloudflare**](#deploy-on-cloudflare) | Free for personal use | Cloudflare account + a domain | Cloudflare Access (recommended), emailed code, or password |
+| [**Docker on any server**](#deploy-with-docker) | ~$5/mo VPS | Linux server + a domain | Password or emailed code (or Cloudflare Access via Tunnel) |
 | [**Local**](#local-development) | Free | Node.js 20+ | None (open mode) |
 
 ---
@@ -57,7 +57,14 @@ pnpm cf:deploy
 
 ### 2. Put it on your domain
 
-Dashboard → **Workers & Pages** → **vchat** → **Settings** → **Domains & Routes** → **Add** → **Custom domain**, e.g. `call.yourdomain.com`. The domain must already be on your Cloudflare account. Then set `"workers_dev": false` in `apps/cloudflare/wrangler.jsonc` and redeploy, so the app is only reachable on your domain.
+The domain must already be on your Cloudflare account. Write it in `apps/cloudflare/.deploy.local` (git ignores this file, so your domain never ends up in the repo) and deploy again:
+
+```bash
+echo "DOMAIN=call.yourdomain.com" > apps/cloudflare/.deploy.local
+pnpm cf:deploy
+```
+
+This attaches the domain to the Worker and switches off the `*.workers.dev` address, so the app is only reachable on your domain.
 
 ### 3. Set up owner sign-in with Cloudflare Access (recommended)
 
@@ -77,7 +84,7 @@ Access means there's no owner password to leak: you sign in with your email (a o
 
 Open `https://call.yourdomain.com/admin`. Cloudflare asks you to sign in, then you're on your dashboard. To check that it's protected, open `https://call.yourdomain.com/api/admin/session` in a private window: you should see Cloudflare's sign-in page, not data. The Worker also verifies Access's signed token itself, so `/api/admin` stays locked even when reached another way (e.g. the `workers.dev` address).
 
-**Simpler alternative:** skip Access and set an owner password with `wrangler secret put ADMIN_PASSWORD`.
+**Simpler alternatives:** skip Access and sign in with a code emailed to you (see [Email sign-in and invites](#email-sign-in-and-invites-resend)), or set an owner password with `wrangler secret put ADMIN_PASSWORD`.
 
 ### 4. (Optional) Enable TURN relay
 
@@ -91,6 +98,36 @@ pnpm --filter @vchat/cloudflare exec wrangler secret put CF_TURN_API_TOKEN
 Only invited guests and you can get relay credentials, so strangers can't run up your bill. The first 1,000 GB per month is free, then $0.05/GB.
 
 To test locally with the real Workers runtime: `pnpm cf:dev` (http://localhost:8787). Put local-only secrets in `apps/cloudflare/.dev.vars` (see `.dev.vars.example`; it's gitignored). To remove everything: `pnpm --filter @vchat/cloudflare exec wrangler delete`.
+
+---
+
+## Email sign-in and invites (Resend)
+
+Optional, on either deployment. With [Resend](https://resend.com) set up:
+
+- **Owner sign-in by email** (when `OWNER_EMAIL` is set): at `/admin` you enter your address and get a 6-digit code by email, valid for 10 minutes. There's no password to leak. Anyone can ask for a code, but only your address ever receives one, and the page answers the same way for every address.
+- **Emailed invites** (whenever Resend is configured in private mode): from the dashboard, enter a guest's email address. They get a "Join the call" link and a 6-digit code that is theirs alone, and they need both to get in. You then admit them as usual, and you see which address the invite was sent to. A forwarded link is useless without the code, and you can still deny or remove anyone.
+
+Nothing about this is stored: the sign-in code lives only inside a signed, 10-minute challenge, and each emailed invite is a signed token like any other.
+
+**Set up Resend:**
+
+1. Create a Resend account and **add your sending domain** (e.g. `example.com`, or a subdomain like `mail.example.com`). Resend shows DNS records (SPF, DKIM and so on); add them in Cloudflare DNS (or wherever your DNS is) and wait until the domain shows as verified.
+2. Create an **API key with "Sending access" only**, restricted to that domain if you like.
+3. In the domain's settings, **turn off open and click tracking**, so the emails contain no tracking pixel and links aren't rewritten through Resend.
+
+**Set the secrets.** On Cloudflare:
+
+```bash
+pnpm --filter @vchat/cloudflare exec wrangler secret put RESEND_API_KEY
+pnpm --filter @vchat/cloudflare exec wrangler secret put EMAIL_FROM      # e.g. vchat <invites@example.com>
+pnpm --filter @vchat/cloudflare exec wrangler secret put OWNER_EMAIL     # optional: sign in by email
+pnpm cf:deploy
+```
+
+With Docker, add the same three lines to `.env` (docker-compose passes them on), e.g. `EMAIL_FROM='vchat <invites@example.com>'`, then `docker compose up -d`. If `OWNER_EMAIL` is set, it takes over from `ADMIN_PASSWORD`. Cloudflare Access, if configured, still wins over both.
+
+**The trade-off.** An invite email carries everything a guest needs to join: the link (with the room key) and their code. It passes through your server, Resend, and both mail providers. Approval still protects you: nobody gets in without you letting them in. But for sensitive calls, compare the [safety codes](DOCS.md#end-to-end-verification) out loud once you're connected; they reveal anyone in the middle, even someone who read the email.
 
 ---
 
@@ -156,7 +193,9 @@ The same settings work on every backend (Node environment variables or Cloudflar
 |---|---|
 | `SECRET_KEY` | Signs invite links and owner sessions. 32+ random characters; keep it stable. **Required for private mode** (and setting it means you want private mode) |
 | `CF_ACCESS_TEAM_DOMAIN` + `CF_ACCESS_AUD` | Owner signs in with Cloudflare Access |
-| `ADMIN_PASSWORD` | Owner signs in with a password (used if Access isn't configured) |
+| `OWNER_EMAIL` | Owner signs in with a 6-digit code emailed to this address. Needs `RESEND_API_KEY` + `EMAIL_FROM`. Used instead of `ADMIN_PASSWORD` if both are set |
+| `ADMIN_PASSWORD` | Owner signs in with a password (used if neither Access nor `OWNER_EMAIL` is configured) |
+| `RESEND_API_KEY` + `EMAIL_FROM` | Send email through Resend: sign-in codes and per-guest invites. `EMAIL_FROM` is `you@example.com` or `Name <you@example.com>` on a domain verified in Resend |
 | `CF_TURN_KEY_ID` + `CF_TURN_API_TOKEN` | Relay via Cloudflare Realtime TURN |
 | `TURN_URLS` + `TURN_SECRET` | Relay via your own coturn (`use-auth-secret`) |
 | `TURN_URLS` + `TURN_USERNAME` + `TURN_CREDENTIAL` | Relay with static credentials |
@@ -168,7 +207,7 @@ The same settings work on every backend (Node environment variables or Cloudflar
 | `DEBUG_LOGS` | Set to `1` to log room activity. Off by default |
 | `PORT` | Node only: listen port (default 3001) |
 
-Open mode needs either **nothing** configured (no `SECRET_KEY`, `ADMIN_PASSWORD` or `CF_ACCESS_*`, as in local development) or an explicit `OPEN_MODE=1`. Anything in between, such as `SECRET_KEY` without an owner sign-in, an empty or short (<10 characters) password, or only one Access value, is a configuration error: the server refuses to run open, logs the problem at startup, and only tells browsers `misconfigured: true`. A typo can't make a private server public. Empty values count as unset.
+Open mode needs either **nothing** configured (no `SECRET_KEY`, `ADMIN_PASSWORD`, `OWNER_EMAIL` or `CF_ACCESS_*`, as in local development) or an explicit `OPEN_MODE=1`. Owner sign-in precedence is Cloudflare Access, then `OWNER_EMAIL`, then `ADMIN_PASSWORD`. Anything in between, such as `SECRET_KEY` without an owner sign-in, an empty or short (<10 characters) password, only one Access value, `OWNER_EMAIL` without both Resend settings, only one of `RESEND_API_KEY`/`EMAIL_FROM`, or a malformed `OWNER_EMAIL`/`EMAIL_FROM`, is a configuration error: the server refuses to run open, logs the problem at startup, and only tells browsers `misconfigured: true`. A typo can't make a private server public. Empty values count as unset.
 
 ## Privacy and security
 
@@ -177,6 +216,7 @@ Open mode needs either **nothing** configured (no `SECRET_KEY`, `ADMIN_PASSWORD`
 - No logs by default: the app doesn't log room codes, names or IP addresses, Workers Logs are off, coturn logging is off, Caddy discards all its logs, and Docker keeps no container logs.
 - The signaling server does see some things while a call is set up: room ids, display names, IP addresses and network candidates, and the **room password in plain text** (over TLS) when a guest types it, because that's how it checks it. It keeps none of this after the room empties.
 - Whoever runs the server (you, and Cloudflare if you use it, since it terminates TLS) can see that connection metadata, but never call content.
+- With email set up, invite emails (link, room key and code) and sign-in codes pass through your server, Resend and the mail providers on both ends. The server never logs addresses, codes or tokens.
 - Browsers contact a STUN server to learn their public address: `stun.cloudflare.com` by default, your own coturn with Docker, or whatever `STUN_URLS` says.
 
 See [DOCS.md](DOCS.md) for the full security model and how it works under the hood.

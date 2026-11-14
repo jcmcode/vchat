@@ -13,7 +13,10 @@
   {#each requests as req (req.peerId)}
     <div class="admission-item">
       <span class="req-avatar" aria-hidden="true">{req.displayName.charAt(0).toUpperCase()}</span>
-      <span class="req-name">{req.displayName}</span>
+      <span class="req-name">
+        {req.displayName}
+        {#if req.email}<small class="req-email" title="The address their personal invite was sent to">{req.email}</small>{/if}
+      </span>
       <div class="req-actions">
         <button class="btn small primary" on:click={() => dispatch('admit', req.peerId)} aria-label="Approve {req.displayName}">Approve</button>
         <button class="btn small danger" on:click={() => dispatch('deny', req.peerId)} aria-label="Deny {req.displayName}">Deny</button>
@@ -70,6 +73,15 @@
     color: var(--accent);
     font-size: var(--text-sm);
     font-weight: 600;
+  }
+
+  .req-email {
+    display: block;
+    font-size: var(--text-xs, 0.75rem);
+    font-weight: 400;
+    color: var(--text-muted);
+    overflow: hidden;
+    text-overflow: ellipsis;
   }
 
   .req-name {

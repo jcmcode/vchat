@@ -16,6 +16,9 @@ turnserver.conf
 
 # Cloudflare / Wrangler local state
 .wrangler/
+# Your own deploy settings (domain) and the temporary config made from them
+.deploy.local
+.wrangler.deploy.json
 
 # Rust / Tauri
 target/
