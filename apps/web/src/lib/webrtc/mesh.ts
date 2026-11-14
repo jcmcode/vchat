@@ -342,6 +342,11 @@ const FATAL_ERRORS: Record<string, string> = {
   'Room is locked': 'This call is locked by the host, so nobody new can join. Ask the host to unlock it, then open the link again.',
 };
 
+/** "Can't reach the call server" clears itself on reconnect; every other room error ends the call. */
+export function isTransientRoomError(message: string): boolean {
+  return message === FATAL_ERRORS['Cannot connect'];
+}
+
 /** Plain-words version of a server error (e.g. 'Invite expired'), if it's one we know. */
 export function friendlyJoinError(message: string): string | undefined {
   return Object.prototype.hasOwnProperty.call(FATAL_ERRORS, message) ? FATAL_ERRORS[message] : undefined;

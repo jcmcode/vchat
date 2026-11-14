@@ -15,14 +15,23 @@ export const selectedAudioOutput = writable<string>('');
 export const voiceOnlyMode = writable(false);
 /** The camera is being turned back on (waiting for the device). */
 export const cameraStarting = writable(false);
+/** Which way the camera faces, when the browser says (phones): the self view isn't mirrored for the back one. */
+export const cameraFacing = writable<'user' | 'environment' | undefined>(undefined);
 
-function cameraConstraints(deviceId?: string): MediaTrackConstraints {
+function cameraConstraints(deviceId?: string, facing?: 'user' | 'environment'): MediaTrackConstraints {
   return {
     width: { ideal: 1280 },
     height: { ideal: 720 },
     frameRate: { ideal: 30, max: 30 },
     ...(deviceId ? { deviceId: { exact: deviceId } } : {}),
+    // No camera named (or it's gone): at least keep facing the same way (front or back).
+    ...(!deviceId && facing ? { facingMode: { ideal: facing } } : {}),
   };
+}
+
+function facingOfTrack(track: MediaStreamTrack): 'user' | 'environment' | undefined {
+  const facing = track.getSettings().facingMode;
+  return facing === 'user' || facing === 'environment' ? facing : undefined;
 }
 
 export async function enumerateDevices(): Promise<void> {
@@ -122,16 +131,19 @@ function cameraErrorMessage(err: unknown): string {
   return "Couldn't turn the camera on.";
 }
 
-/** Camera changes (on, off, switch) run one at a time, so two cameras are never left open. */
+/**
+ * Camera changes (on, off, switch, flip in call-camera.ts) run one at a time, so two cameras are
+ * never left open.
+ */
 let cameraQueue: Promise<unknown> = Promise.resolve();
-function withCamera<T>(task: () => Promise<T>): Promise<T> {
+export function withCamera<T>(task: () => Promise<T>): Promise<T> {
   const run = cameraQueue.then(task);
   cameraQueue = run.catch(() => {});
   return run;
 }
 
 /** Make `track` the only camera in `stream`: any other one is stopped and removed. */
-function putCamera(stream: MediaStream, track: MediaStreamTrack): void {
+export function putCamera(stream: MediaStream, track: MediaStreamTrack): void {
   for (const old of stream.getVideoTracks()) {
     if (old === track) continue;
     old.stop();
@@ -141,6 +153,7 @@ function putCamera(stream: MediaStream, track: MediaStreamTrack): void {
   watchCamera(track);
   const deviceId = track.getSettings().deviceId;
   if (deviceId) selectedVideoDevice.set(deviceId);
+  cameraFacing.set(facingOfTrack(track));
 }
 
 let cameraToggle: Promise<boolean> | null = null;
@@ -181,16 +194,17 @@ async function turnCameraOn(): Promise<boolean> {
   const stream = get(localStream);
   if (!stream || get(voiceOnlyMode)) return false;
   const wanted = get(selectedVideoDevice);
+  const facing = get(cameraFacing); // front or back, as it was before it was turned off
   cameraStarting.set(true);
   let camera: MediaStream;
   try {
     try {
-      camera = await navigator.mediaDevices.getUserMedia({ video: cameraConstraints(wanted || undefined) });
+      camera = await navigator.mediaDevices.getUserMedia({ video: cameraConstraints(wanted || undefined, facing) });
     } catch (err) {
-      // The chosen camera is gone: use the default one instead.
+      // The chosen camera is gone: use the default one (facing the same way) instead.
       const name = err instanceof DOMException ? err.name : '';
       if (!wanted || !['NotFoundError', 'OverconstrainedError'].includes(name)) throw err;
-      camera = await navigator.mediaDevices.getUserMedia({ video: cameraConstraints() });
+      camera = await navigator.mediaDevices.getUserMedia({ video: cameraConstraints(undefined, facing) });
     }
   } catch (err) {
     throw new Error(cameraErrorMessage(err));
@@ -296,4 +310,53 @@ export function stopScreenShare(): void {
     screenStream.set(null);
   }
   isScreenSharing.set(false);
+}
+
+/**
+ * Use a stream that's already open (the pre-join preview) instead of opening the devices again,
+ * as startMedia would. `audio: false` joins muted (the track stays open, sending silence).
+ * `video: false` joins with the camera off, in the same state turning it off leaves: no camera
+ * track at all (any that came along is stopped), so the camera isn't held, and turning it on asks
+ * for `videoDeviceId` (facing `facing`). `voiceOnly` is audio only: no camera at all.
+ */
+export async function adoptMedia(
+  stream: MediaStream,
+  opts: {
+    audio?: boolean;
+    video?: boolean;
+    voiceOnly?: boolean;
+    audioDeviceId?: string;
+    videoDeviceId?: string;
+    facing?: 'user' | 'environment';
+  } = {}
+): Promise<MediaStream> {
+  const voiceOnly = !!opts.voiceOnly;
+  // At most one live camera, and none when joining with it off (or audio only).
+  let camera: MediaStreamTrack | undefined;
+  for (const track of stream.getVideoTracks()) {
+    if (!camera && !voiceOnly && opts.video !== false && track.readyState === 'live') {
+      camera = track;
+      continue;
+    }
+    track.stop();
+    stream.removeTrack(track);
+  }
+  if (camera) {
+    camera.enabled = true;
+    watchCamera(camera); // unplugged: treated as turned off, so one tap turns it back on
+  }
+  const audioTrack = stream.getAudioTracks()[0];
+  const audioOn = !!audioTrack && opts.audio !== false;
+  if (audioTrack) audioTrack.enabled = audioOn;
+
+  selectedAudioDevice.set(audioTrack?.getSettings().deviceId || opts.audioDeviceId || '');
+  selectedVideoDevice.set(camera?.getSettings().deviceId || opts.videoDeviceId || '');
+  cameraFacing.set((camera && facingOfTrack(camera)) ?? opts.facing);
+  audioEnabled.set(audioOn);
+  videoEnabled.set(!!camera);
+  voiceOnlyMode.set(voiceOnly);
+  localStream.set(stream);
+
+  await enumerateDevices().catch(() => {});
+  return stream;
 }
