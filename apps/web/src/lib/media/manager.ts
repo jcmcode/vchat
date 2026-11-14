@@ -240,6 +240,11 @@ export async function switchAudioDevice(deviceId: string): Promise<MediaStreamTr
   });
 
   const newTrack = newStream.getAudioTracks()[0];
+  // Left the call (or a new call took over) while the new microphone was opening: release it.
+  if (get(localStream) !== stream) {
+    newStream.getTracks().forEach((t) => t.stop());
+    return null;
+  }
   newTrack.enabled = get(audioEnabled); // stay muted if we were muted
   oldTrack?.stop();
   if (oldTrack) stream.removeTrack(oldTrack);

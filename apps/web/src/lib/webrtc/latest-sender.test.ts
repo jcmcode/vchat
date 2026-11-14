@@ -2,7 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { LatestSender } from './latest-sender.js';
 
-function harness<T>(initialState: T, intervalMs = 500, assumed?: T) {
+function harness<T>(initialState: T, intervalMs = 500, assumed?: T, latch?: (value: T, lastSent: T | undefined) => boolean) {
   let now = 1_000;
   let state = initialState;
   const sent: T[] = [];
@@ -13,6 +13,7 @@ function harness<T>(initialState: T, intervalMs = 500, assumed?: T) {
       intervalMs,
       read: () => state,
       send: (v) => sent.push(v),
+      latch,
       now: () => now,
       setTimer: (fn, ms) => {
         const id = ++ids;
@@ -106,4 +107,67 @@ test('cancel and reset drop a scheduled send', () => {
   assert.deepEqual(h.sent, [1, 3]);
   h.set(0); // what receivers assume after a reset
   assert.deepEqual(h.sent, [1, 3]);
+});
+
+type Media = { audio: boolean; video: boolean };
+const micOrCameraCameOn = (s: Media, sent: Media | undefined) => (s.audio && !sent?.audio) || (s.video && !sent?.video);
+
+test('latch: a hold-to-talk tap inside the quiet period is still announced, then the current state', () => {
+  const muted = { audio: false, video: true };
+  const live = { audio: true, video: true };
+  const h = harness<Media>(muted, 500, undefined, micOrCameraCameOn);
+  h.set(muted); // first send (receivers assume nothing yet)
+  assert.deepEqual(h.sent, [muted]);
+  h.advance(100);
+  h.set(live); // a quick tap: on…
+  h.advance(150);
+  h.set(muted); // …and off again before the interval is up
+  h.advance(250); // interval over: the tap must not vanish
+  assert.deepEqual(h.sent, [muted, live]);
+  h.advance(500); // then the current state follows
+  assert.deepEqual(h.sent, [muted, live, muted]);
+  h.advance(2000);
+  assert.equal(h.sent.length, 3, 'nothing more to say');
+});
+
+test('latch: the tap is announced even if something else changed in the same window', () => {
+  const start = { audio: false, video: true };
+  const h = harness<Media>(start, 500, start, micOrCameraCameOn);
+  h.set({ audio: false, video: false }); // camera off: goes out at once
+  h.advance(100);
+  h.set({ audio: true, video: false }); // tap on
+  h.advance(100);
+  h.set({ audio: false, video: false }); // tap off
+  h.advance(300);
+  assert.deepEqual(h.sent, [
+    { audio: false, video: false },
+    { audio: true, video: false },
+  ]);
+  h.advance(500);
+  assert.deepEqual(h.sent.at(-1), { audio: false, video: false });
+});
+
+test('latch: a quick mute is not forced out (only turning something on is)', () => {
+  const live = { audio: true, video: true };
+  const h = harness<Media>(live, 500, undefined, micOrCameraCameOn);
+  h.set(live);
+  h.advance(100);
+  h.set({ audio: false, video: true });
+  h.advance(100);
+  h.set(live);
+  h.advance(1000);
+  assert.deepEqual(h.sent, [live]);
+});
+
+test('latch: rapid taps never exceed one message per interval', () => {
+  const h = harness<Media>({ audio: false, video: false }, 500, { audio: false, video: false }, micOrCameraCameOn);
+  let on = false;
+  for (let i = 0; i < 60; i++) {
+    on = !on;
+    h.set({ audio: on, video: false });
+    h.advance(45);
+  }
+  h.advance(2000);
+  assert.ok(h.sent.length <= Math.ceil((60 * 45 + 2000) / 500) + 1, `sent ${h.sent.length}`);
+  assert.deepEqual(h.sent.at(-1), { audio: on, video: false });
 });

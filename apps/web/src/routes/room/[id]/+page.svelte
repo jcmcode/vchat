@@ -620,6 +620,11 @@
       meshStopCalled = false;
       endHoldToTalk(); // the picker can swallow the Space keyup
       const stream = await startScreenShare();
+      // The call ended (or we were removed) while the picker was open: don't start presenting.
+      if (stream && (destroyed || !$roomJoined || $roomError)) {
+        stopScreenShare();
+        return;
+      }
       if (stream) {
         startSharingScreen();
       }

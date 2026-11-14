@@ -711,11 +711,14 @@ export async function joinRoom(opts: JoinOptions): Promise<void> {
   });
 
   // Tell peers when we mute/unmute or turn the camera on/off. They accept 2 of these a second, so
-  // send at most one per 500ms, always the latest state (quick hold-to-talk taps included).
+  // send at most one per 500ms, always the latest state, and never skip a moment the mic was on.
   const mediaStateSender = new LatestSender({
     intervalMs: 500,
     read: localMediaState,
     send: (state) => broadcastToAllPeers(serialize({ type: 'media-state', ...state })),
+    // A mic or camera that came on, even for one quick hold-to-talk tap, is always announced:
+    // peers must never see "muted" for a moment when they actually heard us.
+    latch: (state, sent) => (state.audio && !sent?.audio) || (state.video && !sent?.video),
   });
   unsubscribers.push(() => mediaStateSender.cancel());
   const publishMediaState = () => mediaStateSender.notify();
@@ -1207,6 +1210,8 @@ export function replaceTrackOnAllPeers(newTrack: MediaStreamTrack | null, kind: 
 export function useNewMicTrack(track: MediaStreamTrack): void {
   const screen = get(screenStream);
   const mic = get(localStream);
+  // A microphone that isn't the call's (it finished opening after we left) is never sent or listened to.
+  if (!mic || !mic.getAudioTracks().includes(track) || track.readyState !== 'live') return;
   if (screenShareActive && screen?.getAudioTracks().length && mic) {
     replaceTrackOnAllPeers(createMixedAudioTrack(mic, screen), 'audio');
   } else {
