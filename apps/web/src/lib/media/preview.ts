@@ -62,10 +62,12 @@ export interface PreJoinResult {
   name: string;
   mode: JoinMode;
   hideIp: boolean;
-  /** The open microphone (and camera, or a stopped stand-in when joining with it off). null: chat only. */
+  /** The open microphone, and the camera if it's on (none when joining with it off). null: chat only. */
   stream: MediaStream | null;
   micOn: boolean;
   camOn: boolean;
+  /** Audio only: no camera at all (chosen, or none was found), so the call offers no camera button. */
+  voiceOnly: boolean;
   facing: Facing | undefined;
   /** The camera to open if it's turned on later ('' = any). */
   videoDeviceId: string;

@@ -11,7 +11,7 @@
   import { loadDevicePrefs, rememberDevice } from '$lib/media/device-prefs';
   import { createLevelMeter, resumeSharedAudio } from '$lib/media/audio-analysis';
   import { canChooseSpeaker, playTestTone } from '$lib/media/speaker-test';
-  import { isTouchDevice, stoppedVideoPlaceholder } from '$lib/media/call-camera';
+  import { isTouchDevice } from '$lib/media/call-camera';
   import {
     audioDevices,
     videoDevices,
@@ -20,7 +20,6 @@
     enumerateDevices,
   } from '$lib/media/manager';
 
-  export let title = '';
   export let initialName = '';
   export let initialMode: JoinMode = 'video';
   export let hideIp = false;
@@ -189,13 +188,11 @@
       }
       const noCamera = preview.snapshot.cameraProblem?.kind === 'notfound';
       const handed = preview.handOff();
-      const tracks: MediaStreamTrack[] = [];
-      if (handed.audioTrack) tracks.push(handed.audioTrack);
-      if (joinMode === 'video') {
-        // Camera off (or unavailable for now): a stopped stand-in, so it can be turned on in the call.
-        const video = handed.videoTrack ?? (noCamera ? null : stoppedVideoPlaceholder());
-        if (video) tracks.push(video);
-      }
+      // Camera off (or unavailable for now): no camera track, as turning it off in the call leaves
+      // it, so it can be turned on there. No camera at all: audio only.
+      const tracks = [handed.audioTrack, joinMode === 'video' ? handed.videoTrack : null].filter(
+        (t): t is MediaStreamTrack => !!t
+      );
       dispatch('join', {
         name: trimmed,
         mode: joinMode,
@@ -203,6 +200,7 @@
         stream: tracks.length ? new MediaStream(tracks) : null,
         micOn: handed.micOn,
         camOn: !!handed.videoTrack,
+        voiceOnly: joinMode === 'audio' || (joinMode === 'video' && noCamera && !handed.videoTrack),
         facing: handed.facing,
         videoDeviceId: handed.videoDevice,
       });
@@ -231,241 +229,220 @@
 <svelte:window on:pointerdown={resumeSharedAudio} on:keydown={resumeSharedAudio} />
 <svelte:document on:visibilitychange={onVisibilityChange} />
 
-<div class="overlay">
-  <form class="prejoin card fade-in" role="dialog" aria-modal="true" aria-labelledby="prejoin-title" on:submit|preventDefault={join}>
-    <h2 id="prejoin-title">{title || 'Join the call'}</h2>
-    <p class="sub">Choose your name and how you'd like to join.</p>
+<form class="prejoin" on:submit|preventDefault={join} aria-labelledby="prejoin-title">
+  <h2 id="prejoin-title">How you'll join</h2>
+  <p class="sub">Choose your name and how you'd like to join, and check your camera and microphone.</p>
 
-    <div class="layout">
-      <section class="media-col" aria-label="Camera and microphone check">
-        {#if mode === 'chat'}
-          <div class="chat-note">
-            <Icon name="message" size={22} />
-            <p>Your camera and microphone stay off. You'll still see and hear everyone.</p>
-          </div>
-        {:else}
-          <div class="preview" class:audio-only={mode === 'audio'}>
-            {#if mode === 'video' && camLive}
-              <!-- svelte-ignore a11y-media-has-caption -->
-              <video bind:this={videoEl} class:mirrored={shouldMirror(s.facing)} autoplay muted playsinline></video>
-            {:else}
-              <div class="placeholder" aria-live="polite">
-                {#if waiting}
-                  <span class="spinner" aria-hidden="true"></span>
-                  <p>Waiting for your browser… If it asks, choose <strong>Allow</strong>.</p>
-                {:else if problem}
-                  <Icon name="shield-alert" size={26} />
-                  <p>{problemTitle(problem)}</p>
-                {:else if idle}
-                  <Icon name={mode === 'video' ? 'video-off' : 'mic-off'} size={26} />
-                  <p>{mode === 'video' ? 'Your camera and microphone are off.' : 'Your microphone is off.'}</p>
-                  <button type="button" class="btn small" on:click={startPreview}>
-                    {mode === 'video' ? 'Check camera & mic' : 'Check microphone'}
-                  </button>
-                {:else if mode === 'video' && !s.camOn}
-                  <Icon name="video-off" size={26} />
-                  <p>Camera is off. You'll join with it off.</p>
-                {:else if cameraProblem}
-                  <Icon name="video-off" size={26} />
-                  <p>{problemTitle(cameraProblem)}</p>
-                {:else}
-                  <Icon name="mic" size={26} />
-                  <p>{s.micOn ? 'Microphone is on.' : "You're muted."}</p>
-                {/if}
-              </div>
-            {/if}
+  <div class="layout">
+    <section class="media-col" aria-label="Camera and microphone check">
+      {#if mode === 'chat'}
+        <div class="chat-note">
+          <Icon name="message" size={22} />
+          <p>Your camera and microphone stay off. You'll still see and hear everyone.</p>
+        </div>
+      {:else}
+        <div class="preview" class:audio-only={mode === 'audio'}>
+          {#if mode === 'video' && camLive}
+            <!-- svelte-ignore a11y-media-has-caption -->
+            <video bind:this={videoEl} class:mirrored={shouldMirror(s.facing)} autoplay muted playsinline></video>
+          {:else}
+            <div class="placeholder" aria-live="polite">
+              {#if waiting}
+                <span class="spinner" aria-hidden="true"></span>
+                <p>Waiting for your browser… If it asks, choose <strong>Allow</strong>.</p>
+              {:else if problem}
+                <Icon name="shield-alert" size={26} />
+                <p>{problemTitle(problem)}</p>
+              {:else if idle}
+                <Icon name={mode === 'video' ? 'video-off' : 'mic-off'} size={26} />
+                <p>{mode === 'video' ? 'Your camera and microphone are off.' : 'Your microphone is off.'}</p>
+                <button type="button" class="btn small" on:click={startPreview}>
+                  {mode === 'video' ? 'Check camera & mic' : 'Check microphone'}
+                </button>
+              {:else if mode === 'video' && !s.camOn}
+                <Icon name="video-off" size={26} />
+                <p>Camera is off. You'll join with it off.</p>
+              {:else if cameraProblem}
+                <Icon name="video-off" size={26} />
+                <p>{problemTitle(cameraProblem)}</p>
+              {:else}
+                <Icon name="mic" size={26} />
+                <p>{s.micOn ? 'Microphone is on.' : "You're muted."}</p>
+              {/if}
+            </div>
+          {/if}
 
-            <div class="preview-controls">
+          <div class="preview-controls">
+            <button
+              type="button"
+              class="round"
+              class:off={!s.micOn}
+              on:click={toggleMic}
+              aria-label={s.micOn ? 'Mute: join with the microphone off' : 'Unmute: join with the microphone on'}
+              title={s.micOn ? 'Mute' : 'Unmute'}
+            >
+              <Icon name={s.micOn ? 'mic' : 'mic-off'} size={18} />
+            </button>
+            {#if mode === 'video'}
               <button
                 type="button"
                 class="round"
-                class:off={!s.micOn}
-                on:click={toggleMic}
-                aria-label={s.micOn ? 'Mute: join with the microphone off' : 'Unmute: join with the microphone on'}
-                title={s.micOn ? 'Mute' : 'Unmute'}
+                class:off={!s.camOn}
+                on:click={toggleCamera}
+                aria-label={s.camOn ? 'Turn the camera off (join with it off)' : 'Turn the camera on'}
+                title={s.camOn ? 'Camera off' : 'Camera on'}
               >
-                <Icon name={s.micOn ? 'mic' : 'mic-off'} size={18} />
+                <Icon name={s.camOn ? 'video' : 'video-off'} size={18} />
               </button>
-              {#if mode === 'video'}
-                <button
-                  type="button"
-                  class="round"
-                  class:off={!s.camOn}
-                  on:click={toggleCamera}
-                  aria-label={s.camOn ? 'Turn the camera off (join with it off)' : 'Turn the camera on'}
-                  title={s.camOn ? 'Camera off' : 'Camera on'}
-                >
-                  <Icon name={s.camOn ? 'video' : 'video-off'} size={18} />
-                </button>
+            {/if}
+            {#if mode === 'video' && canFlip}
+              <button type="button" class="round" on:click={flip} aria-label="Switch between front and back camera" title="Switch camera">
+                <Icon name="switch-camera" size={18} />
+              </button>
+            {/if}
+          </div>
+        </div>
+
+        <div class="level" class:active={micLive && s.micOn} aria-hidden="true">
+          <Icon name={s.micOn ? 'mic' : 'mic-off'} size={14} />
+          <span class="level-track"><span class="level-fill" style="transform: scaleX({level})"></span></span>
+        </div>
+
+        {#if shownProblem}
+          <div class="problem" class:soft={!problem} role="alert">
+            <strong>{describeProblem(shownProblem).title}</strong>
+            <p>{describeProblem(shownProblem).detail}</p>
+            {#if shownProblem.kind === 'denied'}
+              <ol>
+                {#each steps as step}<li>{step}</li>{/each}
+              </ol>
+            {/if}
+            <p class="fallback">
+              {#if shownProblem.devices === 'camera' && shownProblem.kind === 'notfound'}
+                You'll join with audio only.
+              {:else if shownProblem.devices === 'camera'}
+                You'll join with your camera off, and can turn it on later.
+              {:else}
+                {fallbackText(shownProblem)}
               {/if}
-              {#if mode === 'video' && canFlip}
-                <button type="button" class="round" on:click={flip} aria-label="Switch between front and back camera" title="Switch camera">
-                  <Icon name="switch-camera" size={18} />
-                </button>
+            </p>
+            <div class="problem-actions">
+              <button type="button" class="btn small" on:click={startPreview} disabled={waiting}>Try again</button>
+              {#if problem}
+                <button type="button" class="btn small ghost" on:click={() => chooseMode('chat')}>Use chat only</button>
               {/if}
             </div>
           </div>
-
-          <div class="level" class:active={micLive && s.micOn} aria-hidden="true">
-            <Icon name={s.micOn ? 'mic' : 'mic-off'} size={14} />
-            <span class="level-track"><span class="level-fill" style="transform: scaleX({level})"></span></span>
-          </div>
-
-          {#if shownProblem}
-            <div class="problem" class:soft={!problem} role="alert">
-              <strong>{describeProblem(shownProblem).title}</strong>
-              <p>{describeProblem(shownProblem).detail}</p>
-              {#if shownProblem.kind === 'denied'}
-                <ol>
-                  {#each steps as step}<li>{step}</li>{/each}
-                </ol>
-              {/if}
-              <p class="fallback">
-                {#if shownProblem.devices === 'camera' && shownProblem.kind === 'notfound'}
-                  You'll join with audio only.
-                {:else if shownProblem.devices === 'camera'}
-                  You'll join with your camera off, and can turn it on later.
-                {:else}
-                  {fallbackText(shownProblem)}
-                {/if}
-              </p>
-              <div class="problem-actions">
-                <button type="button" class="btn small" on:click={startPreview} disabled={waiting}>Try again</button>
-                {#if problem}
-                  <button type="button" class="btn small ghost" on:click={() => chooseMode('chat')}>Use chat only</button>
-                {/if}
-              </div>
-            </div>
-          {/if}
         {/if}
+      {/if}
 
-        {#if deviceError}<p class="device-error" role="alert">{deviceError}</p>{/if}
+      {#if deviceError}<p class="device-error" role="alert">{deviceError}</p>{/if}
 
-        <div class="devices">
-          {#if mode !== 'chat' && mics.length > 0}
-            <div class="field">
-              <label class="field-label" for="pj-mic">Microphone</label>
-              <select id="pj-mic" class="input" value={micId} on:change={pickMic} disabled={waiting}>
-                {#each mics as device (device.deviceId)}
-                  <option value={device.deviceId}>{device.label}</option>
-                {/each}
-              </select>
-            </div>
-          {/if}
-          {#if mode === 'video' && cams.length > 0}
-            <div class="field">
-              <label class="field-label" for="pj-cam">Camera</label>
-              <select id="pj-cam" class="input" value={camId || chosenCam} on:change={pickCamera} disabled={waiting}>
-                {#each cams as device (device.deviceId)}
-                  <option value={device.deviceId}>{device.label}</option>
-                {/each}
-              </select>
-            </div>
-          {/if}
-          {#if speakers.length > 0}
-            <div class="field">
-              <label class="field-label" for="pj-spk">Speaker</label>
-              <select id="pj-spk" class="input" value={$selectedAudioOutput} on:change={pickSpeaker}>
-                {#if !speakers.some((d) => d.deviceId === 'default')}
-                  <option value="">System default</option>
-                {/if}
-                {#each speakers as device (device.deviceId)}
-                  <option value={device.deviceId}>{device.label}</option>
-                {/each}
-              </select>
-            </div>
-          {/if}
-          <button type="button" class="btn small ghost test-speaker" on:click={testSpeaker} disabled={testingSpeaker}>
-            <Icon name="volume" size={16} />
-            {testingSpeaker ? 'Playing…' : 'Test speaker'}
-          </button>
-        </div>
-      </section>
+      <div class="devices">
+        {#if mode !== 'chat' && mics.length > 0}
+          <div class="field">
+            <label class="field-label" for="pj-mic">Microphone</label>
+            <select id="pj-mic" class="input" value={micId} on:change={pickMic} disabled={waiting}>
+              {#each mics as device (device.deviceId)}
+                <option value={device.deviceId}>{device.label}</option>
+              {/each}
+            </select>
+          </div>
+        {/if}
+        {#if mode === 'video' && cams.length > 0}
+          <div class="field">
+            <label class="field-label" for="pj-cam">Camera</label>
+            <select id="pj-cam" class="input" value={camId || chosenCam} on:change={pickCamera} disabled={waiting}>
+              {#each cams as device (device.deviceId)}
+                <option value={device.deviceId}>{device.label}</option>
+              {/each}
+            </select>
+          </div>
+        {/if}
+        {#if speakers.length > 0}
+          <div class="field">
+            <label class="field-label" for="pj-spk">Speaker</label>
+            <select id="pj-spk" class="input" value={$selectedAudioOutput} on:change={pickSpeaker}>
+              {#if !speakers.some((d) => d.deviceId === 'default')}
+                <option value="">System default</option>
+              {/if}
+              {#each speakers as device (device.deviceId)}
+                <option value={device.deviceId}>{device.label}</option>
+              {/each}
+            </select>
+          </div>
+        {/if}
+        <button type="button" class="btn small ghost test-speaker" on:click={testSpeaker} disabled={testingSpeaker}>
+          <Icon name="volume" size={16} />
+          {testingSpeaker ? 'Playing…' : 'Test speaker'}
+        </button>
+      </div>
+    </section>
 
-      <section class="form-col">
-        <div class="field">
-          <label class="field-label" for="prejoin-name">Your name</label>
-          <!-- svelte-ignore a11y-autofocus -->
-          <input id="prejoin-name" class="input" type="text" bind:value={name} placeholder="Your name" maxlength="30" autofocus />
-        </div>
-        <fieldset class="join-modes">
-          <legend class="field-label">Join with</legend>
-          <label class="mode" class:selected={mode === 'video'}>
-            <input type="radio" name="prejoin-mode" value="video" checked={mode === 'video'} on:change={() => chooseMode('video')} />
-            <span class="mode-icon"><Icon name="video" size={18} /></span>
-            <span class="mode-text"><strong>Camera &amp; mic</strong><small>Video and voice</small></span>
-            <span class="mode-check" aria-hidden="true"><Icon name="check" size={14} /></span>
-          </label>
-          <label class="mode" class:selected={mode === 'audio'}>
-            <input type="radio" name="prejoin-mode" value="audio" checked={mode === 'audio'} on:change={() => chooseMode('audio')} />
-            <span class="mode-icon"><Icon name="mic" size={18} /></span>
-            <span class="mode-text"><strong>Audio only</strong><small>Voice, no camera</small></span>
-            <span class="mode-check" aria-hidden="true"><Icon name="check" size={14} /></span>
-          </label>
-          <label class="mode" class:selected={mode === 'chat'}>
-            <input type="radio" name="prejoin-mode" value="chat" checked={mode === 'chat'} on:change={() => chooseMode('chat')} />
-            <span class="mode-icon"><Icon name="message" size={18} /></span>
-            <span class="mode-text"><strong>Chat only</strong><small>No camera or mic · you still see and hear everyone</small></span>
-            <span class="mode-check" aria-hidden="true"><Icon name="check" size={14} /></span>
-          </label>
-        </fieldset>
-        <label class="hide-ip">
-          <input type="checkbox" bind:checked={hideIp} on:change={() => setRelayOnly(hideIp)} />
-          <span>
-            <strong>Hide my IP address</strong>
-            <small>Route through the server's relay instead of connecting directly. Still end-to-end encrypted; may add a little delay. Needs a TURN relay on this server.</small>
-          </span>
+    <section class="form-col">
+      <div class="field">
+        <label class="field-label" for="prejoin-name">Your name</label>
+        <!-- svelte-ignore a11y-autofocus -->
+        <input id="prejoin-name" class="input" type="text" bind:value={name} placeholder="Your name" maxlength="30" autofocus />
+      </div>
+      <fieldset class="join-modes">
+        <legend class="field-label">Join with</legend>
+        <label class="mode" class:selected={mode === 'video'}>
+          <input type="radio" name="prejoin-mode" value="video" checked={mode === 'video'} on:change={() => chooseMode('video')} />
+          <span class="mode-icon"><Icon name="video" size={18} /></span>
+          <span class="mode-text"><strong>Camera &amp; mic</strong><small>Video and voice</small></span>
+          <span class="mode-check" aria-hidden="true"><Icon name="check" size={14} /></span>
         </label>
-      </section>
-    </div>
+        <label class="mode" class:selected={mode === 'audio'}>
+          <input type="radio" name="prejoin-mode" value="audio" checked={mode === 'audio'} on:change={() => chooseMode('audio')} />
+          <span class="mode-icon"><Icon name="mic" size={18} /></span>
+          <span class="mode-text"><strong>Audio only</strong><small>Voice, no camera</small></span>
+          <span class="mode-check" aria-hidden="true"><Icon name="check" size={14} /></span>
+        </label>
+        <label class="mode" class:selected={mode === 'chat'}>
+          <input type="radio" name="prejoin-mode" value="chat" checked={mode === 'chat'} on:change={() => chooseMode('chat')} />
+          <span class="mode-icon"><Icon name="message" size={18} /></span>
+          <span class="mode-text"><strong>Chat only</strong><small>No camera or mic · you still see and hear everyone</small></span>
+          <span class="mode-check" aria-hidden="true"><Icon name="check" size={14} /></span>
+        </label>
+      </fieldset>
+      <label class="hide-ip">
+        <input type="checkbox" bind:checked={hideIp} on:change={() => setRelayOnly(hideIp)} />
+        <span>
+          <strong>Hide my IP address</strong>
+          <small>Route through the server's relay instead of connecting directly. Still end-to-end encrypted; may add a little delay. Needs a TURN relay on this server.</small>
+        </span>
+      </label>
+    </section>
+  </div>
 
-    <div class="actions">
-      <button type="button" class="btn ghost" on:click={cancel}>Cancel</button>
-      <button type="submit" class="btn primary" disabled={!name.trim() || joining || waiting}>
-        {joining || waiting ? 'Starting…' : 'Join'}
-      </button>
-    </div>
-  </form>
-</div>
+  <div class="actions">
+    <button type="button" class="btn ghost" on:click={cancel}>Cancel</button>
+    <button type="submit" class="btn primary" disabled={!name.trim() || joining || waiting}>
+      {joining || waiting ? 'Starting…' : 'Join'}
+    </button>
+  </div>
+</form>
 
 <style>
-  .overlay {
-    position: fixed;
-    inset: 0;
-    z-index: 100;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    padding: var(--space-4);
-    background: rgba(8, 10, 15, 0.72);
-    -webkit-backdrop-filter: blur(6px);
-    backdrop-filter: blur(6px);
-    overflow-y: auto;
-  }
-
+  /* A step of the landing card (+page.svelte), which provides the room name and frame. */
   .prejoin {
-    width: min(100%, 780px);
-    max-height: 100%;
-    overflow-y: auto;
-    margin: auto;
-    padding: var(--space-6);
-    box-shadow: var(--shadow-lg);
     display: flex;
     flex-direction: column;
     gap: var(--space-3);
+    padding-top: var(--space-4);
+    border-top: 1px solid var(--border-subtle);
   }
 
   h2 {
-    font-size: var(--text-xl);
+    font-size: var(--text-lg);
     font-weight: 600;
-    letter-spacing: -0.01em;
     color: var(--text);
-    overflow-wrap: anywhere;
   }
 
   .sub {
     color: var(--text-muted);
-    font-size: var(--text-base);
+    font-size: var(--text-sm);
     margin-top: calc(var(--space-2) * -1);
   }
 
@@ -823,9 +800,9 @@
     }
   }
 
-  @media (max-width: 640px) {
-    .prejoin {
-      padding: var(--space-5);
+  @media (max-width: 480px) {
+    .actions .btn {
+      flex: 1;
     }
   }
 

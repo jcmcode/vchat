@@ -1,5 +1,6 @@
 // Regression tests for the second security review (throttles, identity takeover, remove-peer,
 // token malleability, fail-closed config, TURN credentials, names, nothing-stored metadata).
+import { createHmac } from 'node:crypto';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
@@ -17,11 +18,15 @@ import {
   getIceServers,
   handleApi,
   hashRoomPassword,
+  cleanInviteMessage,
+  icsFold,
+  icsText,
   ipKey,
   nameKey,
   parseClientMessage,
   resolveConfig,
   signToken,
+  throttleClientId,
   verifyToken,
   type RoomMeta,
   type ServerEnv,
@@ -132,6 +137,17 @@ test('AttemptCounter: overflow evicts stale keys first, then the oldest', () => 
   c.take('d', 5, 5003); // nothing stale: oldest ('a') goes
   assert.equal(c.count('a', 5003), 0);
   assert.equal(c.count('b', 5003), 1);
+});
+
+test('AttemptCounter: a refund gives back one attempt even when others remain', () => {
+  const c = new AttemptCounter(60_000);
+  for (let i = 0; i < 3; i++) c.take('k', 3, 1000 + i);
+  assert.equal(c.take('k', 3, 1010), false);
+  c.refund('k', 1011);
+  assert.equal(c.count('k', 1011), 2);
+  assert.equal(c.take('k', 3, 1012), true);
+  c.refund('other', 1013); // nothing to refund: no-op
+  assert.equal(c.count('other', 1013), 0);
 });
 
 // ── 2. peerId takeover ────────────────────────────────────────────────────────
@@ -754,8 +770,11 @@ test('emailed invite: per-guest code, `to` reaches the host, nothing secret in t
     resend.restore();
   }
   assert.equal(res.status, 200);
+  // The older single `email` field still works.
   const out = (await res.json()) as Record<string, unknown>;
-  assert.deepEqual(out, { ok: true, expiresAt: created.expiresAt });
+  assert.deepEqual(out, { ok: true, sent: ['guest@example.com'], failed: [], expiresAt: created.expiresAt, warnings: [] });
+  assert.equal(resend.calls.length, 1);
+  assert.equal(resend.calls[0].body.attachments, undefined);
 
   const mail = resend.calls[0].body;
   assert.deepEqual(mail.to, ['guest@example.com']);
@@ -799,7 +818,7 @@ test('emailed invite: per-guest code, `to` reaches the host, nothing secret in t
   }
   assert.ok(!resend2.calls[0].body.text.includes('&k='));
 
-  // Resend failure: generic 502, no provider details.
+  // Resend failure: reported per recipient, no provider details.
   const failing = stubResend(true);
   let failed: Response;
   try {
@@ -807,8 +826,10 @@ test('emailed invite: per-guest code, `to` reaches the host, nothing secret in t
   } finally {
     failing.restore();
   }
-  assert.equal(failed.status, 502);
-  assert.ok(!JSON.stringify(await failed.json()).includes('provider detail'));
+  assert.equal(failed.status, 200);
+  const failedBody = await failed.json();
+  assert.deepEqual(failedBody, { ok: true, sent: [], failed: [{ email: 'g3@example.com', reason: 'send-failed' }], expiresAt: created.expiresAt, warnings: [] });
+  assert.ok(!JSON.stringify(failedBody).includes('provider detail'));
 
   // Not configured: 503.
   const noMail = await handleApi(post('/api/admin/rooms/email-invite', { roomId: created.roomId, inviteToken: created.inviteToken, email: 'g@example.com' }, cookie), env);
@@ -824,4 +845,527 @@ test('sign-in codes are 6 uniform digits', async () => {
     counts[Number(c[0])]++;
   }
   assert.ok(counts.every((n) => n > 350 && n < 650), counts.join());
+});
+
+// ── Emailed invites: several recipients, no passcode, calendar file ───────────
+
+const inviteEnv: ServerEnv = { ...env, ...RESEND };
+
+async function ownerCookie(ip: string): Promise<string> {
+  const login = await handleApi(post('/api/admin/login', { password: 'correct horse battery' }), inviteEnv, { clientIp: ip });
+  return login!.headers.get('Set-Cookie')!.split(';')[0];
+}
+
+async function newRoom(cookie: string, body: Record<string, unknown> = {}) {
+  return (await (await handleApi(post('/api/admin/rooms', body, cookie), inviteEnv))!.json()) as {
+    roomId: string;
+    inviteToken: string;
+    expiresAt: number;
+  };
+}
+
+interface InviteResult {
+  ok: true;
+  sent: string[];
+  failed: { email: string; reason: string }[];
+  expiresAt: number;
+  warnings: string[];
+  error?: string;
+}
+
+async function sendInvites(cookie: string, body: Record<string, unknown>) {
+  const resend = stubResend();
+  let res: Response;
+  try {
+    res = (await handleApi(post('/api/admin/rooms/email-invite', body, cookie), inviteEnv))!;
+  } finally {
+    resend.restore();
+  }
+  return { res, status: res.status, out: (await res.json()) as InviteResult, calls: resend.calls };
+}
+
+const linkIn = (text: string) => text.match(/https:\/\/call\.example\.com\/room\/\S+/)![0];
+const tokenIn = (text: string) => linkIn(text).split('#invite=')[1].split('&')[0];
+
+function checkReq(body: unknown, origin = SITE) {
+  return new Request(`${SITE}/api/invite/check`, {
+    method: 'POST',
+    headers: { Origin: origin, Host: 'call.example.com', 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+}
+async function check(body: unknown, clientIp = '198.51.100.30', opts: Record<string, unknown> = {}) {
+  const res = (await handleApi(checkReq(body), inviteEnv, { clientIp, ...opts }))!;
+  return { status: res.status, body: (await res.json()) as Record<string, unknown>, res };
+}
+
+test('email invite: several recipients each get their own email, token and code, and never see each other', async () => {
+  const cookie = await ownerCookie('25.0.0.1');
+  const room = await newRoom(cookie, { label: 'Team', approval: false });
+  const emails = ['A@Example.com', 'b@example.com', 'c@example.org'];
+  const { status, out, calls } = await sendInvites(cookie, { roomId: room.roomId, inviteToken: room.inviteToken, emails });
+  assert.equal(status, 200);
+  assert.deepEqual(out, { ok: true, sent: ['a@example.com', 'b@example.com', 'c@example.org'], failed: [], expiresAt: room.expiresAt, warnings: [] });
+  assert.equal(calls.length, 3);
+
+  const tokens: string[] = [];
+  const codes: string[] = [];
+  for (const [i, call] of calls.entries()) {
+    const me = out.sent[i];
+    assert.deepEqual(call.body.to, [me]); // one recipient per email: no shared To/CC
+    assert.equal(call.body.cc, undefined);
+    assert.equal(call.body.bcc, undefined);
+    const raw = JSON.stringify(call.body);
+    for (const other of out.sent) if (other !== me) assert.ok(!raw.includes(other), 'no other recipient in the email');
+    const token = tokenIn(call.body.text);
+    tokens.push(token);
+    const p = await verifyToken(SECRET, token);
+    assert.ok(p.ok && p.payload.to === me && p.payload.approval === false && typeof p.payload.pw === 'string');
+    codes.push(codeIn(call.body.text.split('Your code:')[1]));
+  }
+  assert.equal(new Set(tokens).size, 3);
+  // Each code works with its own token only.
+  assert.equal((await authorizeJoin(inviteEnv, { roomId: room.roomId, token: tokens[0], password: codes[0] }, { clientId: 'm1' })).ok, true);
+  if (codes[0] !== codes[1]) {
+    assert.deepEqual(await authorizeJoin(inviteEnv, { roomId: room.roomId, token: tokens[1], password: codes[0] }, { clientId: 'm1' }), {
+      ok: false,
+      passwordRequired: true,
+      invalid: true,
+    });
+  }
+  // Nothing secret in the response.
+  const raw = JSON.stringify(out);
+  for (const t of tokens) assert.ok(!raw.includes(t));
+  for (const c of codes) assert.ok(!raw.includes(c));
+});
+
+test('email invite: addresses are deduplicated, invalid ones reported, more than 20 or none valid is a 400', async () => {
+  const cookie = await ownerCookie('25.0.0.2');
+  const room = await newRoom(cookie);
+  const base = { roomId: room.roomId, inviteToken: room.inviteToken };
+  const { status, out, calls } = await sendInvites(cookie, {
+    ...base,
+    emails: [' X@Example.com ', 'x@example.com', 'not-an-email', '', 'y@example.com', 'NOT-an-email', 42],
+  });
+  assert.equal(status, 200);
+  assert.deepEqual(out.sent, ['x@example.com', 'y@example.com']);
+  assert.deepEqual(out.failed, [
+    { email: 'not-an-email', reason: 'invalid' },
+    { email: '', reason: 'invalid' },
+  ]);
+  assert.equal(calls.length, 2);
+
+  const none = await sendInvites(cookie, { ...base, emails: ['nope', ' '] });
+  assert.equal(none.status, 400);
+  assert.equal(none.calls.length, 0);
+  assert.equal((await sendInvites(cookie, { ...base, emails: [] })).status, 400);
+  assert.equal((await sendInvites(cookie, { ...base })).status, 400);
+
+  const many = Array.from({ length: 21 }, (_, i) => `p${i}@example.com`);
+  const tooMany = await sendInvites(cookie, { ...base, emails: many });
+  assert.equal(tooMany.status, 400);
+  assert.equal(tooMany.calls.length, 0);
+  // 20 distinct after deduplication passes the count check (stopped here by the bad token, unsent).
+  const dupes = await sendInvites(cookie, { ...base, emails: [...many.slice(0, 20), 'P0@example.com'], inviteToken: 'bad' });
+  assert.equal(dupes.status, 400);
+  assert.equal(dupes.out.error, 'Invalid or expired invite');
+});
+
+test('email invite: passcode:false gives a token with no code and approval forced; the guest waits for the host', async () => {
+  const cookie = await ownerCookie('25.0.0.3');
+  const room = await newRoom(cookie, { password: 'roompw', approval: false });
+  const { status, out, calls } = await sendInvites(cookie, {
+    roomId: room.roomId,
+    inviteToken: room.inviteToken,
+    emails: ['lobby@example.com'],
+    passcode: false,
+  });
+  assert.equal(status, 200);
+  assert.deepEqual(out.sent, ['lobby@example.com']);
+  const mail = calls[0].body;
+  assert.match(mail.text, /Open the link, enter your name, and the host will let you in\./);
+  assert.ok(mail.html.includes('Open the link, enter your name, and the host will let you in.'));
+  assert.ok(!/Your code/.test(mail.text) && !/Your code/.test(mail.html));
+  assert.ok(!/\b\d{6}\b/.test(mail.text.replace(/https:\S+/g, '')), 'no code in the email');
+
+  const token = tokenIn(mail.text);
+  const p = await verifyToken(SECRET, token);
+  assert.ok(p.ok);
+  assert.equal(p.payload.pw, undefined); // no code, and the room password is dropped too
+  assert.equal(p.payload.approval, true);
+  assert.equal(p.payload.to, 'lobby@example.com');
+
+  // Joins with no code…
+  const decision = await authorizeJoin(inviteEnv, { roomId: room.roomId, token }, { clientId: 'np1' });
+  assert.ok(decision.ok);
+  assert.deepEqual(decision.ok && decision.grant, { role: 'guest', approval: true, label: undefined, email: 'lobby@example.com' });
+  // …and lands in the waiting queue, even before the host is there.
+  const r = new Room<Conn>(room.roomId, transport);
+  const g = new Conn();
+  await r.enter(g, who('g'), decision.ok ? decision.grant : HOST);
+  assert.deepEqual(g.last(), { type: 'waiting-for-admission', roomId: room.roomId, hostPresent: false });
+  const h = new Conn();
+  await r.enter(h, who('h'), HOST);
+  assert.equal(h.last('admission-request').email, 'lobby@example.com');
+  r.admitPeer(h, 'g');
+  assert.equal(g.last('room-peers').type, 'room-peers');
+
+  // The check endpoint says no code is needed.
+  assert.deepEqual((await check({ roomId: room.roomId, token, code: '' })).body, { ok: true, required: false });
+});
+
+test('ics: escaping and UTF-8-safe folding at 75 octets', () => {
+  assert.equal(icsText('a\\b;c,d\ne\r\nf'), 'a\\\\b\\;c\\,d\\ne\\nf');
+  assert.equal(icsFold('short'), 'short');
+  const long = `SUMMARY:${'é'.repeat(40)}${'x'.repeat(30)}☕☕☕${'y'.repeat(80)}`;
+  const folded = icsFold(long);
+  const lines = folded.split('\r\n');
+  assert.ok(lines.length > 2);
+  for (const [i, line] of lines.entries()) {
+    assert.ok(Buffer.byteLength(line, 'utf8') <= 75, `line ${i} is ${Buffer.byteLength(line, 'utf8')} octets`);
+    if (i > 0) assert.equal(line[0], ' ');
+  }
+  assert.equal(folded.replace(/\r\n /g, ''), long);
+});
+
+test('email invite: a schedule adds a When line and a valid METHOD:REQUEST invite.ics with the passcode', async () => {
+  const cookie = await ownerCookie('25.0.0.4');
+  const label = 'Planning, review; budget \\ next — café ☕ ünïcödé ñ';
+  const room = await newRoom(cookie, { label, expiresInHours: 24 * 7 });
+  const startsAt = Math.ceil((Date.now() + 2 * 24 * 3600_000) / 3600_000) * 3600_000 + 30 * 60_000;
+  const key = 'B'.repeat(43);
+  const { status, out, calls } = await sendInvites(cookie, {
+    roomId: room.roomId,
+    inviteToken: room.inviteToken,
+    emails: ['cal@example.com'],
+    key,
+    schedule: { startsAt, durationMinutes: 90 },
+  });
+  assert.equal(status, 200);
+  assert.deepEqual(out.warnings, []);
+  assert.deepEqual(out.sent, ['cal@example.com']);
+
+  const mail = calls[0].body;
+  const d = new Date(startsAt);
+  const weekday = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'][d.getUTCDay()];
+  assert.ok(mail.text.includes(`When: ${weekday}, ${d.getUTCDate()} `), mail.text);
+  assert.match(mail.text, /When: .+ \d{4}, \d{2}:30 UTC \(1 h 30 min\)/);
+  assert.match(mail.text, /A calendar invite is attached\./);
+  assert.ok(mail.html.includes('A calendar invite is attached.') && mail.html.includes('When:'));
+  const code = codeIn(mail.text.split('Your code:')[1]);
+  const link = linkIn(mail.text);
+  assert.ok(link.endsWith(`&k=${key}`));
+
+  assert.equal(mail.attachments.length, 1);
+  const att = mail.attachments[0];
+  assert.deepEqual(Object.keys(att).sort(), ['content', 'content_type', 'filename']);
+  assert.equal(att.filename, 'invite.ics');
+  assert.equal(att.content_type, 'text/calendar; method=REQUEST; charset=UTF-8');
+  assert.match(att.content, /^[A-Za-z0-9+/]+=*$/);
+  const ics = Buffer.from(att.content, 'base64').toString('utf8');
+  assert.equal(Buffer.from(ics, 'utf8').toString('base64'), att.content); // decodes losslessly
+  assert.ok(!ics.includes('�'), 'no character split by folding');
+
+  // CRLF everywhere, folded lines of at most 75 octets.
+  assert.ok(ics.endsWith('\r\n'));
+  assert.ok(!/[^\r]\n/.test(ics) && !/\r[^\n]/.test(ics), 'only CRLF line breaks');
+  const physical = ics.slice(0, -2).split('\r\n');
+  for (const line of physical) assert.ok(Buffer.byteLength(line, 'utf8') <= 75, `${Buffer.byteLength(line, 'utf8')} octets: ${line}`);
+  assert.ok(physical.some((l) => l.startsWith(' ')), 'long lines are folded');
+
+  const lines = ics.replace(/\r\n /g, '').slice(0, -2).split('\r\n');
+  const prop = (name: string) => lines.find((l) => l.startsWith(`${name}:`) || l.startsWith(`${name};`));
+  const iso = (ms: number) => new Date(ms).toISOString().replace(/[-:]/g, '').replace(/\.\d{3}/, '');
+  assert.deepEqual(lines.slice(0, 6), ['BEGIN:VCALENDAR', 'VERSION:2.0', 'PRODID:-//vchat//invite//EN', 'CALSCALE:GREGORIAN', 'METHOD:REQUEST', 'BEGIN:VEVENT']);
+  assert.deepEqual(lines.slice(-3), ['END:VALARM', 'END:VEVENT', 'END:VCALENDAR']);
+  assert.equal(lines.filter((l) => l === 'BEGIN:VEVENT').length, 1);
+  assert.match(prop('UID')!, /^UID:[A-Za-z0-9_-]+@call\.example\.com$/);
+  assert.match(prop('DTSTAMP')!, /^DTSTAMP:\d{8}T\d{6}Z$/);
+  assert.equal(prop('DTSTART'), `DTSTART:${iso(startsAt)}`);
+  assert.equal(prop('DTEND'), `DTEND:${iso(startsAt + 90 * 60_000)}`);
+  assert.equal(prop('SUMMARY'), 'SUMMARY:Planning\\, review\\; budget \\\\ next — café ☕ ünïcödé ñ');
+  assert.equal(prop('DESCRIPTION'), `DESCRIPTION:Join: ${link}\\nPasscode: ${code}`);
+  assert.equal(prop('URL'), `URL:${link}`);
+  assert.equal(prop('LOCATION'), `LOCATION:${link}`);
+  assert.equal(prop('ORGANIZER'), 'ORGANIZER;CN=vchat:mailto:invites@example.com');
+  assert.equal(prop('ATTENDEE'), 'ATTENDEE;CN=cal@example.com;RSVP=FALSE;PARTSTAT=NEEDS-ACTION;ROLE=REQ-PARTICIPANT:mailto:cal@example.com');
+  assert.ok(lines.includes('STATUS:CONFIRMED') && lines.includes('SEQUENCE:0'));
+  assert.ok(lines.includes('BEGIN:VALARM') && lines.includes('ACTION:DISPLAY') && lines.includes('TRIGGER:-PT10M'));
+
+  // The guest's own code is in the calendar file, in the description only, labelled as the passcode
+  // (ignoring the link and timestamps, which hold random digits).
+  const scrubbed = lines.filter((l) => !/^(UID|DTSTAMP|DTSTART|DTEND):/.test(l)).join('\n').split(link).join('');
+  assert.equal(scrubbed.split(code).length, 2, 'the code appears exactly once');
+  assert.ok(prop('DESCRIPTION')!.endsWith(`\\nPasscode: ${code}`));
+});
+
+test('email invite: schedule warnings (ignored when invalid, noted when the meeting outlasts the invite)', async () => {
+  const cookie = await ownerCookie('25.0.0.5');
+  const room = await newRoom(cookie, { expiresInHours: 2 });
+  const base = { roomId: room.roomId, inviteToken: room.inviteToken };
+  const day = 24 * 3600_000;
+  // Two invalid schedules end to end (the bounds are covered below without sending).
+  for (const schedule of [
+    { startsAt: Date.now() + 401 * day, durationMinutes: 60 },
+    { startsAt: Date.now() + day, durationMinutes: 30.5 },
+  ]) {
+    const { status, out, calls } = await sendInvites(cookie, { ...base, emails: ['w@example.com'], schedule });
+    assert.equal(status, 200);
+    assert.deepEqual(out.warnings, ['schedule-ignored'], JSON.stringify(schedule));
+    assert.equal(calls[0].body.attachments, undefined);
+    assert.ok(!/When:/.test(calls[0].body.text));
+  }
+
+  // Valid, but the invite expires in 2 hours: still sent, with a warning.
+  const late = await sendInvites(cookie, { ...base, emails: ['late@example.com'], passcode: false, schedule: { startsAt: Date.now() + day, durationMinutes: 60 } });
+  assert.equal(late.status, 200);
+  assert.deepEqual(late.out.sent, ['late@example.com']);
+  assert.deepEqual(late.out.warnings, ['meeting-ends-after-invite-expires']);
+  const ics = Buffer.from(late.calls[0].body.attachments[0].content, 'base64').toString('utf8').replace(/\r\n /g, '');
+  // No passcode: the description doesn't mention one, and no code is anywhere in the email or file.
+  assert.match(ics, /\r\nDESCRIPTION:Join: https:\/\/call\.example\.com\/room\/[^\r]+\r\n/);
+  assert.ok(!/passcode/i.test(ics));
+  const description = ics.split('\r\n').find((l) => l.startsWith('DESCRIPTION:'))!;
+  assert.ok(!/\b\d{6}\b/.test(description.replace(/https:\S+/g, '')));
+  assert.ok(!/\b\d{6}\b/.test(late.calls[0].body.text.replace(/https:\S+/g, '')), 'no code in the email');
+});
+
+test('email invite: schedule validation bounds', async () => {
+  const { isValidSchedule } = await import('../src/core/index.js');
+  const t = Date.now();
+  const day = 24 * 3600_000;
+  assert.equal(isValidSchedule({ startsAt: t + day, durationMinutes: 60 }, t), true);
+  assert.equal(isValidSchedule({ startsAt: t - day + 1000, durationMinutes: 5 }, t), true);
+  assert.equal(isValidSchedule({ startsAt: t + 400 * day - 1000, durationMinutes: 1440 }, t), true);
+  for (const bad of [
+    { startsAt: t - 2 * day, durationMinutes: 60 },
+    { startsAt: t + 401 * day, durationMinutes: 60 },
+    { startsAt: t + day, durationMinutes: 4 },
+    { startsAt: t + day, durationMinutes: 1441 },
+    { startsAt: t + day, durationMinutes: 30.5 },
+    { startsAt: String(t + day), durationMinutes: 60 },
+    { startsAt: Number.NaN, durationMinutes: 60 },
+    { startsAt: Infinity, durationMinutes: 60 },
+    { startsAt: t + day },
+    'tomorrow',
+    [],
+  ]) {
+    assert.equal(isValidSchedule(bad, t), false, JSON.stringify(bad));
+  }
+});
+
+test('invite message: cleaned (invisible characters, blank lines), trimmed and cut to 500 code points', () => {
+  assert.equal(cleanInviteMessage(undefined), '');
+  assert.equal(cleanInviteMessage(42), '');
+  assert.equal(cleanInviteMessage('   \n\n  '), '');
+  // Control, bidi-override and zero-width characters go; newlines stay (CRLF/CR become LF).
+  assert.equal(cleanInviteMessage('  Hi‮ there​!\u0007\r\nLine\ttwo  \rthree '), 'Hi there!\nLine two\nthree');
+  // Runs of blank lines collapse to one (whitespace-only lines count as blank).
+  assert.equal(cleanInviteMessage('a\n\n\n\nb\n \n\t\n\nc\n\nd'), 'a\n\nb\n\nc\n\nd');
+  // 500 code points, never splitting an emoji; longer messages are cut, not refused.
+  const cut = cleanInviteMessage('😀'.repeat(600));
+  assert.equal(cut, '😀'.repeat(500));
+  assert.equal(cleanInviteMessage('x'.repeat(499) + ' ' + 'y'.repeat(10)), 'x'.repeat(499));
+  assert.equal(cleanInviteMessage('é'.repeat(500)), 'é'.repeat(500));
+});
+
+test('email invite: the host message is in the email (escaped) and the calendar invite (RFC 5545), never logged', async () => {
+  const cookie = await ownerCookie('25.0.0.6');
+  const room = await newRoom(cookie, { label: 'Sync', expiresInHours: 24 * 7 });
+  const startsAt = Math.ceil((Date.now() + 2 * 24 * 3600_000) / 3600_000) * 3600_000;
+  const message = `  Agenda <b>&amp; "notes"</b>; budget, Q3 \\ café‮\n\n\n\nBring 'ideas' ☕  `;
+  const logged: string[] = [];
+  const saved = { log: console.log, error: console.error, warn: console.warn, info: console.info };
+  for (const k of ['log', 'error', 'warn', 'info'] as const) {
+    console[k] = (...args: unknown[]) => void logged.push(args.map(String).join(' '));
+  }
+  let result: Awaited<ReturnType<typeof sendInvites>>;
+  let failing: Response;
+  try {
+    result = await sendInvites(cookie, {
+      roomId: room.roomId,
+      inviteToken: room.inviteToken,
+      emails: ['msg@example.com'],
+      message,
+      schedule: { startsAt, durationMinutes: 30 },
+    });
+    // A failed send logs an error: the message is not in it.
+    const resend = stubResend(true);
+    try {
+      const body = { roomId: room.roomId, inviteToken: room.inviteToken, emails: ['f@example.com'], message };
+      failing = (await handleApi(post('/api/admin/rooms/email-invite', body, cookie), inviteEnv))!;
+    } finally {
+      resend.restore();
+    }
+  } finally {
+    Object.assign(console, saved);
+  }
+  assert.equal(result.status, 200);
+  assert.equal(((await failing.json()) as InviteResult).failed[0].reason, 'send-failed');
+  assert.ok(logged.length > 0);
+  for (const line of logged) assert.ok(!line.includes('Agenda') && !line.includes('ideas'), line);
+
+  const clean = `Agenda <b>&amp; "notes"</b>; budget, Q3 \\ café\n\nBring 'ideas' ☕`;
+  const mail = result.calls[0].body;
+  // Plain text: under the "You're invited" line, labelled, as written.
+  assert.ok(mail.text.startsWith(`You're invited to Sync.\n\nMessage from the host:\n${clean}\n\nWhen: `), mail.text);
+  // HTML: escaped, newlines as <br>, between the invite line and the join button.
+  const html = `Agenda &lt;b&gt;&amp;amp; &quot;notes&quot;&lt;/b&gt;; budget, Q3 \\ café<br><br>Bring &#39;ideas&#39; ☕`;
+  assert.ok(mail.html.includes(html), mail.html);
+  assert.ok(!mail.html.includes('<b>') && !mail.html.includes('‮'));
+  assert.ok(mail.html.indexOf('Message from the host:') > mail.html.indexOf("You're invited to"));
+  assert.ok(mail.html.indexOf('Message from the host:') < mail.html.indexOf('Join the call'));
+
+  // Calendar: above the Join line, RFC 5545 escaped and folded, then the passcode.
+  const code = codeIn(mail.text.split('Your code:')[1]);
+  const link = linkIn(mail.text);
+  const ics = Buffer.from(mail.attachments[0].content, 'base64').toString('utf8');
+  for (const line of ics.slice(0, -2).split('\r\n')) assert.ok(Buffer.byteLength(line, 'utf8') <= 75);
+  const description = ics.replace(/\r\n /g, '').split('\r\n').find((l) => l.startsWith('DESCRIPTION:'));
+  assert.equal(
+    description,
+    `DESCRIPTION:Agenda <b>&amp\\; "notes"</b>\\; budget\\, Q3 \\\\ café\\n\\nBring 'ideas' ☕\\n\\nJoin: ${link}\\nPasscode: ${code}`
+  );
+});
+
+test('email invite: no message given, or only whitespace, means no message anywhere', async () => {
+  const cookie = await ownerCookie('25.0.0.7');
+  const room = await newRoom(cookie, { label: 'Plain', expiresInHours: 24 * 7 });
+  const schedule = { startsAt: Date.now() + 2 * 24 * 3600_000, durationMinutes: 30 };
+  for (const extra of [{}, { message: ' \n​\n ' }, { message: 42 }]) {
+    const { status, calls } = await sendInvites(cookie, {
+      roomId: room.roomId,
+      inviteToken: room.inviteToken,
+      emails: ['n@example.com'],
+      passcode: false,
+      schedule,
+      ...extra,
+    });
+    assert.equal(status, 200);
+    const mail = calls[0].body;
+    assert.ok(!mail.text.includes('Message from the host') && !mail.html.includes('Message from the host'), JSON.stringify(extra));
+    assert.ok(mail.text.startsWith("You're invited to Plain.\n\nWhen: "));
+    const ics = Buffer.from(mail.attachments[0].content, 'base64').toString('utf8').replace(/\r\n /g, '');
+    assert.match(ics, /\r\nDESCRIPTION:Join: https:\/\/call\.example\.com\/room\/[^\r\\]+\r\n/);
+  }
+});
+
+test('invite check: right code, wrong code, no-code tokens, wrong room, expired, origin', async () => {
+  const pw = await hashRoomPassword(SECRET, 'chkroom', '123456');
+  const token = await signToken(SECRET, { role: 'guest', room: 'chkroom', exp: now() + 600, pw, to: 'c@example.com' });
+  const right = await check({ roomId: 'chkroom', token, code: '123456' });
+  assert.equal(right.status, 200);
+  assert.deepEqual(right.body, { ok: true, required: true });
+  const wrong = await check({ roomId: 'chkroom', token, code: '654321' });
+  assert.equal(wrong.status, 401);
+  assert.deepEqual(wrong.body, { error: 'Wrong code' });
+  assert.equal((await check({ roomId: 'chkroom', token })).status, 401); // no code: required (and not counted)
+
+  const open = await signToken(SECRET, { role: 'guest', room: 'chkroom', exp: now() + 600 });
+  assert.deepEqual((await check({ roomId: 'chkroom', token: open, code: 'anything' })).body, { ok: true, required: false });
+
+  const otherRoom = await check({ roomId: 'otherroom', token, code: '123456' });
+  assert.deepEqual([otherRoom.status, otherRoom.body], [400, { error: 'Invalid invite' }]);
+  const expiredToken = await signToken(SECRET, { role: 'guest', room: 'chkroom', exp: now() - 10, pw });
+  const expired = await check({ roomId: 'chkroom', token: expiredToken, code: '123456' });
+  assert.deepEqual([expired.status, expired.body], [400, { error: 'Invite expired' }]);
+  const hostToken = await signToken(SECRET, { role: 'host', room: 'chkroom', exp: now() + 600 });
+  assert.equal((await check({ roomId: 'chkroom', token: hostToken, code: '' })).status, 400);
+  assert.equal((await check({ roomId: 'chkroom', token: `${token}x`, code: '123456' })).status, 400);
+  assert.equal((await check({ roomId: 'Bad Room!', token, code: '123456' })).status, 400);
+  const foreign = await handleApi(checkReq({ roomId: 'chkroom', token, code: '123456' }, 'https://evil.example.net'), inviteEnv);
+  assert.equal(foreign!.status, 403);
+  // Open mode has no invites.
+  const openMode = await handleApi(checkReq({ roomId: 'chkroom', token, code: '123456' }), {});
+  assert.equal(openMode!.status, 400);
+
+  // Room passwords on ordinary invite links work too.
+  const cookie = await ownerCookie('25.0.0.6');
+  const room = await newRoom(cookie, { password: 'open sesame' });
+  assert.deepEqual((await check({ roomId: room.roomId, token: room.inviteToken, code: 'open sesame' })).body, { ok: true, required: true });
+  assert.equal((await check({ roomId: room.roomId, token: room.inviteToken, code: 'open says me' })).status, 401);
+});
+
+test('invite check: shares the join throttle (10 misses, then 429 for checks and joins alike)', async () => {
+  const ip = '198.51.100.77';
+  const pw = await hashRoomPassword(SECRET, 'thrroom', '424242');
+  const token = await signToken(SECRET, { role: 'guest', room: 'thrroom', exp: now() + 600, pw });
+  // Same client id as the Node server gives sockets from this address (and the Worker's header).
+  const clientId = await throttleClientId(SECRET, ip);
+  assert.equal(clientId, createHmac('sha256', SECRET).update(`client:${ipKey(ip)}`).digest('base64url').slice(0, 22));
+
+  for (let i = 0; i < 8; i++) assert.equal((await check({ roomId: 'thrroom', token, code: '000000' }, ip)).status, 401);
+  // A correct check is refunded, as on joining.
+  assert.equal((await check({ roomId: 'thrroom', token, code: '424242' }, ip)).status, 200);
+  // A wrong join counts against the same budget (9 used now).
+  assert.deepEqual(await authorizeJoin(inviteEnv, { roomId: 'thrroom', token, password: 'nope' }, { clientId }), {
+    ok: false,
+    passwordRequired: true,
+    invalid: true,
+  });
+  assert.equal((await check({ roomId: 'thrroom', token, code: '000000' }, ip)).status, 401); // 10th miss
+
+  const limited = await check({ roomId: 'thrroom', token, code: '424242' }, ip);
+  assert.equal(limited.status, 429);
+  assert.deepEqual(limited.body, { error: 'Too many attempts' });
+  assert.ok(Number(limited.res.headers.get('Retry-After')) > 0);
+  assert.deepEqual(await authorizeJoin(inviteEnv, { roomId: 'thrroom', token, password: '424242' }, { clientId }), {
+    ok: false,
+    error: 'Too many password attempts',
+  });
+  // Other clients are unaffected.
+  assert.equal((await check({ roomId: 'thrroom', token, code: '424242' }, '198.51.100.78')).status, 200);
+  // A token without a code is never throttled.
+  const open = await signToken(SECRET, { role: 'guest', room: 'thrroom', exp: now() + 600 });
+  assert.equal((await check({ roomId: 'thrroom', token: open, code: '' }, ip)).status, 200);
+});
+
+test('invite check: a backend can run the comparison elsewhere (Cloudflare: the room Durable Object)', async () => {
+  const seen: unknown[] = [];
+  const checkInvite = async (input: unknown) => {
+    seen.push(input);
+    return new Response(JSON.stringify({ ok: true, required: true }), { headers: { 'Content-Type': 'application/json' } });
+  };
+  const pw = await hashRoomPassword(SECRET, 'delroom', '111111');
+  const token = await signToken(SECRET, { role: 'guest', room: 'delroom', exp: now() + 600, pw });
+  const open = await signToken(SECRET, { role: 'guest', room: 'delroom', exp: now() + 600 });
+  assert.equal((await check({ roomId: 'delroom', token, code: '111111' }, '198.51.100.90', { checkInvite })).status, 200);
+  assert.deepEqual(seen, [{ roomId: 'delroom', token, code: '111111' }]);
+  // Invalid tokens and tokens without a code are answered without waking the room.
+  assert.equal((await check({ roomId: 'other', token, code: '111111' }, '198.51.100.90', { checkInvite })).status, 400);
+  assert.deepEqual((await check({ roomId: 'delroom', token: open, code: '' }, '198.51.100.90', { checkInvite })).body, { ok: true, required: false });
+  assert.equal(seen.length, 1);
+});
+
+// Keep this last: it uses up the hourly invite cap for the rest of the file.
+test('email invite: the hourly cap stops early and reports the rest as rate-limited', async () => {
+  const cookie = await ownerCookie('25.0.0.9');
+  const room = await newRoom(cookie);
+  const batch = (n: number) => Array.from({ length: 20 }, (_, i) => `cap${n}-${i}@example.com`);
+  let totalSent = 0;
+  let sawLimit = false;
+  for (const n of [1, 2]) {
+    const emails = batch(n);
+    const { status, out, calls, res } = await sendInvites(cookie, { roomId: room.roomId, inviteToken: room.inviteToken, emails });
+    assert.equal(status, 200);
+    assert.equal(calls.length, out.sent.length); // stopped early: nothing sent past the cap
+    const limited = out.failed.filter((f) => f.reason === 'rate-limited').map((f) => f.email);
+    assert.equal(out.sent.length + limited.length, 20);
+    // In order: everything after the first refused address is refused too.
+    assert.deepEqual([...out.sent, ...limited], emails);
+    if (limited.length) {
+      sawLimit = true;
+      assert.ok(Number(res.headers.get('Retry-After')) > 0);
+    }
+    totalSent += out.sent.length;
+  }
+  assert.ok(sawLimit);
+  assert.ok(totalSent <= 30);
+
+  // Once at the cap, nothing is sent at all (still a 200 with per-recipient results).
+  const { status, out, calls } = await sendInvites(cookie, { roomId: room.roomId, inviteToken: room.inviteToken, emails: ['after@example.com'] });
+  assert.equal(status, 200);
+  assert.deepEqual(out.sent, []);
+  assert.deepEqual(out.failed, [{ email: 'after@example.com', reason: 'rate-limited' }]);
+  assert.equal(calls.length, 0);
 });

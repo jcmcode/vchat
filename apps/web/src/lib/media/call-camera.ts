@@ -1,16 +1,14 @@
-// In-call camera helpers: flipping between the front and back camera, opening the camera when you
-// joined with it off, and the stand-in track that makes joining with the camera off possible.
-// These only change the local stream; the caller hands the new track to the call with
-// replaceTrackOnAllPeers (mesh.ts), which holds it back from any connection that isn't verified.
+// In-call camera helpers: flipping between the front and back camera, and remembering a camera
+// picked while the camera is off once it's really in use. Camera changes go through manager.ts's
+// camera queue (withCamera) and putCamera, so they never overlap with turning the camera on or off
+// or switching it, and only one camera is ever left running. mesh.ts follows the local stream, so
+// peers get the new camera through the usual trust gate.
 
-import { get, writable } from 'svelte/store';
-import { localStream, videoEnabled, selectedVideoDevice, videoDevices } from './manager.js';
-import { facingOf, openFlippedCamera, openTrack, videoConstraints, type Facing } from './camera.js';
+import { get } from 'svelte/store';
+import { localStream, videoEnabled, videoDevices, cameraFacing, withCamera, putCamera } from './manager.js';
+import { facingOf, openFlippedCamera, type Facing } from './camera.js';
 import { insecureContextError } from './media-errors.js';
 import { rememberDevice } from './device-prefs.js';
-
-/** Which way your camera faces (undefined: the browser doesn't say, as for most webcams). */
-export const cameraFacing = writable<Facing | undefined>(undefined);
 
 function getUserMedia(constraints: MediaStreamConstraints): Promise<MediaStream> {
   const devices = typeof navigator !== 'undefined' ? navigator.mediaDevices : undefined;
@@ -22,140 +20,83 @@ export function isTouchDevice(): boolean {
   return typeof matchMedia === 'function' && matchMedia('(pointer: coarse)').matches;
 }
 
-/**
- * A stand-in for a camera that's off when you join: an already-stopped video track from a canvas,
- * so no device is touched and nothing is ever sent. It gives every connection a video sender, so
- * the camera can be turned on later in the call. null if the browser can't make one.
- */
-export function stoppedVideoPlaceholder(): MediaStreamTrack | null {
-  try {
-    const canvas = document.createElement('canvas');
-    canvas.width = 2;
-    canvas.height = 2;
-    const track = canvas.captureStream(0).getVideoTracks()[0] ?? null;
-    track?.stop();
-    return track;
-  } catch {
-    return null;
-  }
-}
-
-/** The camera was released (joined with it off, or a flip failed): turning it on must reopen it. */
-export function cameraNeedsReopen(): boolean {
-  const track = get(localStream)?.getVideoTracks()[0];
-  return !!track && track.readyState === 'ended';
-}
-
-const isEnded = (track: MediaStreamTrack) => track.readyState === 'ended';
-
-/** The camera change in progress, for the call (local stream) it belongs to. */
-let busy: { stream: MediaStream | null; run: Promise<MediaStreamTrack | null> } | null = null;
+const liveCamera = (stream: MediaStream | null) =>
+  stream?.getVideoTracks().find((t) => t.readyState === 'live') ?? null;
 
 /**
- * Run one camera change at a time (a double tap must not open two cameras). Scoped to the call:
- * a prompt left unanswered in an earlier call never blocks the next one.
- */
-function exclusive(run: () => Promise<MediaStreamTrack | null>): Promise<MediaStreamTrack | null> {
-  const stream = get(localStream);
-  if (busy && busy.stream === stream) return busy.run;
-  const entry: { stream: MediaStream | null; run: Promise<MediaStreamTrack | null> } = {
-    stream,
-    run: run().finally(() => {
-      if (busy === entry) busy = null;
-    }),
-  };
-  busy = entry;
-  return entry.run;
-}
-
-/** A camera picked while it was off: remembered only if it's the one that opens when turned on. */
-let pickedWhileOff: { stream: MediaStream | null; deviceId: string } | null = null;
-
-/** Pick the camera to use when it's turned on again, without opening it now. */
-export function chooseCameraForLater(deviceId: string): void {
-  pickedWhileOff = { stream: get(localStream), deviceId };
-  selectedVideoDevice.set(deviceId);
-}
-
-/** Put `track` in place of the stream's current camera track. */
-function useCameraTrack(stream: MediaStream, track: MediaStreamTrack, facing: Facing | undefined): void {
-  const old = stream.getVideoTracks()[0];
-  if (old && old !== track) {
-    old.stop();
-    stream.removeTrack(old);
-  }
-  stream.addTrack(track);
-  selectedVideoDevice.set(track.getSettings().deviceId ?? get(selectedVideoDevice));
-  cameraFacing.set(facing);
-  localStream.set(stream);
-}
-
-/**
- * Open the camera again after it was released (the call's "camera on" when you joined with it
- * off). Returns the new track, or null if there was nothing to reopen or the call ended meanwhile.
- */
-export function reopenCamera(): Promise<MediaStreamTrack | null> {
-  return exclusive(async () => {
-    const stream = get(localStream);
-    const old = stream?.getVideoTracks()[0];
-    if (!stream || !old || old.readyState !== 'ended') return null;
-    const deviceId = get(selectedVideoDevice);
-    const facing = get(cameraFacing);
-    const track = await openTrack(
-      getUserMedia,
-      'video',
-      videoConstraints(deviceId ? { deviceId, exact: false } : { facingMode: facing })
-    );
-    // Left the call (or the camera changed) while the browser was opening it: release it again.
-    if (get(localStream) !== stream || stream.getVideoTracks()[0] !== old) {
-      track.stop();
-      return null;
-    }
-    track.enabled = true;
-    useCameraTrack(stream, track, facingOf(track) ?? facing);
-    videoEnabled.set(true);
-    // Remember a camera picked while it was off only if that's the one now in use.
-    const picked = pickedWhileOff;
-    pickedWhileOff = null;
-    if (picked && picked.stream === stream && picked.deviceId === track.getSettings().deviceId) {
-      rememberDevice('videoInput', picked.deviceId);
-    }
-    return track;
-  });
-}
-
-/**
- * Switch between the front and back camera. Returns the new track, or null if the camera is off
- * or the call ended meanwhile. If it fails on a phone that can't run two cameras at once, the
- * camera ends up off (and can be turned on again).
+ * Switch between the front and back camera (queued with turning the camera on, off and switching
+ * it). Resolves to the new track, or null if the camera is off or the call ended meanwhile. If it
+ * fails on a phone that can't run two cameras at once, the camera ends up off (and can be turned
+ * on again).
  */
 export function flipCamera(): Promise<MediaStreamTrack | null> {
-  return exclusive(async () => {
+  return withCamera(async () => {
     const stream = get(localStream);
-    const current = stream?.getVideoTracks()[0];
-    if (!stream || !current || current.readyState !== 'live' || !get(videoEnabled)) return null;
+    const current = liveCamera(stream);
+    if (!stream || !current || !get(videoEnabled)) return null;
     let result: { track: MediaStreamTrack; facing: Facing | undefined };
     try {
       result = await openFlippedCamera(getUserMedia, current, get(videoDevices), get(cameraFacing));
     } catch (err) {
-      // A phone that released the camera for the attempt: it's off now (and can be turned on again).
-      if (isEnded(current) && get(localStream) === stream) videoEnabled.set(false);
+      // A phone that released the camera for the attempt: it's off now, as if turned off.
+      if (current.readyState === 'ended' && get(localStream) === stream) {
+        stream.removeTrack(current);
+        videoEnabled.set(false);
+        localStream.set(stream);
+      }
       throw err;
     }
-    if (get(localStream) !== stream || stream.getVideoTracks()[0] !== current) {
+    // Turned off, or left the call, while the browser was opening it: release it again.
+    if (get(localStream) !== stream || !get(videoEnabled)) {
       result.track.stop();
       return null;
     }
-    result.track.enabled = get(videoEnabled);
-    useCameraTrack(stream, result.track, result.facing);
+    putCamera(stream, result.track); // stops and removes every other camera track
+    cameraFacing.set(facingOf(result.track) ?? result.facing);
+    localStream.set(stream);
     return result.track;
   });
 }
 
-/** Set the facing from the camera currently in use (after joining or switching cameras). */
+/** Set the facing from the camera currently in use (after joining with startMedia). */
 export function syncCameraFacing(): void {
-  const track = get(localStream)?.getVideoTracks()[0];
-  if (track && track.readyState === 'live') cameraFacing.set(facingOf(track));
+  const track = liveCamera(get(localStream));
+  if (track) cameraFacing.set(facingOf(track));
+}
+
+/** A camera picked while the camera was off, waiting to be remembered once it's the one in use. */
+let pickedWhileOff: { stream: MediaStream; deviceId: string } | null = null;
+let stopWatchingPick: (() => void) | null = null;
+
+function settlePick(): void {
+  pickedWhileOff = null;
+  const stop = stopWatchingPick;
+  stopWatchingPick = null;
+  stop?.();
+}
+
+/**
+ * Remember `deviceId` for next time (vchat_devices) only once the camera is turned on and it's
+ * really that camera (not a fallback, and not one picked again while it was starting). Forgotten
+ * if the call ends first.
+ */
+export function rememberCameraWhenInUse(deviceId: string): void {
+  const stream = get(localStream);
+  if (!stream) return;
+  pickedWhileOff = { stream, deviceId };
+  if (stopWatchingPick) return;
+  let ready = false;
+  const unsubscribe = localStream.subscribe((current) => {
+    const picked = pickedWhileOff;
+    if (!picked || !ready) return;
+    if (current !== picked.stream) return settlePick(); // left the call
+    const camera = liveCamera(current);
+    if (!camera) return; // still off
+    if (camera.getSettings().deviceId === picked.deviceId) rememberDevice('videoInput', picked.deviceId);
+    settlePick(); // the camera is on (with this camera or another): settled either way
+  });
+  stopWatchingPick = unsubscribe;
+  ready = true;
 }
 
 const shownTrack = new WeakMap<HTMLVideoElement, string>();

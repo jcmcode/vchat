@@ -9,12 +9,11 @@
     switchAudioDevice,
     switchVideoDevice,
     enumerateDevices,
-    isScreenSharing,
     videoEnabled,
   } from '$lib/media/manager';
   import { replaceTrackOnAllPeers, useNewMicTrack } from '$lib/webrtc/mesh';
   import { rememberDevice } from '$lib/media/device-prefs';
-  import { cameraNeedsReopen, chooseCameraForLater, flipCamera, isTouchDevice, syncCameraFacing } from '$lib/media/call-camera';
+  import { flipCamera, isTouchDevice, rememberCameraWhenInUse } from '$lib/media/call-camera';
   import Icon from '$lib/ui/Icon.svelte';
   import { onMount } from 'svelte';
 
@@ -42,18 +41,14 @@
   async function handleVideoChange(e: Event) {
     const deviceId = (e.target as HTMLSelectElement).value;
     deviceError = '';
-    // The camera is released (joined with it off): don't open it now, just use this one when it's
-    // turned on (and remember it then, if it's the one that opens).
-    if (cameraNeedsReopen()) {
-      chooseCameraForLater(deviceId);
-      return;
-    }
     try {
+      // With the camera off this only remembers the choice, for when it's turned back on.
       const track = await switchVideoDevice(deviceId);
-      // While screen sharing, peers keep seeing the screen; the new camera is used when sharing stops.
-      if (track && !$isScreenSharing) replaceTrackOnAllPeers(track, 'video');
-      syncCameraFacing();
-      rememberDevice('videoInput', deviceId);
+      // The camera goes out next to a shared screen, so it's switched for peers either way.
+      if (track) replaceTrackOnAllPeers(track, 'video');
+      // Remembered for next time only if it's the camera actually in use (now, or once turned on).
+      if (track?.getSettings().deviceId === deviceId) rememberDevice('videoInput', deviceId);
+      else if (!track) rememberCameraWhenInUse(deviceId);
     } catch {
       deviceError = "Couldn't switch camera — it may be in use by another app.";
     }
@@ -69,8 +64,7 @@
   async function handleFlip() {
     deviceError = '';
     try {
-      const track = await flipCamera();
-      if (track && !$isScreenSharing) replaceTrackOnAllPeers(track, 'video');
+      await flipCamera(); // mesh.ts follows the local stream
     } catch {
       deviceError = "Couldn't switch camera.";
     }

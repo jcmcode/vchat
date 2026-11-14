@@ -16,6 +16,7 @@ import {
   Room,
   WS_PROTOCOL,
   authorizeJoin,
+  checkInviteCode,
   isValidRoomId,
   normalizeMeta,
   parseClientMessage,
@@ -25,7 +26,7 @@ import {
   type RoomMeta,
   type Transport,
 } from '@vchat/signaling-server/core';
-import { CLIENT_HEADER, type Env } from './env.ts';
+import { CLIENT_HEADER, INVITE_CHECK_PATH, type Env } from './env.ts';
 
 interface Attachment {
   roomId: string;
@@ -144,8 +145,10 @@ export class SignalingRoom extends DurableObject<Env> {
   }
 
   async fetch(request: Request): Promise<Response> {
-    const roomId = new URL(request.url).searchParams.get('room') ?? '';
+    const url = new URL(request.url);
+    const roomId = url.searchParams.get('room') ?? '';
     if (!isValidRoomId(roomId)) return new Response('Invalid room', { status: 400 });
+    if (url.pathname === INVITE_CHECK_PATH) return this.inviteCheck(request, roomId);
     if (this.room && this.room.id !== roomId) return new Response('Invalid room', { status: 400 });
     if (this.ctx.getWebSockets().length >= MAX_SOCKETS_PER_ROOM) {
       return new Response('Too many connections', { status: 503 });
@@ -170,6 +173,28 @@ export class SignalingRoom extends DurableObject<Env> {
     const offered = parseWsProtocols(request.headers.get('Sec-WebSocket-Protocol')).protocols;
     const headers = offered.includes(WS_PROTOCOL) ? { 'Sec-WebSocket-Protocol': WS_PROTOCOL } : undefined;
     return new Response(null, { status: 101, webSocket: client, headers });
+  }
+
+  /**
+   * POST /api/invite/check, forwarded by the Worker: checked here so it shares this room's
+   * password-guess throttle with joining. Creates no room state.
+   */
+  private async inviteCheck(request: Request, roomId: string): Promise<Response> {
+    if (request.method !== 'POST') return new Response('Method not allowed', { status: 405 });
+    let input: { roomId?: unknown; token?: unknown; code?: unknown } = {};
+    try {
+      input = (await request.json()) as typeof input;
+    } catch {
+      // handled below
+    }
+    if (input.roomId !== roomId || typeof input.token !== 'string' || typeof input.code !== 'string') {
+      return new Response(JSON.stringify({ error: 'Invalid invite' }), { status: 400, headers: { 'Content-Type': 'application/json' } });
+    }
+    return checkInviteCode(
+      this.env,
+      { roomId, token: input.token, code: input.code },
+      { clientId: request.headers.get(CLIENT_HEADER) ?? undefined }
+    );
   }
 
   async webSocketMessage(ws: WebSocket, message: string | ArrayBuffer): Promise<void> {
@@ -239,6 +264,17 @@ export class SignalingRoom extends DurableObject<Env> {
         break;
       case 'remove-peer':
         room.removePeer(ws, msg.peerId);
+        break;
+      case 'lock-room':
+      case 'unlock-room':
+        room.setLocked(ws, msg.type === 'lock-room');
+        break;
+      case 'end-room':
+        // Members were told and closed by the Room. Close every other socket too (never entered,
+        // password prompt, denied…), so no connection is left to keep a stale object around.
+        if (room.endRoom(ws)) {
+          for (const other of this.ctx.getWebSockets()) if (other.readyState === OPEN) transport.close(other, 1000, 'Closing');
+        }
         break;
     }
     await this.scheduleAlarm();
