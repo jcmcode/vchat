@@ -185,3 +185,30 @@ export function stopScreenShare(): void {
   }
   isScreenSharing.set(false);
 }
+
+/**
+ * Use a stream that's already open (the pre-join preview) instead of opening the devices again,
+ * as startMedia would. `audio: false` joins muted (the track stays open, sending silence).
+ * `video: false` joins with the camera off: the stream's video track should then be a stopped one
+ * (see call-camera.ts), so the camera isn't held. A stream without a video track joins audio-only.
+ */
+export async function adoptMedia(
+  stream: MediaStream,
+  opts: { audio?: boolean; video?: boolean; audioDeviceId?: string; videoDeviceId?: string } = {}
+): Promise<MediaStream> {
+  const audioTrack = stream.getAudioTracks()[0];
+  const videoTrack = stream.getVideoTracks()[0];
+  const audioOn = !!audioTrack && opts.audio !== false;
+  const videoOn = !!videoTrack && videoTrack.readyState === 'live' && opts.video !== false;
+  if (audioTrack) audioTrack.enabled = audioOn;
+  if (videoTrack) videoTrack.enabled = videoOn;
+  localStream.set(stream);
+  audioEnabled.set(audioOn);
+  videoEnabled.set(videoOn);
+  voiceOnlyMode.set(!videoTrack);
+  selectedAudioDevice.set(audioTrack?.getSettings().deviceId || opts.audioDeviceId || '');
+  selectedVideoDevice.set((videoOn && videoTrack?.getSettings().deviceId) || opts.videoDeviceId || '');
+
+  await enumerateDevices().catch(() => {});
+  return stream;
+}
