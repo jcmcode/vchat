@@ -9,7 +9,6 @@
     switchAudioDevice,
     switchVideoDevice,
     enumerateDevices,
-    isScreenSharing,
   } from '$lib/media/manager';
   import { replaceTrackOnAllPeers, useNewMicTrack } from '$lib/webrtc/mesh';
   import { onMount } from 'svelte';
@@ -35,9 +34,10 @@
     const deviceId = (e.target as HTMLSelectElement).value;
     deviceError = '';
     try {
+      // With the camera off this only remembers the choice, for when it's turned back on.
       const track = await switchVideoDevice(deviceId);
-      // While screen sharing, peers keep seeing the screen; the new camera is used when sharing stops.
-      if (track && !$isScreenSharing) replaceTrackOnAllPeers(track, 'video');
+      // The camera goes out next to a shared screen, so it's switched for peers either way.
+      if (track) replaceTrackOnAllPeers(track, 'video');
     } catch {
       deviceError = "Couldn't switch camera — it may be in use by another app.";
     }

@@ -43,6 +43,7 @@
     stopMedia,
     toggleAudio,
     toggleVideo,
+    cameraStarting,
     startScreenShare,
     stopScreenShare,
   } from '$lib/media/manager';
@@ -166,7 +167,8 @@
         ? 'remote-screen'
         : null;
   $: stagePeer = stage === 'remote-screen' && remoteSharer ? $peers.get(remoteSharer) ?? null : null;
-  $: stripPeers = stagePeer ? peerList.filter((p) => p.id !== stagePeer?.id) : peerList;
+  // The presenter keeps their tile (camera and sound); the stage shows only their screen.
+  $: stripPeers = peerList;
   $: gridCols = getGridCols(peerList.length + 1);
 
   function getGridCols(count: number): number {
@@ -442,8 +444,16 @@
     toggleAudio();
   }
 
-  function handleToggleVideo() {
-    toggleVideo();
+  /** Why the camera didn't turn back on (busy, unplugged, blocked). */
+  let cameraError = '';
+
+  async function handleToggleVideo() {
+    try {
+      await toggleVideo();
+      cameraError = '';
+    } catch (err) {
+      cameraError = err instanceof Error ? err.message : "Couldn't turn the camera on.";
+    }
   }
 
   let meshStopCalled = false;
@@ -761,6 +771,15 @@
     </div>
   {/if}
 
+  {#if cameraError}
+    <div class="banner danger" role="alert">
+      <span>{cameraError}</span>
+      <button class="banner-dismiss" on:click={() => (cameraError = '')} aria-label="Dismiss">
+        <Icon name="x" size={14} />
+      </button>
+    </div>
+  {/if}
+
   {#if $whiteboardNotice && !$whiteboardOpen}
     <div class="banner info" role="status">
       <Icon name="whiteboard" size={16} />
@@ -794,6 +813,7 @@
                   peerConnection={stagePeer}
                   speaking={$speakingPeers.has(stagePeer.id)}
                   contain
+                  screen
                   presenting
                   verification={$verification.get(stagePeer.id)?.state}
                   bind:videoEl={stageVideoEl}
@@ -868,11 +888,12 @@
             </button>
           {/if}
 
-          {#if !chatOnly && $localStream?.getVideoTracks().length}
+          {#if !chatOnly && $localStream && !$voiceOnlyMode}
             <button
               class="ctrl-btn"
               class:off={!$videoEnabled}
               aria-pressed={$videoEnabled}
+              disabled={$cameraStarting}
               on:click={handleToggleVideo}
               title={$videoEnabled ? 'Camera off' : 'Camera on'}
             >
@@ -1453,6 +1474,11 @@
   .ctrl-btn.off:hover {
     background: var(--danger-soft);
     border-color: var(--danger);
+  }
+
+  .ctrl-btn:disabled {
+    opacity: 0.6;
+    cursor: progress;
   }
 
   .ctrl-btn.active {
