@@ -3,7 +3,8 @@
   import { goto } from '$app/navigation';
   import Icon from '$lib/ui/Icon.svelte';
   import { generateRoomKey } from '$lib/webrtc/e2e-proof';
-  import { downloadIcs, inviteText, mailtoLink, type MeetingInvite } from '$lib/invites';
+  import { DURATIONS, downloadIcs, durationLabel, inviteText, mailtoLink, type MeetingInvite } from '$lib/invites';
+  import InviteForm from './InviteForm.svelte';
   import {
     apiUrl,
     fetchServerConfig,
@@ -33,12 +34,8 @@
   let loginCode = '';
   let codeSentTo = '';
 
-  // Emailed invites (sent by the server through Resend).
+  // Emailed invites (sent by the server through Resend): which room's form is open.
   let invitingRoomId = '';
-  let inviteEmail = '';
-  let inviteIncludeKey = true;
-  let sendingInvite = false;
-  let inviteStatus: { ok: boolean; text: string } | null = null;
 
   let label = '';
   let roomPassword = '';
@@ -47,7 +44,6 @@
   /** Optional schedule (datetime-local value) and length, for calendar/email invites. */
   let scheduleAt = '';
   let durationMinutes = 60;
-  const DURATIONS = [15, 30, 45, 60, 90, 120];
   let creating = false;
   let createError = '';
 
@@ -161,40 +157,23 @@
 
   function openInviteForm(room: SavedRoom) {
     invitingRoomId = invitingRoomId === room.roomId ? '' : room.roomId;
-    inviteEmail = '';
-    inviteIncludeKey = true;
-    inviteStatus = null;
   }
 
-  async function sendEmailInvite(room: SavedRoom) {
-    const to = inviteEmail.trim();
-    if (!to) return;
-    sendingInvite = true;
-    inviteStatus = null;
-    try {
-      const { res, body } = await postJson('/api/admin/rooms/email-invite', {
-        roomId: room.roomId,
-        inviteToken: room.inviteToken,
-        email: to,
-        ...(inviteIncludeKey && room.key ? { key: room.key } : {}),
-      });
-      if (res.ok) {
-        inviteStatus = { ok: true, text: `Invite sent to ${to}, with their own 6-digit code.` };
-        inviteEmail = '';
-      } else {
-        if (res.status === 401) authenticated = false;
-        const msg =
-          res.status === 400 ? "That email address doesn't look right." :
-          res.status === 429 ? 'Too many invites sent recently. Try again later.' :
-          res.status === 503 ? "This server isn't set up to send email." :
-          typeof body.error === 'string' ? body.error : "The invite couldn't be sent. Try again.";
-        inviteStatus = { ok: false, text: msg };
+  /** Emailed invites went out for a meeting time (or none): keep it on the saved room. */
+  function updateSchedule(e: CustomEvent<{ roomId: string; startsAt?: number; durationMinutes?: number }>) {
+    const { roomId, startsAt, durationMinutes: minutes } = e.detail;
+    const apply = (r: SavedRoom): SavedRoom => {
+      if (r.roomId !== roomId) return r;
+      const next = { ...r, startsAt, durationMinutes: minutes };
+      if (!startsAt) {
+        delete next.startsAt;
+        delete next.durationMinutes;
       }
-    } catch {
-      inviteStatus = { ok: false, text: 'Could not reach the server.' };
-    } finally {
-      sendingInvite = false;
-    }
+      return next;
+    };
+    rooms = rooms.map(apply);
+    saveRooms(rooms);
+    if (created) created = { ...created, room: apply(created.room) };
   }
 
   async function logout() {
@@ -452,7 +431,7 @@
             <div>
               <label class="field-label" for="duration">Length</label>
               <select id="duration" class="input" bind:value={durationMinutes}>
-                {#each DURATIONS as d}<option value={d}>{d < 60 ? `${d} min` : `${d / 60} h`.replace('.5 h', ' h 30')}</option>{/each}
+                {#each DURATIONS as d}<option value={d}>{durationLabel(d)}</option>{/each}
               </select>
             </div>
           {/if}
@@ -501,19 +480,9 @@
             <button class="btn primary small" on:click={() => created && startCall(created.room)}><Icon name="video" size={16} /> Start call</button>
           </div>
           {#if invitingRoomId === created.room.roomId}
-            {@const room = created.room}
-            <form class="invite-form" on:submit|preventDefault={() => sendEmailInvite(room)}>
-              <label class="field-label" for="invite-email-new">Guest's email</label>
-              <div class="row">
-                <input id="invite-email-new" class="input" type="email" bind:value={inviteEmail} placeholder="guest@example.com" autocomplete="off" />
-                <button class="btn primary" type="submit" disabled={!inviteEmail.includes('@') || sendingInvite}>{sendingInvite ? 'Sending…' : 'Send'}</button>
-              </div>
-              <label class="toggle-row small-text">
-                <input type="checkbox" bind:checked={inviteIncludeKey} />
-                <span>Include the end-to-end key in the link (one-click join). The key then passes through this server and the email service, and either could use it to listen in unnoticed. For full protection, untick this and send the guest the invite link yourself.</span>
-              </label>
-              {#if inviteStatus}<p class={inviteStatus.ok ? 'ok small-text' : 'error'} role="status">{inviteStatus.text}</p>{/if}
-            </form>
+            {#key created.room.roomId}
+              <InviteForm room={created.room} on:unauthorized={() => (authenticated = false)} on:schedule={updateSchedule} />
+            {/key}
           {/if}
           {#if created.password}
             <p class="pw">
@@ -557,18 +526,7 @@
                   <button class="btn ghost danger small icon" on:click={() => removeRoom(room)} title="Remove from this list" aria-label="Remove from this list"><Icon name="trash" size={16} /></button>
                 </div>
                 {#if invitingRoomId === room.roomId && created?.room.roomId !== room.roomId}
-                  <form class="invite-form" on:submit|preventDefault={() => sendEmailInvite(room)}>
-                    <label class="field-label" for="invite-email-{room.roomId}">Guest's email</label>
-                    <div class="row">
-                      <input id="invite-email-{room.roomId}" class="input" type="email" bind:value={inviteEmail} placeholder="guest@example.com" autocomplete="off" />
-                      <button class="btn primary" type="submit" disabled={!inviteEmail.includes('@') || sendingInvite}>{sendingInvite ? 'Sending…' : 'Send'}</button>
-                    </div>
-                    <label class="toggle-row small-text">
-                      <input type="checkbox" bind:checked={inviteIncludeKey} />
-                      <span>Include the end-to-end key in the link (one-click join). The key then passes through this server and the email service, and either could use it to listen in unnoticed. For full protection, untick this and send the guest the invite link yourself.</span>
-                    </label>
-                    {#if inviteStatus}<p class={inviteStatus.ok ? 'ok small-text' : 'error'} role="status">{inviteStatus.text}</p>{/if}
-                  </form>
+                  <InviteForm {room} on:unauthorized={() => (authenticated = false)} on:schedule={updateSchedule} />
                 {/if}
               </li>
             {/each}
@@ -804,27 +762,6 @@
   .error {
     color: var(--danger);
     font-size: var(--text-sm);
-  }
-
-  .ok {
-    color: var(--success, #22c55e);
-  }
-
-  .invite-form {
-    flex-basis: 100%;
-    display: flex;
-    flex-direction: column;
-    gap: var(--space-2);
-    padding: var(--space-3);
-    margin-top: var(--space-2);
-    border: 1px solid var(--border-subtle);
-    border-radius: var(--radius);
-    background: var(--bg-elevated);
-  }
-
-  .invite-form .row .input {
-    flex: 1;
-    min-width: 0;
   }
 
   .code-input {
