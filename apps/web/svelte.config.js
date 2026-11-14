@@ -20,6 +20,8 @@ const config = {
 				'media-src': ['self', 'blob:'],
 				// ws:/wss: so a custom signaling server can be set in Settings.
 				'connect-src': ['self', 'ws:', 'wss:'],
+				// The web app manifest (static/manifest.webmanifest) for installing the app.
+				'manifest-src': ['self'],
 				'object-src': ['none'],
 				'base-uri': ['self'],
 				'form-action': ['self']
