@@ -5,6 +5,21 @@
   import Icon from '$lib/ui/Icon.svelte';
   import { fileTransfers, MAX_FILE_SIZE, MAX_PREVIEW_BYTES, type FileTransferEntry } from '$lib/webrtc/file-transfer';
   import { isSafeToPreview } from '$lib/webrtc/image-size';
+  import { getLocalDisplayName } from '$lib/webrtc/mesh';
+  import { roomName } from '$lib/collab/room-meta';
+  import { linkify, type ChatPart } from '$lib/chat/linkify';
+  import { formatTranscript, transcriptFileName } from '$lib/chat/transcript';
+
+  // Links in a message are found once (a message never changes after it arrives).
+  const partsCache = new WeakMap<ChatMessage, ChatPart[]>();
+  function partsOf(msg: ChatMessage): ChatPart[] {
+    let parts = partsCache.get(msg);
+    if (!parts) {
+      parts = linkify(msg.text);
+      partsCache.set(msg, parts);
+    }
+    return parts;
+  }
 
   // One object URL per received image, revoked when the panel closes.
   const previewUrls = new Map<Blob, string>();
@@ -124,6 +139,19 @@
   }
 
   /**
+   * "Save chat": a plain-text transcript of the chat in memory, built here and downloaded. Nothing
+   * is uploaded, and this is the only time chat is written anywhere.
+   */
+  function saveChat() {
+    if (messages.length === 0 && transfers.length === 0) return;
+    const savedAt = new Date();
+    // Only the room's name, never its code: a room without a name is "Unnamed room".
+    const room = $roomName;
+    const text = formatTranscript({ roomName: room, localName: getLocalDisplayName(), savedAt, messages, files: transfers });
+    downloadFile(new Blob([text], { type: 'text/plain;charset=utf-8' }), transcriptFileName(room, savedAt));
+  }
+
+  /**
    * Inline previews only for common raster formats of sensible size (no SVG), and only once the
    * header says the image isn't enormous in pixels (no decode bombs).
    */
@@ -162,9 +190,20 @@
 <aside class="chat-panel" aria-label="Chat">
   <div class="chat-header">
     <span class="chat-title"><Icon name="message" size={18} /> Chat</span>
-    <button class="icon-btn" on:click={() => dispatch('close')} aria-label="Close chat" title="Close chat">
-      <Icon name="x" size={18} />
-    </button>
+    <div class="chat-actions">
+      <button
+        class="icon-btn save-btn"
+        on:click={saveChat}
+        disabled={messages.length === 0 && transfers.length === 0}
+        aria-label="Save chat"
+        title="Save chat as a text file (made on this device, nothing is uploaded)"
+      >
+        <Icon name="download" size={18} />
+      </button>
+      <button class="icon-btn" on:click={() => dispatch('close')} aria-label="Close chat" title="Close chat">
+        <Icon name="x" size={18} />
+      </button>
+    </div>
   </div>
 
   <div class="messages" bind:this={messagesContainer} role="log" aria-live="polite" aria-label="Messages">
@@ -184,7 +223,8 @@
           <span class="msg-time">{formatTime(msg.timestamp)}</span>
         </div>
         <div class="bubble">
-          <div class="msg-text">{msg.text}</div>
+          <!-- Kept on one line: with pre-wrap, whitespace between these tags would show. -->
+          <div class="msg-text">{#each partsOf(msg) as part}{#if part.kind === 'link'}<a class="msg-link" href={part.href} target="_blank" rel="noopener noreferrer nofollow" referrerpolicy="no-referrer">{part.before}<span class="link-domain">{part.domain}</span>{part.after}</a>{:else}{part.text}{/if}{/each}</div>
         </div>
         {#if !msg.isLocal && $peers.has(msg.fromPeerId)}
           <button class="reply-private" on:click={() => replyPrivately(msg.fromPeerId)}>
@@ -351,6 +391,17 @@
     color: var(--text);
   }
 
+  .chat-actions {
+    display: flex;
+    align-items: center;
+    gap: var(--space-1);
+  }
+
+  .save-btn:disabled {
+    opacity: 0.4;
+    cursor: not-allowed;
+  }
+
   .messages {
     flex: 1;
     min-height: 0;
@@ -419,6 +470,23 @@
     line-height: 1.4;
     overflow-wrap: anywhere;
     white-space: pre-wrap;
+  }
+
+  /* Links show their full, normalized address (see lib/chat/linkify.ts), with the site's domain in
+     bold. No long-press preview on iOS/macOS, which would fetch the page. */
+  .msg-link {
+    color: inherit;
+    text-decoration: underline;
+    text-underline-offset: 2px;
+    -webkit-touch-callout: none;
+  }
+
+  .msg-link:hover {
+    text-decoration-thickness: 2px;
+  }
+
+  .link-domain {
+    font-weight: 700;
   }
 
   /* Private / direct messages: warm tint + lock so they never read as public. */
