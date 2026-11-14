@@ -38,6 +38,7 @@
 
 6. LEAVE     Socket closes → server broadcasts peer-left → peers tear down that link.
              When the last person leaves, the room (and its password) is gone.
+             The host can also end the call for everyone at once.
 ```
 
 ## Access model
@@ -61,7 +62,13 @@ Any other combination (for example `SECRET_KEY` without an owner sign-in, or an 
 
 **Invites are stateless.** A token is `base64url(payload).HMAC-SHA256(SECRET_KEY)`, decoded strictly (canonical unpadded base64url only, so a token has exactly one valid spelling). The payload holds the role (`host`/`guest`), room id, expiry, whether approval is needed, an optional label, an optional room-password hash keyed with `SECRET_KEY` (so the password can't be brute-forced offline from a link), and for emailed invites the address it was sent to (`to`, readable by whoever holds the link). The server stores nothing about rooms or invites. Rotating `SECRET_KEY` revokes every link at once.
 
-**Host powers.** Only a host-role peer (the owner) can approve, deny or remove guests. A denied guest can't ask again for 5 minutes; a removed participant is disconnected and their peer id and tab secret (and, for an emailed invite, that invite's address) are refused for the rest of the room's life. Because a removed person still holds the invite link, every new guest after a removal has to be approved by the host, even on an invite that doesn't normally ask for approval. If the owner leaves, guests keep talking but nobody can admit newcomers until the owner returns. Invited guests are never promoted to host, and can never take over an identity (peer id) already admitted to the room, even one that's offline. The owner can always get in: one seat over the 6-person limit if guests filled the room.
+**Host powers.** Only a host-role peer (the owner) can approve, deny or remove guests, lock the room and end the call (the server enforces this; in open mode the host is whoever holds the role). A denied guest can't ask again for 5 minutes; a removed participant is disconnected and their peer id and tab secret (and, for an emailed invite, that invite's address) are refused for the rest of the room's life. Because a removed person still holds the invite link, every new guest after a removal has to be approved by the host, even on an invite that doesn't normally ask for approval. If the owner leaves, guests keep talking but nobody can admit newcomers until the owner returns. Invited guests are never promoted to host, and can never take over an identity (peer id) already admitted to the room, even one that's offline. The owner can always get in: one seat over the 6-person limit if guests filled the room.
+
+**Locking the call.** The host can lock the room during a call. While it's locked the server refuses every new join attempt, even with a valid invite and the right password or code: the person is told "This call is locked by the host" (`error` `Room is locked`, then close code `4005`), and isn't queued, so the host isn't asked. Their tab doesn't retry: it releases the camera and forgets the invite, and they open the link again once the host unlocks. Still let in: anyone already admitted reconnecting with their peer id and tab secret (a network drop or a refresh), the owner (host token) at any time, and guests who were already in the waiting room when the host locked. They stay queued and the host can still admit or deny them. A waiting guest whose connection drops completely counts as new and is refused. In open mode the room password is checked first, so only people who know it learn that the room is locked. The lock is part of the room's in-memory metadata (on Cloudflare, copied to every socket's attachment like the rest), so it survives hibernation. It stays on if the host leaves (fail closed; in private mode only the owner can unlock it) and disappears when the room empties. Everyone in the call sees a "Locked" indicator.
+
+**Ending the call.** The host can end the call for everyone (after a confirm step). Every participant and waiting guest receives `room-ended` and is disconnected with close code `4004`; clients don't reconnect, tear down their connections, forget the tab's rejoin data (as when leaving) and show "The host ended the call". The server drops the room's state. For the next 60 seconds it answers any new entry for that room the same way, so a participant who happened to be offline at that moment can't silently re-open the call. This is memory only (on Cloudflare, only while the Durable Object stays in memory, so best effort). The owner's host link is exempt and opens the room again at once. After that the room is simply gone: opening the invite again starts a fresh room, exactly as if nobody had been in it (in private mode, guests on an approval invite wait for the owner; in open mode anyone with the code can create it again).
+
+**Waiting-room alerts.** When someone new is waiting, the host's tab plays a short chime (synthesized with WebAudio, nothing fetched; at most one every 5 seconds) and, while the tab is hidden or unfocused, flashes its title with the count ("(1) Waiting to join · …") until the tab is back in front or the queue is empty. The host can also turn on system notifications in the host menu. The browser's permission prompt is only shown from that click, never on its own. The notification always says only "Someone is waiting to join your call" (operating systems keep notification history and show it on lock screens, so it never includes a guest's name or email, or the room's name). Clicking it focuses the tab. The on/off choice is kept in localStorage (`vchat_waiting_alerts`).
 
 ### What the server sees
 
@@ -102,7 +109,7 @@ All room logic lives in `packages/signaling-server/src/core/` and is transport-a
 | File | Purpose |
 |---|---|
 | `protocol.ts` | Message types, validation, limits (6 peers, 10 waiting, 10-min admission timeout, 64KB messages, 32KB signals), name cleaning |
-| `room.ts` | `Room<C>`: create/join/admit/deny/remove/leave/signal, host hand-off, rejoin secrets, deny-lists |
+| `room.ts` | `Room<C>`: create/join/admit/deny/remove/leave/signal, lock/unlock, end for everyone, host hand-off, rejoin secrets, deny-lists |
 | `ice.ts` | Builds ICE server lists: Cloudflare TURN API, coturn REST credentials, or static |
 | `throttle.ts` | Sign-in and room-password throttles (in memory, entries dropped after their window) |
 | `rate-limit.ts` | Per-connection token bucket |
@@ -118,6 +125,7 @@ The Node server (`src/index.ts`) keeps a `Map<roomId, Room>` in memory. The Clou
 | `lib/webrtc/file-transfer.ts` | Chunked, acknowledged, per-recipient file transfer (50MB max) |
 | `lib/media/manager.ts` | Camera/mic/screen capture, device switching, audio-only fallback |
 | `lib/stores/room.ts` | Endpoints, ICE fetch, per-tab identity, preferences |
+| `lib/ui/attention.ts` | Waiting-room alerts for the host: chime, flashing tab title, opt-in generic notification |
 
 The app is a static SPA (SvelteKit + adapter-static). Its Content-Security-Policy is emitted as a `<meta>` tag with a hash for SvelteKit's boot script (`svelte.config.js`), so it works on any host.
 
@@ -169,6 +177,8 @@ JSON over WebSocket. The client connects to `/ws?room=<roomId>` (the Node server
 | `join` | `roomId`, `peerId`, `displayName`, `secret`, `password?`, `token?` (required in private mode) |
 | `admit-peer` / `deny-peer` | `peerId` (host only). A denied guest can't ask again for 5 minutes |
 | `remove-peer` | `peerId` (host only): removes a participant or waiting guest for the rest of the room's life |
+| `lock-room` / `unlock-room` | — (host only): refuse every new join attempt / allow them again (see [Locking the call](#access-model)) |
+| `end-room` | — (host only): end the call for everyone, participants and waiting guests |
 | `signal` | `targetPeerId`, `signal` (opaque, at most 32KB serialized; the client sends `{ sid, data }`) |
 | `leave` | — |
 | `ping` | — (answered with `pong`) |
@@ -186,6 +196,8 @@ JSON over WebSocket. The client connects to `/ws?room=<roomId>` (the Node server
 | `admission-request` / `admission-cancelled` | `peerId`, `displayName?`, `email?` (to host; `email` only for emailed invites, from the signed token) |
 | `admission-granted` / `admission-denied` | `roomId`, `reason?` |
 | `removed` | `roomId`, `reason`: the host removed you; the socket is then closed with `4002` |
+| `lock-changed` | `locked`: sent to everyone in the call when the host locks or unlocks, and right after `room-peers` when you enter a locked room |
+| `room-ended` | `roomId`, `reason`: the host ended the call (also the answer to any entry in the next 60s); the socket is then closed with `4004` |
 | `signal` | `fromPeerId`, `signal` |
 | `error` | `message` |
 
@@ -203,7 +215,7 @@ JSON over WebSocket. The client connects to `/ws?room=<roomId>` (the Node server
 | `POST /api/admin/rooms/email-invite` | Owner only: `{ roomId, inviteToken, email, key? }` → `200 { ok: true, expiresAt }`. Never returns the token or code. 400 bad input or invite, 401 not signed in, 503 email not configured, 429 over the cap, 502 if sending failed |
 | `GET /healthz` | `ok` |
 
-Close codes (clients must not reconnect automatically after 4000, 4002 or 4003):
+Close codes (clients must not reconnect automatically after 4000, 4002, 4003, 4004 or 4005):
 
 | Code | Meaning |
 |---|---|
@@ -211,6 +223,8 @@ Close codes (clients must not reconnect automatically after 4000, 4002 or 4003):
 | `4001` | Idle: the socket wasn't in a room for too long (60s) |
 | `4002` | Removed by the host |
 | `4003` | The invite is invalid or expired (sent after the `error` message) |
+| `4004` | The host ended the call (sent after `room-ended`). Clients stop as soon as `room-ended` arrives, whatever close code follows |
+| `4005` | The room is locked: a new join attempt was refused (sent after the `error` message `Room is locked`) |
 
 A socket is bound to the room it was authorized for at the upgrade (`/ws?room=`); joining another room on it is refused. In private mode the gate accepts an expired-but-genuine invite only within 24 hours of expiry, so the person can be told it expired. Cloudflare refuses more than 40 sockets per room.
 
@@ -218,7 +232,7 @@ A socket is bound to the room it was authorized for at the upgrade (`/ws?room=`)
 
 ## Reconnection
 
-- **Signaling drops.** The client pings every 25s and reconnects with backoff when a pong is missed or the socket closes. Each tab has a random `secret` and a separate random peer identity per room (sessionStorage), so the server can't link one person's rooms. On rejoin, a peer whose `peerId` + `secret` were already admitted skips the password and waiting room, and replaces its stale socket if the server hasn't noticed it's dead. If the room emptied in the meantime, the client re-creates it.
+- **Signaling drops.** The client pings every 25s and reconnects with backoff when a pong is missed or the socket closes. Each tab has a random `secret` and a separate random peer identity per room (sessionStorage), so the server can't link one person's rooms. On rejoin, a peer whose `peerId` + `secret` were already admitted skips the password and waiting room (and a lock), and replaces its stale socket if the server hasn't noticed it's dead. If the room emptied in the meantime, the client re-creates it (open mode). If the host ended the call, the client stops for good on `room-ended` (or close code `4004`) and never reconnects or re-creates the room; a client that was offline at that moment is answered with `room-ended` for the next 60 seconds.
 - **Page refresh.** `peerId`, `secret`, the room password and "I created this room" are kept in sessionStorage for the tab, so a refresh rejoins seamlessly. Closing the tab forgets everything.
 - **P2P drops.** ICE `failed` (or `disconnected` for 5s) triggers a new connection with a fresh session id. If both sides restart at once ("glare"), the peer with the smaller id wins. Retries are capped at 5 per minute per peer.
 
@@ -231,8 +245,9 @@ A socket is bound to the room it was authorized for at the upgrade (`/ws?room=`)
 - **TURN credentials.** Short-lived (4h by default, never past the invite's expiry): coturn uses a shared-secret HMAC (`use-auth-secret`) with a unique `<expiry>:<random>` username per response, and Cloudflare credentials come from its API (cached briefly per role and room). No TURN password is baked into the frontend. coturn has per-user and total quotas, a per-session and total bandwidth cap, and refuses to relay to private, special-purpose, NAT64/Teredo and cloud-metadata addresses or any address of the host itself.
 - **Input validation.** All signaling messages are validated, size-limited (64KB; 32KB for a signal payload) and rate-limited per connection. WebSocket origins are checked. The Node server drops clients that stop reading (over 1MB queued).
 - **Peer data.** Names shown in chat come from the server's validated list, not from what a peer claims over the data channel. SVG files aren't previewed inline.
-- **Storage.** Chat is kept in memory only and never written to storage: it is gone when you leave, are removed, refresh or close the tab. The invite token, room key and per-room identity live in sessionStorage so a refresh can rejoin; they are cleared when you leave the call or are removed from it (if the tab is closed without leaving, the browser may keep them for its own "reopen closed tab" feature until the session ends). localStorage holds your display name, TURN preferences and, on the owner's own browser, the rooms they created (including their host links and room keys, which grant host access until they expire). Expired rooms are pruned and the list is cleared on sign-out. Don't use the owner dashboard on a shared computer.
+- **Storage.** Chat is kept in memory only and never written to storage: it is gone when you leave, are removed, refresh or close the tab. The invite token, room key and per-room identity live in sessionStorage so a refresh can rejoin; they are cleared when you leave the call or are removed from it (if the tab is closed without leaving, the browser may keep them for its own "reopen closed tab" feature until the session ends). localStorage holds your display name, TURN preferences, whether you turned on waiting-room notifications and, on the owner's own browser, the rooms they created (including their host links and room keys, which grant host access until they expire). Expired rooms are pruned and the list is cleared on sign-out. Don't use the owner dashboard on a shared computer.
 - **Untrusted peers.** Everything received over data channels is size- and rate-limited per participant. Files are capped (3 at a time, 150MB total per sender, 50 files / 300MB per peer per call) and checked chunk by chunk, with a 60s stall timeout. Received images are previewed only after a header check (at most 16 megapixels). Whiteboard and annotation data is capped (3,000 strokes / 600k points). Nobody can rewrite someone else's strokes or file entries. Names are made unique (compared after folding case, accents, compatibility forms and common look-alike letters) and stripped of invisible/bidi characters.
+- **Host controls.** Locking, unlocking and ending the call are checked by the server against the host role, like approving and removing; the hidden buttons are only UI. The lock and the 60-second "ended" marker live in memory only and are never logged. Lock state shown in the app comes from the server, never from other participants.
 - **Hide my IP address.** An optional pre-join setting makes the browser use only the TURN relay (`iceTransportPolicy: relay`), so other participants see the relay's address instead of yours. It needs TURN to be configured.
 - **Server hardening.** In private mode a WebSocket is only accepted with a valid invite or host token, sent as a subprotocol so it never appears in URLs. Invite links carry the token after `#`, which browsers never send to servers. Owner logins are throttled (see above). Room-password guesses are limited to 10 per room and client per 10 minutes, with a backstop of 200 per room; on Cloudflare the client is identified by an HMAC of its IP keyed with `SECRET_KEY`, never the raw address. These throttles live in memory (per process, or per Durable Object/isolate on Cloudflare) and forget clients once their window passes. Configuration fails closed.
 - **No logs.** Room activity is only logged with `DEBUG_LOGS=1`. Workers Logs are disabled in `wrangler.jsonc`. In the Docker setup, Caddy discards all logs (its error log would otherwise include IPs and the token header), coturn's logging is off, and every container uses Docker's `none` logging driver.

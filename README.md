@@ -14,6 +14,7 @@ Your own private, end-to-end encrypted video calls. Deploy it on your domain, si
   - Group chat, **private direct messages** and **files sent straight to one person** (tap them), and reactions
   - **Calendar and email invites**: download an `.ics` event or draft an email in your own mail app. Nothing is sent by vchat
   - Named rooms (the host can rename during a call), host approval, and automatic reconnection
+  - **Host controls**: lock the call so nobody new can join (even with an invite), end it for everyone, and get a chime, a flashing tab title and, if you turn it on, a system notification when someone is waiting to join (it never shows who)
 
 ## How it works for you
 
