@@ -409,6 +409,7 @@
   // Every peer counts (a connection that hasn't opened yet is still being checked).
   $: verStates = peerList.map((p) => $verification.get(p.id)?.state ?? 'pending');
   $: unverifiedPeers = peerList.filter((p) => $verification.get(p.id)?.state === 'unverified');
+  $: unreachablePeers = peerList.filter((p) => $verification.get(p.id)?.state === 'unreachable');
   $: e2eStatus = !$hasRoomKey
     ? 'nokey'
     : verStates.some((v) => v === 'unverified' || v === 'failed' || v === 'allowed')
@@ -491,6 +492,8 @@
         return 'Blocked: failed verification';
       case 'nokey':
         return "Not verified: you don't have the room key";
+      case 'unreachable':
+        return 'Not connected: a network is blocking the connection (still trying)';
       default:
         return 'Verifying…';
     }
@@ -1266,6 +1269,20 @@
           really them and why they have no key: an unverified connection can be listened to by someone in the middle.
         </span>
         <button class="btn small secondary" on:click={() => allowUnverified(up.id)}>Allow anyway</button>
+      </div>
+    {/each}
+
+    {#each unreachablePeers as up (up.id)}
+      <div class="banner warning" role="status">
+        <Icon name="link" size={16} />
+        <span>
+          {#if $verification.get(up.id)?.relay}
+            Can't connect to <strong>{up.displayName}</strong> yet: a network on one side is blocking the connection. Still trying…
+          {:else}
+            Can't connect to <strong>{up.displayName}</strong>: a VPN or firewall on one side is blocking a direct connection, and this
+            server has no relay to fall back on. Turning off a VPN usually fixes it. Still trying…
+          {/if}
+        </span>
       </div>
     {/each}
 
