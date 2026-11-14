@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { onMount } from 'svelte';
+  import { onDestroy, onMount } from 'svelte';
   import { goto } from '$app/navigation';
   import Icon from '$lib/ui/Icon.svelte';
   import { generateRoomKey } from '$lib/webrtc/e2e-proof';
@@ -196,6 +196,7 @@
     // Saved rooms hold host links and room keys: don't leave them in this browser.
     clearSavedRooms();
     rooms = [];
+    deleted = null;
     if (config?.auth === 'access') {
       window.location.href = '/cdn-cgi/access/logout';
       return;
@@ -268,11 +269,31 @@
     goto(`/room/${room.roomId}`);
   }
 
+  /** The room just deleted, kept for a few seconds so it can be undone. */
+  let deleted: { room: SavedRoom; index: number } | null = null;
+  let undoTimer: ReturnType<typeof setTimeout> | undefined;
+
   function removeRoom(room: SavedRoom) {
+    const index = rooms.findIndex((r) => r.roomId === room.roomId);
+    if (index < 0) return;
     rooms = rooms.filter((r) => r.roomId !== room.roomId);
     saveRooms(rooms);
     if (freshId === room.roomId) freshId = '';
+    deleted = { room, index };
+    clearTimeout(undoTimer);
+    undoTimer = setTimeout(() => (deleted = null), 8000);
   }
+
+  function undoRemove() {
+    if (!deleted) return;
+    const { room, index } = deleted;
+    rooms = [...rooms.slice(0, index), room, ...rooms.slice(index)];
+    saveRooms(rooms);
+    deleted = null;
+    clearTimeout(undoTimer);
+  }
+
+  onDestroy(() => clearTimeout(undoTimer));
 
 </script>
 
@@ -448,6 +469,17 @@
       {/if}
     {/if}
   </div>
+
+  {#if deleted}
+    <div class="toast fade-in" role="status">
+      <span class="toast-text">
+        <strong>Deleted “{deleted.room.label || 'Untitled room'}”</strong>
+        <small>Links you already sent keep working until they expire.</small>
+      </span>
+      <button class="btn secondary small" on:click={undoRemove}><Icon name="undo" size={15} /> Undo</button>
+      <button class="btn ghost icon small" aria-label="Dismiss" on:click={() => (deleted = null)}><Icon name="x" size={15} /></button>
+    </div>
+  {/if}
 </div>
 
 <style>
@@ -683,6 +715,43 @@
     justify-content: space-between;
     gap: var(--space-3);
     padding: 0 var(--space-1);
+  }
+
+  .toast {
+    position: fixed;
+    left: 0;
+    right: 0;
+    margin: 0 auto;
+    bottom: var(--space-6);
+    z-index: 50;
+    display: flex;
+    align-items: center;
+    gap: var(--space-3);
+    width: max-content;
+    max-width: calc(100vw - 2 * var(--space-4));
+    padding: var(--space-3) var(--space-3) var(--space-3) var(--space-4);
+    background: var(--bg-elevated);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-lg);
+    box-shadow: var(--shadow-md);
+  }
+
+  .toast-text {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    min-width: 0;
+    font-size: var(--text-sm);
+  }
+
+  .toast-text strong {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .toast-text small {
+    color: var(--text-muted);
   }
 
   .empty {
