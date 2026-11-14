@@ -3,7 +3,11 @@
   import { peerMediaState, type PeerConnection } from '$lib/webrtc/mesh';
   import type { Verification } from '$lib/webrtc/e2e';
   import { selectedAudioOutput } from '$lib/media/manager';
+  import { peerAudioPrefs } from '$lib/ui/participant-prefs';
+  import { playbackFor } from '$lib/ui/participants';
+  import { raisedHands } from '$lib/collab/hands';
   import Icon from '$lib/ui/Icon.svelte';
+  import TileQuality from './TileQuality.svelte';
 
   export let peerConnection: PeerConnection;
   export let speaking = false;
@@ -11,6 +15,8 @@
   export let contain = false;
   /** This person is presenting their screen. */
   export let presenting = false;
+  /** Show their shared screen (the stage) instead of their camera. It never plays sound: the shared audio is mixed into their microphone. */
+  export let screen = false;
   /** Exposed so overlays (screen annotations) can read the video's size. */
   export let videoEl: HTMLVideoElement | null = null;
   /** End-to-end verification state of this connection. */
@@ -19,9 +25,20 @@
   export let selectable = false;
 
   const dispatch = createEventDispatcher<{ select: void }>();
+  let qualityShown = false;
+
+  /** Overlays in the slot (screen annotations and their toolbar) handle their own clicks and keys. */
+  let overlayEl: HTMLElement | null = null;
+  function fromOverlay(e: Event): boolean {
+    return !!overlayEl && e.target instanceof Node && overlayEl.contains(e.target);
+  }
+
+  // With overlays (screen annotations have their own buttons) the tile isn't a button itself:
+  // buttons can't contain buttons. A tap still opens the card; the page offers a separate button.
+  $: asButton = selectable && !$$slots.default;
 
   function onKey(e: KeyboardEvent) {
-    if (selectable && (e.key === 'Enter' || e.key === ' ')) {
+    if (asButton && (e.key === 'Enter' || e.key === ' ')) {
       e.preventDefault();
       dispatch('select');
     }
@@ -29,10 +46,11 @@
 
   // What the peer told us about their mic/camera (over the data channel).
   $: media = $peerMediaState.get(peerConnection.id);
-  $: showVideo = !!peerConnection.stream && (presenting || media?.video !== false);
+  $: shown = screen ? peerConnection.screenStream : peerConnection.stream;
+  $: showVideo = !!shown && (screen || media?.video !== false);
 
-  $: if (videoEl && peerConnection.stream && videoEl.srcObject !== peerConnection.stream) {
-    videoEl.srcObject = peerConnection.stream;
+  $: if (videoEl && shown && videoEl.srcObject !== shown) {
+    videoEl.srcObject = shown;
   }
 
   // Route audio to the speaker picked in Device Settings (Chrome/Edge/Firefox support setSinkId).
@@ -41,6 +59,16 @@
       .setSinkId($selectedAudioOutput)
       .catch(() => {});
   }
+
+  // Volume and "Mute for me" from the person card: only how they play on this device. Their sound
+  // (shared-screen audio included, mixed into the microphone) plays from their camera tile; a
+  // screen tile always stays silent.
+  $: playback = playbackFor($peerAudioPrefs.get(peerConnection.id));
+  $: if (videoEl) {
+    videoEl.volume = playback.volume;
+    videoEl.muted = screen || playback.muted;
+  }
+  $: handRaised = $raisedHands.has(peerConnection.id);
 </script>
 
 <!-- svelte-ignore a11y-no-noninteractive-tabindex -->
@@ -49,23 +77,33 @@
   class:speaking
   class:contain
   class:selectable
-  role={selectable ? 'button' : undefined}
-  tabindex={selectable ? 0 : undefined}
-  aria-label={selectable ? `${peerConnection.displayName}: message privately or send a file` : undefined}
-  on:click={() => selectable && dispatch('select')}
+  role={asButton ? 'button' : undefined}
+  tabindex={asButton ? 0 : undefined}
+  aria-label={asButton ? `${peerConnection.displayName}${handRaised ? ', hand raised' : ''}${playback.muted ? ', muted for you' : ''}: message, send a file, volume or pin` : undefined}
+  aria-describedby={qualityShown ? `quality-${peerConnection.id}` : undefined}
+  on:click={(e) => selectable && !fromOverlay(e) && dispatch('select')}
   on:keydown={onKey}
 >
-  {#if peerConnection.stream}
+  {#if shown}
     <!-- The video element stays mounted (it also plays the person's audio); it's hidden when their camera is off. -->
     <!-- svelte-ignore a11y-media-has-caption -->
-    <video bind:this={videoEl} autoplay playsinline class:hidden={!showVideo}></video>
+    <video bind:this={videoEl} autoplay playsinline muted={screen} class:hidden={!showVideo}></video>
   {/if}
   {#if !showVideo}
     <div class="no-video">
       <span class="avatar">{peerConnection.displayName.charAt(0).toUpperCase()}</span>
     </div>
   {/if}
-  <slot />
+  {#if $$slots.default}
+    <div class="tile-overlay" bind:this={overlayEl}><slot /></div>
+  {/if}
+  {#if handRaised && !screen}
+    <span class="hand-badge" title="Hand raised"><Icon name="hand" size={15} /><span class="sr-only">hand raised</span></span>
+  {/if}
+  {#if !screen}
+    <!-- Once per person: on their own tile, not on their shared screen (ids must stay unique). -->
+    <TileQuality peerId={peerConnection.id} id="quality-{peerConnection.id}" bind:shown={qualityShown} />
+  {/if}
   <span class="tile-name">
     {#if verification === 'verified'}
       <span class="ver verified" title="Verified end-to-end"><Icon name="shield-check" size={13} /><span class="sr-only">verified</span></span>
@@ -75,6 +113,9 @@
     <span class="name-text">{peerConnection.displayName}{presenting ? ' · presenting' : ''}</span>
     {#if media?.audio === false}
       <span class="muted-dot" title="Muted"><Icon name="mic-off" size={13} /><span class="sr-only">muted</span></span>
+    {/if}
+    {#if playback.muted}
+      <span class="silenced" title="Muted for you"><Icon name="volume-x" size={13} /><span class="sr-only">muted for you</span></span>
     {/if}
   </span>
 </div>
@@ -198,5 +239,28 @@
     display: inline-flex;
     flex-shrink: 0;
     color: #f87171;
+  }
+
+  .tile-overlay {
+    display: contents;
+  }
+
+  .silenced {
+    display: inline-flex;
+    flex-shrink: 0;
+    color: #fbbf24;
+  }
+
+  .hand-badge {
+    position: absolute;
+    top: var(--space-2);
+    left: var(--space-2);
+    display: inline-flex;
+    padding: 5px;
+    border-radius: var(--radius-pill);
+    background: var(--warning);
+    color: #1a1300;
+    box-shadow: var(--shadow-sm);
+    pointer-events: none;
   }
 </style>

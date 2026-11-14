@@ -8,12 +8,21 @@ Your own private, end-to-end encrypted video calls. Deploy it on your domain, si
 - **No data, no logs**: no database, no accounts, no message history, and no server or container logs. Invite links are self-contained signed tokens
 - **2–6 people** per room
 - **Features**:
-  - Video, audio-only, or **chat-only** participation
-  - **Screen sharing** (with audio), plus a **laser pointer and drawing** over the shared screen that everyone sees
+  - Video, audio-only, or **chat-only** participation. Turning your camera off really releases it (the camera light goes off)
+  - A **pre-join check**: camera preview, microphone level, microphone/camera/speaker pickers and a test sound. Join muted or with your camera off. Nothing is switched on until you choose
+  - On phones: **front/back camera flip**, and the screen stays on during a call
+  - **Screen sharing** (with audio) next to your camera, also when you joined audio-only, plus a **laser pointer and drawing** over the shared screen that everyone sees
+  - Video quality adapts to the size of the call, so upload stays around 3.5 Mbps even with six people
   - A **shared whiteboard** (pen, highlighter, text, eraser) you can export as **PDF** or PNG
   - Group chat, **private direct messages** and **files sent straight to one person** (tap them), and reactions
+  - **Raise hand**, per-person **volume** and **mute for me**, **pin** anyone to your stage, and **keyboard shortcuts** (press `?`)
+  - Clickable links in chat (shown with their real address, never previewed), and **Save chat** to download the conversation as a text file made in your browser
+  - **Installable** as an app from your browser (a web app manifest, with deliberately no service worker)
   - **Calendar and email invites**: download an `.ics` event or draft an email in your own mail app. Nothing is sent by vchat
   - Named rooms (the host can rename during a call), host approval, and automatic reconnection
+  - **Picture-in-picture**: pop the call out into a small always-on-top window to keep seeing people (and mute, turn the camera off or leave) while you're in another tab or app. Chromium shows everyone; Safari shows one video
+  - **Connection quality** bars on each person, and round trip, packet loss and whether the connection is direct or relayed in their card. Measured in your browser and never sent anywhere
+  - **Host controls**: lock the call so nobody new can join (even with an invite), end it for everyone, and get a chime, a flashing tab title and, if you turn it on, a system notification when someone is waiting to join (it never shows who)
 
 ## How it works for you
 
@@ -106,9 +115,13 @@ To test locally with the real Workers runtime: `pnpm cf:dev` (http://localhost:8
 Optional, on either deployment. With [Resend](https://resend.com) set up:
 
 - **Owner sign-in by email** (when `OWNER_EMAIL` is set): at `/admin` you enter your address and get a 6-digit code by email, valid for 10 minutes. There's no password to leak. Anyone can ask for a code, but only your address ever receives one, and the page answers the same way for every address.
-- **Emailed invites** (whenever Resend is configured in private mode): from the dashboard, enter a guest's email address. They get a "Join the call" link and a 6-digit code that is theirs alone, and they need both to get in. You then admit them as usual, and you see which address the invite was sent to. A forwarded link is useless without the code, and you can still deny or remove anyone.
+- **Emailed invites** (whenever Resend is configured in private mode): from the dashboard, enter up to 20 guest addresses. Each guest gets their own email (nobody sees the other addresses) with a "Join the call" link and, by default, a 6-digit code that is theirs alone; they need both to get in. You then admit them as usual, and you see which address each invite was sent to. A forwarded link is useless without the code, and you can still deny or remove anyone.
+  - **No passcode:** turn the code off and guests just open the link and enter their name. They always wait in the lobby until you let them in, so you decide who joins.
+  - **Calendar invites:** give a date, time and length, and each email shows the time (in UTC) and carries a calendar invite (`invite.ics`) that adds the call to the guest's calendar, with a reminder 10 minutes before. If the invite has a passcode, the calendar event shows it too, next to the link.
+  - **A short message:** optionally add a note about the call (up to 500 characters). It appears in the email under the invitation line and in the calendar event.
+  - The join page can check the code before asking for a name (`POST /api/invite/check`). That check uses the same guess limits as joining, so it doesn't make codes any easier to guess.
 
-Nothing about this is stored: the sign-in code lives only inside a signed, 10-minute challenge, and each emailed invite is a signed token like any other.
+Nothing about this is stored: the sign-in code lives only inside a signed, 10-minute challenge, and each emailed invite is a signed token like any other. Invite emails are capped at 30 per hour, counting each recipient.
 
 **Set up Resend:**
 
@@ -127,7 +140,7 @@ pnpm cf:deploy
 
 With Docker, add the same three lines to `.env` (docker-compose passes them on), e.g. `EMAIL_FROM='vchat <invites@example.com>'`, then `docker compose up -d`. If `OWNER_EMAIL` is set, it takes over from `ADMIN_PASSWORD`. Cloudflare Access, if configured, still wins over both.
 
-**The trade-off.** An invite email carries everything a guest needs to join: the link (with the room key) and their code. It passes through your server, Resend, and both mail providers. Approval still protects you: nobody gets in without you letting them in. But for sensitive calls, compare the [safety codes](DOCS.md#end-to-end-verification) out loud once you're connected; they reveal anyone in the middle, even someone who read the email.
+**The trade-off.** An invite email carries everything a guest needs to join: the link (with the room key) and their code. It passes through your server, Resend, and both mail providers. A calendar invite holds the same: the link (and the room key, if it's in the link) and, for invites with a passcode, the code. Calendar apps sync it to their providers (Google, Apple, Microsoft and so on), where it can stay long after the call. If that matters for a call, send it without a date, or without a passcode and admit each guest yourself. Approval still protects you: nobody gets in without you letting them in. But for sensitive calls, compare the [safety codes](DOCS.md#end-to-end-verification) out loud once you're connected; they reveal anyone in the middle, even someone who read the email.
 
 ---
 
@@ -227,6 +240,7 @@ Open mode needs either **nothing** configured (no `SECRET_KEY`, `ADMIN_PASSWORD`
 - The signaling server does see some things while a call is set up: room ids, display names, IP addresses and network candidates, and the **room password in plain text** (over TLS) when a guest types it, because that's how it checks it. It keeps none of this after the room empties.
 - Whoever runs the server (you, and Cloudflare if you use it, since it terminates TLS) can see that connection metadata, but never call content.
 - With email set up, invite emails (link, room key and code) and sign-in codes pass through your server, Resend and the mail providers on both ends. The server never logs addresses, codes or tokens.
+- Connection quality is measured in your browser from WebRTC's own statistics and only shown there. It's never sent to the server or to other participants.
 - Browsers contact a STUN server to learn their public address: `stun.cloudflare.com` by default, your own coturn with Docker, or whatever `STUN_URLS` says.
 
 See [DOCS.md](DOCS.md) for the full security model and how it works under the hood.

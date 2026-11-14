@@ -9,10 +9,18 @@
     switchAudioDevice,
     switchVideoDevice,
     enumerateDevices,
-    isScreenSharing,
+    videoEnabled,
   } from '$lib/media/manager';
   import { replaceTrackOnAllPeers, useNewMicTrack } from '$lib/webrtc/mesh';
-  import { onMount } from 'svelte';
+  import { rememberDevice } from '$lib/media/device-prefs';
+  import { flipCamera, isTouchDevice, rememberCameraWhenInUse } from '$lib/media/call-camera';
+  import { createEventDispatcher, onMount } from 'svelte';
+  import Icon from '$lib/ui/Icon.svelte';
+
+  const dispatch = createEventDispatcher<{ shortcuts: void }>();
+
+  const touch = isTouchDevice();
+  $: canFlip = touch && $videoEnabled && $videoDevices.length > 1;
 
   onMount(() => {
     enumerateDevices();
@@ -26,6 +34,7 @@
     try {
       const track = await switchAudioDevice(deviceId);
       if (track) useNewMicTrack(track); // keeps shared-screen audio mixed in while presenting
+      rememberDevice('audioInput', deviceId);
     } catch {
       deviceError = "Couldn't switch microphone — it may be in use by another app.";
     }
@@ -35,9 +44,13 @@
     const deviceId = (e.target as HTMLSelectElement).value;
     deviceError = '';
     try {
+      // With the camera off this only remembers the choice, for when it's turned back on.
       const track = await switchVideoDevice(deviceId);
-      // While screen sharing, peers keep seeing the screen; the new camera is used when sharing stops.
-      if (track && !$isScreenSharing) replaceTrackOnAllPeers(track, 'video');
+      // The camera goes out next to a shared screen, so it's switched for peers either way.
+      if (track) replaceTrackOnAllPeers(track, 'video');
+      // Remembered for next time only if it's the camera actually in use (now, or once turned on).
+      if (track?.getSettings().deviceId === deviceId) rememberDevice('videoInput', deviceId);
+      else if (!track) rememberCameraWhenInUse(deviceId);
     } catch {
       deviceError = "Couldn't switch camera — it may be in use by another app.";
     }
@@ -46,7 +59,17 @@
   function handleOutputChange(e: Event) {
     const deviceId = (e.target as HTMLSelectElement).value;
     selectedAudioOutput.set(deviceId);
+    rememberDevice('audioOutput', deviceId);
     // VideoTile applies this with setSinkId on each remote video element.
+  }
+
+  async function handleFlip() {
+    deviceError = '';
+    try {
+      await flipCamera(); // mesh.ts follows the local stream
+    } catch {
+      deviceError = "Couldn't switch camera.";
+    }
   }
 </script>
 
@@ -70,6 +93,11 @@
         <option value={device.deviceId}>{device.label || 'Camera'}</option>
       {/each}
     </select>
+    {#if canFlip}
+      <button type="button" class="btn small flip" on:click={handleFlip}>
+        <Icon name="switch-camera" size={16} /> Switch front / back camera
+      </button>
+    {/if}
   </div>
 
   {#if $audioOutputDevices.length > 0}
@@ -82,6 +110,10 @@
       </select>
     </div>
   {/if}
+
+  <button type="button" class="shortcuts-link" on:click={() => dispatch('shortcuts')}>
+    <Icon name="keyboard" size={15} /> Keyboard shortcuts <kbd>?</kbd>
+  </button>
 </div>
 
 <style>
@@ -115,6 +147,38 @@
       bottom: 68px;
     }
   }
+  .flip {
+    margin-top: var(--space-2);
+    gap: var(--space-2);
+    align-self: flex-start;
+  }
+
+  .shortcuts-link {
+    display: inline-flex;
+    align-items: center;
+    gap: var(--space-2);
+    align-self: flex-start;
+    padding: 0;
+    border: 0;
+    background: none;
+    color: var(--accent);
+    font-size: var(--text-sm);
+    cursor: pointer;
+  }
+
+  .shortcuts-link:hover {
+    text-decoration: underline;
+  }
+
+  .shortcuts-link kbd {
+    padding: 0 5px;
+    border: 1px solid var(--border-strong);
+    border-radius: var(--radius-sm);
+    font-family: var(--font-mono);
+    font-size: var(--text-xs);
+    color: var(--text-muted);
+  }
+
   .device-error {
     margin: 0;
     font-size: var(--text-xs);

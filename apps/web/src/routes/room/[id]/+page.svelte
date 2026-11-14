@@ -9,6 +9,8 @@
     connectionState,
     admissionState,
     admissionDeniedReason,
+    admitted,
+    friendlyJoinError,
     hostPresent,
     passwordInvalid,
     roomError,
@@ -30,8 +32,14 @@
     removePeer,
     startSharingScreen,
     stopSharingScreen,
+    roomLocked,
+    callEnded,
+    roomJoined,
+    isTransientRoomError,
     type PeerConnection,
   } from '$lib/webrtc/mesh';
+  import { startWaitingAlerts } from '$lib/ui/attention';
+  import HostControls from './HostControls.svelte';
   import {
     localStream,
     screenStream,
@@ -43,8 +51,12 @@
     stopMedia,
     toggleAudio,
     toggleVideo,
+    cameraStarting,
     startScreenShare,
     stopScreenShare,
+    adoptMedia,
+    videoDevices,
+    cameraFacing,
   } from '$lib/media/manager';
   import {
     signalUrlForRoom,
@@ -58,11 +70,11 @@
     wasRoomCreated,
     rememberRoomPassword,
     recallRoomPassword,
+    forgetRoomPassword,
     peerId,
     getPeerSecret,
     useRoomIdentity,
     getRelayOnly,
-    setRelayOnly,
     ensureUniqueTabIdentity,
     fetchServerConfig,
     setRoomToken,
@@ -73,6 +85,7 @@
     setRoomKey,
     getRoomKey,
     roomUrl,
+    apiUrl,
   } from '$lib/stores/room';
   import { whiteboardOpen, whiteboardNotice, openWhiteboard, closeWhiteboard } from '$lib/collab/whiteboard';
   import { clearScreen, annotationTool } from '$lib/collab/annotations';
@@ -80,6 +93,9 @@
   import Icon from '$lib/ui/Icon.svelte';
   import VideoTile from './VideoTile.svelte';
   import { setE2EKey, verification, blockedConnections, hasRoomKey, isValidRoomKey, allowUnverified } from '$lib/webrtc/e2e';
+  import { pipMode, pipOpen, pipAvailable, togglePip } from '$lib/ui/pip';
+  import ConnectionDetails from './ConnectionDetails.svelte';
+  import ConnectionHint from './ConnectionHint.svelte';
   import ChatPanel from './ChatPanel.svelte';
   import WaitingScreen from './WaitingScreen.svelte';
   import AdmissionPanel from './AdmissionPanel.svelte';
@@ -88,6 +104,18 @@
   import ReactionPicker from './ReactionPicker.svelte';
   import Whiteboard from './Whiteboard.svelte';
   import AnnotationLayer from './AnnotationLayer.svelte';
+  import PreJoin from './PreJoin.svelte';
+  import type { PreJoinResult } from '$lib/media/preview';
+  import { shouldMirror } from '$lib/media/camera';
+  import { flipCamera, isTouchDevice, reattachOnTrackChange, syncCameraFacing } from '$lib/media/call-camera';
+  import { createWakeLock } from '$lib/media/wake-lock';
+  import { localHandRaised, toggleHand } from '$lib/collab/hands';
+  import { pinnedPeerId, unpinPeer } from '$lib/ui/participant-prefs';
+  import { selectStage } from '$lib/ui/participants';
+  import PersonControls from './PersonControls.svelte';
+  import HandToasts from './HandToasts.svelte';
+  import KeyboardShortcuts, { endHoldToTalk } from './KeyboardShortcuts.svelte';
+  import ShortcutsHelp from './ShortcutsHelp.svelte';
 
   type JoinMode = 'video' | 'audio' | 'chat';
 
@@ -97,6 +125,7 @@
   let showChat = false;
   let showDeviceSettings = false;
   let showReactionPicker = false;
+  let showShortcuts = false;
   let peerList: PeerConnection[] = [];
   let localVideoEl: HTMLVideoElement;
   let localScreenEl: HTMLVideoElement;
@@ -111,10 +140,32 @@
   /** Chat-only: joined without camera or microphone. */
   let chatOnly = false;
 
-  // Pre-join screen: name + how to join (video / audio / chat only)
-  let showPrejoin = false;
-  let prejoinName = '';
+  /**
+   * The landing page, shown before the call: a passcode (step 1, guests with a protected invite),
+   * then name + how to join (step 2). 'done' once joining; guests then wait in the lobby.
+   */
+  let landing: 'loading' | 'passcode' | 'name' | 'done' = 'loading';
+  let hasPasscodeStep = false;
+  /** The passcode is an emailed 6-digit code (personal invite), not a room password. */
+  let passcodeIsCode = false;
+  let passcodeValue = '';
+  let passcodeError = '';
+  let checkingPasscode = false;
+  let landingToken: string | undefined;
+  let resolvePasscode: (() => void) | null = null;
+  $: passcodeReady = passcodeIsCode ? passcodeValue.replace(/\D/g, '').length === 6 : !!passcodeValue;
+
+  /** Guests wait in a full-screen lobby, not the call, until the server lets them in. */
+  let lobbyGate = false;
+  let everAdmitted = false;
+  $: if ($admitted) everAdmitted = true;
+  $: showLobby = lobbyGate && !everAdmitted && landing === 'done';
+  $: showCall = landing === 'done' && !showLobby;
+
+  // Pre-join (step 2, PreJoin.svelte): name, how to join (video / audio / chat only), device check
   let prejoinMode: JoinMode = 'video';
+  /** What the pre-join step handed over, including the already-open camera/microphone. */
+  let prejoinResult: PreJoinResult | null = null;
   /** Joined with a personal invite emailed to one person (asks for their 6-digit code). */
   let personalInvite = false;
   /** Connect only through the relay server, so other participants never learn your IP address. */
@@ -125,13 +176,71 @@
   let editingName = false;
   let nameDraft = '';
 
-  function handleSubmitPrejoin() {
-    const trimmed = prejoinName.trim();
-    if (!trimmed) return;
-    displayName = trimmed.slice(0, 30);
+  function handlePrejoinJoin(e: CustomEvent<PreJoinResult>) {
+    prejoinResult = e.detail;
+    displayName = e.detail.name;
     saveDisplayName(displayName);
-    showPrejoin = false;
+    prejoinMode = e.detail.mode;
+    hideIp = e.detail.hideIp;
+    landing = 'done';
     resolvePrejoin?.();
+  }
+
+  // Keep the screen on while in the call (released on leaving, removal and errors).
+  const wakeLock = createWakeLock();
+  let inCall = false;
+  $: if (inCall && !$roomError && $admissionState !== 'denied') void wakeLock.enable();
+  else wakeLock.disable();
+  // A fatal error (room full, invite expired, too many password attempts…) or being denied ends the
+  // call: release the camera and microphone now, not when "Back to home" is clicked.
+  $: if (($roomError && !isTransientRoomError($roomError)) || $admissionState === 'denied') stopMedia();
+
+  // Front/back camera flip on phones and tablets (mesh.ts follows the local stream).
+  const touchDevice = browser && isTouchDevice();
+  async function handleFlipCamera() {
+    try {
+      await flipCamera();
+      cameraError = '';
+    } catch {
+      cameraError = "Couldn't switch camera.";
+    }
+  }
+
+  /** Step 1: check the passcode with the server before going on (joining sends it again). */
+  async function handleSubmitPasscode() {
+    // Codes are digits only (people often paste them with a space in the middle).
+    const code = passcodeIsCode ? passcodeValue.replace(/\D/g, '') : passcodeValue;
+    if (!code || checkingPasscode) return;
+    checkingPasscode = true;
+    passcodeError = '';
+    const accept = (required: boolean) => {
+      if (required) rememberRoomPassword(roomId, code);
+      passcodeValue = '';
+      resolvePasscode?.();
+    };
+    try {
+      const res = await fetch(apiUrl('/api/invite/check'), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ roomId, token: landingToken, code }),
+      });
+      if (destroyed) return;
+      const body = (await res.json().catch(() => ({}))) as { required?: unknown; error?: unknown };
+      if (res.ok) accept(body.required !== false);
+      else if (res.status === 401) passcodeError = "That passcode didn't match. Check it and try again.";
+      else if (res.status === 429) passcodeError = 'Too many attempts. Wait a few minutes.';
+      else if (res.status === 400) {
+        const reason = typeof body.error === 'string' ? body.error : '';
+        roomError.set(friendlyJoinError(reason) ?? friendlyJoinError('Invalid invite') ?? "This invite link isn't valid.");
+      }
+      // Any other answer (an older server without this check, a proxy, a server error): go on.
+      // Joining checks the passcode anyway, and asks again if it's wrong.
+      else accept(true);
+    } catch {
+      passcodeError = "Couldn't reach the server. Check your connection and try again.";
+    } finally {
+      checkingPasscode = false;
+    }
   }
 
   function handleSubmitPassword() {
@@ -156,17 +265,25 @@
   $: roomId = ($page.params.id ?? '').toLowerCase();
   $: peerList = Array.from($peers.values());
 
-  // ── Stage: whiteboard or a shared screen takes the main area; tiles move to a strip ──
-  $: remoteSharer = [...$sharingPeers].find((id) => $peers.has(id)) ?? null;
-  $: stage = $whiteboardOpen
-    ? 'whiteboard'
-    : $isScreenSharing
-      ? 'local-screen'
-      : remoteSharer
-        ? 'remote-screen'
-        : null;
-  $: stagePeer = stage === 'remote-screen' && remoteSharer ? $peers.get(remoteSharer) ?? null : null;
-  $: stripPeers = stagePeer ? peerList.filter((p) => p.id !== stagePeer?.id) : peerList;
+  // ── Stage: whiteboard, a shared screen or the person you pinned takes the main area; tiles move to a strip ──
+  // A remote screen only counts once it's actually arriving (a bare claim can't take the stage);
+  // selectStage picks the latest such presenter with pickPresenter, and your pin outranks it.
+  $: layout = selectStage({
+    whiteboardOpen: $whiteboardOpen,
+    localSharing: $isScreenSharing,
+    sharingPeers: $sharingPeers,
+    hasScreen: (id) => !!$peers.get(id)?.screenStream,
+    peerIds: $peers.keys(),
+    pinned: $pinnedPeerId,
+  });
+  $: stage = layout.stage;
+  $: stagePeer = layout.stagePeerId ? $peers.get(layout.stagePeerId) ?? null : null;
+  $: otherSharerPeer = layout.otherSharer ? $peers.get(layout.otherSharer) ?? null : null;
+  // A presenter keeps their tile (camera and sound); the stage shows only their screen. A pinned
+  // person's tile moves to the stage (one tile per person: it plays their sound).
+  $: stripPeers = stage === 'pinned' && stagePeer ? peerList.filter((p) => p.id !== stagePeer?.id) : peerList;
+  // Any other screen being shared goes in the strip, so no share is ever hidden.
+  $: stripScreens = peerList.filter((p) => p.screenStream && $sharingPeers.has(p.id) && p.id !== stagePeer?.id);
   $: gridCols = getGridCols(peerList.length + 1);
 
   function getGridCols(count: number): number {
@@ -181,7 +298,7 @@
     for (const id of prevSharers) if (!$sharingPeers.has(id)) clearScreen(id);
     prevSharers = new Set($sharingPeers);
   }
-  $: if (!stage || stage === 'whiteboard') annotationTool.set('none');
+  $: if (stage !== 'local-screen' && stage !== 'remote-screen') annotationTool.set('none');
 
   // onMount is async: the user can leave (or the page can unmount) while we await a prompt.
   let destroyed = false;
@@ -298,7 +415,12 @@
     // of the address bar so it isn't shown, bookmarked or kept in history.
     const fragment = new URLSearchParams(window.location.hash.slice(1));
     const inviteParam = fragment.get('invite');
-    if (inviteParam) setRoomToken(roomId, inviteParam);
+    if (inviteParam) {
+      // A newly opened link replaces any earlier one in this tab, along with its passcode, so an
+      // old code isn't replayed against the new invite.
+      if (inviteParam !== getRoomToken(roomId)) forgetRoomPassword(roomId);
+      setRoomToken(roomId, inviteParam);
+    }
     // The room's end-to-end key (only ever in the "#" part of links, never sent to a server).
     const keyParam = fragment.get('k');
     if (isValidRoomKey(keyParam)) setRoomKey(roomId, keyParam);
@@ -340,16 +462,30 @@
     }
     if (destroyed) return;
 
-    // Pre-join: confirm your name and choose video, audio only or chat only.
+    // Guests (not hosts, and not open-mode rooms) wait in the lobby instead of the call.
+    lobbyGate = config.mode === 'private' && tokenInfo.role === 'guest';
+
+    // Step 1: a protected invite asks for its passcode first, unless this tab already has it (a
+    // refresh). If what we have has gone stale, the server asks again and the password dialog shows.
+    hasPasscodeStep = tokenInfo.role === 'guest' && !!tokenInfo.hasPassword && !recallRoomPassword(roomId);
+    if (hasPasscodeStep) {
+      landingToken = token;
+      passcodeIsCode = personalInvite;
+      landing = 'passcode';
+      await new Promise<void>((resolve) => (resolvePasscode = resolve));
+      if (destroyed) return;
+    }
+
+    // Step 2 (pre-join): confirm your name and choose video, audio only or chat only.
     // Skipped when coming from the home page, where those choices were just made.
     displayName = pendingJoin?.name || getSavedDisplayName();
-    prejoinName = displayName;
     prejoinMode = pendingJoin?.mode ?? 'video';
     if (!pendingJoin || !displayName) {
-      showPrejoin = true;
+      landing = 'name';
       await new Promise<void>((resolve) => (resolvePrejoin = resolve));
     }
     if (destroyed) return;
+    landing = 'done';
     chatOnly = prejoinMode === 'chat';
 
     // Open mode only: the creator makes the room. In private mode the token decides everything.
@@ -359,7 +495,19 @@
 
     if (!chatOnly) {
       try {
-        await startMedia({ voiceOnly: prejoinMode === 'audio' });
+        // Use the devices the pre-join check already opened (with your mute/camera-off choices).
+        if (prejoinResult?.stream) {
+          await adoptMedia(prejoinResult.stream, {
+            audio: prejoinResult.micOn,
+            video: prejoinResult.camOn,
+            voiceOnly: prejoinResult.voiceOnly,
+            videoDeviceId: prejoinResult.videoDeviceId,
+            facing: prejoinResult.facing,
+          });
+        } else {
+          await startMedia({ voiceOnly: prejoinMode === 'audio' });
+          syncCameraFacing();
+        }
         if (destroyed) {
           stopMedia(); // left during the camera prompt — release the camera again
           return;
@@ -388,7 +536,7 @@
     await ensureUniqueTabIdentity(roomId);
     if (destroyed) return;
 
-
+    inCall = true;
     await joinRoom({
       serverUrl: signalUrlForRoom(roomId),
       roomId,
@@ -407,9 +555,11 @@
 
   onDestroy(() => {
     destroyed = true;
+    wakeLock.disable();
     if (browser) {
       leaveRoom();
       stopMedia();
+      prejoinResult?.stream?.getTracks().forEach((t) => t.stop()); // handed over but not yet used
       // Leaving the page (any way except a reload) forgets this call's chat, password and keys.
       if (roomId) forgetRoom(roomId);
     }
@@ -419,10 +569,15 @@
   // the camera and microphone and forget this call's invite, key and password right away, rather
   // than when "Back to home" is clicked (which may never happen if the tab is just closed).
   const stopWatchingForcedOut = onForcedOut(() => {
+    inCall = false;
+    wakeLock.disable();
     stopMedia();
     if (roomId) forgetRoom(roomId);
   });
   onDestroy(stopWatchingForcedOut);
+
+  // Host: chime, flash the tab title and (opt-in) notify when someone is waiting to join.
+  onDestroy(startWaitingAlerts(admissionRequests));
 
   function handleLeave() {
     leaveRoom();
@@ -442,8 +597,16 @@
     toggleAudio();
   }
 
-  function handleToggleVideo() {
-    toggleVideo();
+  /** Why the camera didn't turn back on (busy, unplugged, blocked). */
+  let cameraError = '';
+
+  async function handleToggleVideo() {
+    try {
+      await toggleVideo();
+      cameraError = '';
+    } catch (err) {
+      cameraError = err instanceof Error ? err.message : "Couldn't turn the camera on.";
+    }
   }
 
   let meshStopCalled = false;
@@ -455,6 +618,7 @@
       stopScreenShare();
     } else {
       meshStopCalled = false;
+      endHoldToTalk(); // the picker can swallow the Space keyup
       const stream = await startScreenShare();
       if (stream) {
         startSharingScreen();
@@ -510,6 +674,7 @@
   $: if (localVideoEl && $localStream && localVideoEl.srcObject !== $localStream) {
     localVideoEl.srcObject = $localStream;
   }
+  $: if (localVideoEl) reattachOnTrackChange(localVideoEl, $localStream?.getVideoTracks()[0]);
   $: if (localScreenEl && $screenStream && localScreenEl.srcObject !== $screenStream) {
     localScreenEl.srcObject = $screenStream;
   }
@@ -529,6 +694,7 @@
 
   $: localSpeaking = $speakingPeers.has('local');
   $: localHasVideo = !chatOnly && !$voiceOnlyMode && $videoEnabled && !!$localStream?.getVideoTracks().length;
+  $: canFlipCamera = touchDevice && localHasVideo && $videoDevices.length > 1;
 
   // Track unread messages when chat is closed
   $: {
@@ -544,61 +710,106 @@
     if ($connectionState === 'connected') wasConnected = true;
   }
   $: showReconnecting = wasConnected && $connectionState === 'disconnected';
+  // Keyboard shortcuts work in the call itself, not on the landing, password, waiting or error screens.
+  $: shortcutsEnabled = showCall && !$roomError && $admissionState === 'none' && (mediaReady || chatOnly);
 </script>
 
-{#if showPrejoin}
-  <div class="overlay">
-    <form
-      class="dialog card fade-in prejoin"
-      role="dialog"
-      aria-modal="true"
-      aria-labelledby="prejoin-title"
-      on:submit|preventDefault={handleSubmitPrejoin}
-    >
-      <h2 id="prejoin-title">{$roomName || 'Join the call'}</h2>
-      <p class="dialog-sub">Choose your name and how you'd like to join.</p>
-      <div class="field">
-        <label class="field-label" for="prejoin-name">Your name</label>
-        <!-- svelte-ignore a11y-autofocus -->
-        <input id="prejoin-name" class="input" type="text" bind:value={prejoinName} placeholder="Your name" maxlength="30" autofocus />
-      </div>
-      <fieldset class="join-modes">
-        <legend class="field-label">Join with</legend>
-        <label class="mode" class:selected={prejoinMode === 'video'}>
-          <input type="radio" bind:group={prejoinMode} value="video" />
-          <span class="mode-icon"><Icon name="video" size={18} /></span>
-          <span class="mode-text"><strong>Camera &amp; mic</strong><small>Video and voice</small></span>
-          <span class="mode-check" aria-hidden="true"><Icon name="check" size={14} /></span>
-        </label>
-        <label class="mode" class:selected={prejoinMode === 'audio'}>
-          <input type="radio" bind:group={prejoinMode} value="audio" />
-          <span class="mode-icon"><Icon name="mic" size={18} /></span>
-          <span class="mode-text"><strong>Audio only</strong><small>Voice, no camera</small></span>
-          <span class="mode-check" aria-hidden="true"><Icon name="check" size={14} /></span>
-        </label>
-        <label class="mode" class:selected={prejoinMode === 'chat'}>
-          <input type="radio" bind:group={prejoinMode} value="chat" />
-          <span class="mode-icon"><Icon name="message" size={18} /></span>
-          <span class="mode-text"><strong>Chat only</strong><small>No camera or mic · you still see and hear everyone</small></span>
-          <span class="mode-check" aria-hidden="true"><Icon name="check" size={14} /></span>
-        </label>
-      </fieldset>
-      <label class="hide-ip">
-        <input type="checkbox" bind:checked={hideIp} on:change={() => setRelayOnly(hideIp)} />
-        <span>
-          <strong>Hide my IP address</strong>
-          <small>Route through the server's relay instead of connecting directly. Still end-to-end encrypted; may add a little delay. Needs a TURN relay on this server.</small>
-        </span>
-      </label>
-      <div class="dialog-actions">
-        <button type="button" class="btn ghost" on:click={() => goto('/')}>Cancel</button>
-        <button type="submit" class="btn primary" disabled={!prejoinName.trim()}>Join</button>
-      </div>
-    </form>
-  </div>
+{#if landing !== 'done'}
+  <main class="landing">
+    <section class="landing-card card fade-in" class:wide={landing === 'name'} aria-labelledby="landing-title">
+      <header class="landing-head">
+        <h1 id="landing-title">{$roomName || 'Join the call'}</h1>
+        <span class="chip"><Icon name="lock" size={12} /> End-to-end encrypted</span>
+      </header>
+      {#if hasPasscodeStep && landing !== 'loading'}
+        <ol class="steps">
+          <li class:current={landing === 'passcode'} class:done={landing === 'name'} aria-current={landing === 'passcode' ? 'step' : undefined}>
+            <span class="step-num" aria-hidden="true">{#if landing === 'name'}<Icon name="check" size={12} />{:else}1{/if}</span>
+            Passcode
+          </li>
+          <li class:current={landing === 'name'} aria-current={landing === 'name' ? 'step' : undefined}>
+            <span class="step-num" aria-hidden="true">2</span>
+            Your name
+          </li>
+        </ol>
+      {/if}
+
+      {#if landing === 'loading'}
+        <p class="landing-loading" role="status">
+          <span class="landing-spinner" aria-hidden="true"></span> Loading…
+        </p>
+      {:else if landing === 'passcode'}
+        <form class="step" on:submit|preventDefault={handleSubmitPasscode} aria-labelledby="passcode-title" novalidate>
+          <h2 id="passcode-title">Enter your passcode</h2>
+          <p class="step-sub" id="passcode-help">
+            {passcodeIsCode ? 'Type the 6-digit code from your invite email.' : 'Type the room password the host gave you.'}
+          </p>
+          <label class="sr-only" for="passcode-input">{passcodeIsCode ? '6-digit code' : 'Room password'}</label>
+          {#if passcodeIsCode}
+            <!-- svelte-ignore a11y-autofocus -->
+            <input
+              id="passcode-input"
+              class="input code-input"
+              type="text"
+              inputmode="numeric"
+              autocomplete="one-time-code"
+              maxlength="7"
+              placeholder="123456"
+              bind:value={passcodeValue}
+              on:input={() => (passcodeError = '')}
+              aria-invalid={passcodeError ? 'true' : undefined}
+              aria-describedby={passcodeError ? 'passcode-error' : 'passcode-help'}
+              autofocus
+            />
+          {:else}
+            <!-- svelte-ignore a11y-autofocus -->
+            <input
+              id="passcode-input"
+              class="input"
+              type="text"
+              autocomplete="off"
+              autocapitalize="off"
+              spellcheck="false"
+              placeholder="Room password"
+              bind:value={passcodeValue}
+              on:input={() => (passcodeError = '')}
+              aria-invalid={passcodeError ? 'true' : undefined}
+              aria-describedby={passcodeError ? 'passcode-error' : 'passcode-help'}
+              autofocus
+            />
+          {/if}
+          {#if passcodeError}<p id="passcode-error" class="step-error" role="alert">{passcodeError}</p>{/if}
+          <div class="dialog-actions">
+            <button type="button" class="btn ghost" on:click={() => goto('/')}>Cancel</button>
+            <button type="submit" class="btn primary" disabled={!passcodeReady || checkingPasscode}>
+              {checkingPasscode ? 'Checking…' : 'Continue'}
+            </button>
+          </div>
+        </form>
+      {:else}
+        <PreJoin
+          initialName={displayName}
+          initialMode={prejoinMode}
+          {hideIp}
+          on:join={handlePrejoinJoin}
+          on:cancel={() => goto('/')}
+        />
+      {/if}
+    </section>
+  </main>
 {/if}
 
-{#if $admissionState === 'waiting'}
+{#if showLobby}
+  <WaitingScreen
+    page
+    connecting={$admissionState !== 'waiting'}
+    hostPresent={$hostPresent}
+    roomName={$roomName}
+    {displayName}
+    previewStream={chatOnly ? null : $localStream}
+    on:cancel={handleCancelWaiting}
+  />
+{:else if $admissionState === 'waiting'}
   <WaitingScreen hostPresent={$hostPresent} on:cancel={handleCancelWaiting} />
 {/if}
 
@@ -613,8 +824,8 @@
 {:else if $roomError}
   <div class="overlay">
     <div class="dialog card fade-in center" role="alertdialog" aria-modal="true" aria-labelledby="error-title">
-      <div class="dialog-icon danger"><Icon name="x" size={22} /></div>
-      <h2 id="error-title">Couldn't join</h2>
+      <div class="dialog-icon danger"><Icon name={$callEnded ? 'phone-off' : 'x'} size={22} /></div>
+      <h2 id="error-title">{$callEnded ? 'Call ended' : "Couldn't join"}</h2>
       <p class="dialog-sub">{$roomError}</p>
       <div class="dialog-actions">
         <button class="btn primary" on:click={handleLeave}>Back to home</button>
@@ -672,350 +883,603 @@
   </div>
 {/if}
 
-<!-- svelte-ignore a11y-click-events-have-key-events -->
-<!-- svelte-ignore a11y-no-static-element-interactions -->
-<div class="room" on:click={handleWindowClick}>
-  <header>
-    <div class="room-info">
-      <span
-        class="status-dot"
-        class:connected={$connectionState === 'connected'}
-        class:disconnected={$connectionState === 'disconnected'}
-        title={$connectionState}
-        role="status"
-      >
-        <span class="sr-only">{$connectionState}</span>
-      </span>
-      {#if editingName}
-        <input
-          class="rename-input input"
-          bind:value={nameDraft}
-          maxlength={MAX_ROOM_NAME}
-          placeholder="Room name"
-          aria-label="Room name"
-          on:keydown={onRenameKey}
-          on:blur={commitRename}
-          use:focusOnMount
-        />
-      {:else if $hostStatus}
-        <button class="room-id renamable" title="Rename this room for everyone" on:click={startRename}>
-          <span class="room-id-text">{$roomName || roomId}</span>
-          <span class="pen"><Icon name="pen" size={14} /></span>
-          <span class="sr-only">Rename room</span>
-        </button>
-      {:else}
-        <h1 class="room-id" title={roomId}>{$roomName || roomId}</h1>
-      {/if}
-      {#if $hostStatus}
-        <span class="chip accent">Host</span>
-      {/if}
-    </div>
-    <div class="header-end">
-      <span class="e2e-badge {e2eStatus}" title={e2eTitle} role="status">
-        <Icon name={e2eStatus === 'partial' || e2eStatus === 'nokey' ? 'shield-alert' : e2eStatus === 'verified' ? 'shield-check' : 'shield'} size={15} />
-        <span class="e2e-label">{e2eLabel}</span>
-      </span>
-      {#if shareUrl}
-        <button class="btn small copy-btn" class:copied on:click={copyLink} title="Copy a link others can use to join">
-          <Icon name={copied ? 'check' : 'link'} size={15} />
-          <span class="copy-label">{copied ? 'Copied!' : 'Copy invite link'}</span>
-        </button>
-      {/if}
-      <div class="peer-count" title="Participants">
-        <Icon name="users" size={16} />
-        <span aria-hidden="true">{peerList.length + 1}</span>
-        <span class="sr-only">{peerList.length + 1} in call</span>
+{#if showCall}
+  <!-- svelte-ignore a11y-click-events-have-key-events -->
+  <!-- svelte-ignore a11y-no-static-element-interactions -->
+  <div class="room" on:click={handleWindowClick}>
+    <header>
+      <div class="room-info">
+        <span
+          class="status-dot"
+          class:connected={$connectionState === 'connected'}
+          class:disconnected={$connectionState === 'disconnected'}
+          title={$connectionState}
+          role="status"
+        >
+          <span class="sr-only">{$connectionState}</span>
+        </span>
+        {#if editingName}
+          <input
+            class="rename-input input"
+            bind:value={nameDraft}
+            maxlength={MAX_ROOM_NAME}
+            placeholder="Room name"
+            aria-label="Room name"
+            on:keydown={onRenameKey}
+            on:blur={commitRename}
+            use:focusOnMount
+          />
+        {:else if $hostStatus}
+          <button class="room-id renamable" title="Rename this room for everyone" on:click={startRename}>
+            <span class="room-id-text">{$roomName || roomId}</span>
+            <span class="pen"><Icon name="pen" size={14} /></span>
+            <span class="sr-only">Rename room</span>
+          </button>
+        {:else}
+          <h1 class="room-id" title={roomId}>{$roomName || roomId}</h1>
+        {/if}
+        {#if $hostStatus}
+          <HostControls locked={$roomLocked} connected={$roomJoined} />
+        {/if}
+        {#if $roomLocked}
+          <span class="chip warning" title="The host locked this call: nobody new can join" role="status">
+            <Icon name="lock" size={11} /> Locked
+          </span>
+        {/if}
       </div>
-    </div>
-  </header>
+      <div class="header-end">
+        <span class="e2e-badge {e2eStatus}" title={e2eTitle} role="status">
+          <Icon name={e2eStatus === 'partial' || e2eStatus === 'nokey' ? 'shield-alert' : e2eStatus === 'verified' ? 'shield-check' : 'shield'} size={15} />
+          <span class="e2e-label">{e2eLabel}</span>
+        </span>
+        {#if shareUrl}
+          <button class="btn small copy-btn" class:copied on:click={copyLink} title="Copy a link others can use to join">
+            <Icon name={copied ? 'check' : 'link'} size={15} />
+            <span class="copy-label">{copied ? 'Copied!' : 'Copy invite link'}</span>
+          </button>
+        {/if}
+        <div class="peer-count" title="Participants">
+          <Icon name="users" size={16} />
+          <span aria-hidden="true">{peerList.length + 1}</span>
+          <span class="sr-only">{peerList.length + 1} in call</span>
+        </div>
+      </div>
+    </header>
 
-  {#each $blockedConnections as blocked (blocked.peerId)}
-    <div class="banner danger" role="alert">
-      <Icon name="shield-alert" size={16} />
-      Blocked the connection to {blocked.name}: {blocked.reason}. Someone may be trying to intercept the call. Share a fresh invite link through a channel you trust.
-    </div>
-  {/each}
+    {#each $blockedConnections as blocked (blocked.peerId)}
+      <div class="banner danger" role="alert">
+        <Icon name="shield-alert" size={16} />
+        Blocked the connection to {blocked.name}: {blocked.reason}. Someone may be trying to intercept the call. Share a fresh invite link through a channel you trust.
+      </div>
+    {/each}
 
-  {#each unverifiedPeers as up (up.id)}
-    <div class="banner warning" role="alert">
-      <Icon name="shield-alert" size={16} />
-      <span>
-        Couldn't verify <strong>{up.displayName}</strong> ({$verification.get(up.id)?.reason ?? 'no proof'}). You can't see or hear each other
-        until they're verified. The name shown is not proof of who this is. Only allow it if you've confirmed, outside this call, that it's
-        really them and why they have no key: an unverified connection can be listened to by someone in the middle.
-      </span>
-      <button class="btn small secondary" on:click={() => allowUnverified(up.id)}>Allow anyway</button>
-    </div>
-  {/each}
+    {#each unverifiedPeers as up (up.id)}
+      <div class="banner warning" role="alert">
+        <Icon name="shield-alert" size={16} />
+        <span>
+          Couldn't verify <strong>{up.displayName}</strong> ({$verification.get(up.id)?.reason ?? 'no proof'}). You can't see or hear each other
+          until they're verified. The name shown is not proof of who this is. Only allow it if you've confirmed, outside this call, that it's
+          really them and why they have no key: an unverified connection can be listened to by someone in the middle.
+        </span>
+        <button class="btn small secondary" on:click={() => allowUnverified(up.id)}>Allow anyway</button>
+      </div>
+    {/each}
 
-  {#if showReconnecting}
-    <div class="banner warning" role="status">
-      <span class="reconnect-spinner"></span>
-      Connection lost. Reconnecting...
-    </div>
-  {/if}
+    {#if showReconnecting}
+      <div class="banner warning" role="status">
+        <span class="reconnect-spinner"></span>
+        Connection lost. Reconnecting...
+      </div>
+    {/if}
 
-  {#if mediaError}
-    <div class="banner danger" role="alert">
-      {mediaError}
-    </div>
-  {/if}
+    <ConnectionHint />
 
-  {#if $whiteboardNotice && !$whiteboardOpen}
-    <div class="banner info" role="status">
-      <Icon name="whiteboard" size={16} />
-      <span>{$whiteboardNotice.name} opened the whiteboard.</span>
-      <button class="banner-btn" on:click={openWhiteboard}>Open it</button>
-      <button class="banner-dismiss" on:click={() => whiteboardNotice.set(null)} aria-label="Dismiss">
-        <Icon name="x" size={14} />
-      </button>
-    </div>
-  {/if}
+    {#if mediaError}
+      <div class="banner danger" role="alert">
+        {mediaError}
+      </div>
+    {/if}
 
-  <div class="room-body">
-    <div class="call-col">
-      <main class="call-area" class:has-stage={!!stage}>
-        {#if stage}
-          <section class="stage" aria-label={stage === 'whiteboard' ? 'Whiteboard' : 'Shared screen'}>
-            {#if stage === 'whiteboard'}
-              <Whiteboard on:close={closeWhiteboard} />
-            {:else if stage === 'local-screen'}
-              <div class="stage-screen">
-                <!-- svelte-ignore a11y-media-has-caption -->
-                <video bind:this={localScreenEl} autoplay muted playsinline></video>
-                <span class="tile-name"><span class="name-text">You are presenting</span></span>
-                {#if $localPeerIdStore}
-                  <AnnotationLayer videoEl={localScreenEl} screen={$localPeerIdStore} />
+    {#if cameraError}
+      <div class="banner danger" role="alert">
+        <span>{cameraError}</span>
+        <button class="banner-dismiss" on:click={() => (cameraError = '')} aria-label="Dismiss">
+          <Icon name="x" size={14} />
+        </button>
+      </div>
+    {/if}
+
+    {#if $whiteboardNotice && !$whiteboardOpen}
+      <div class="banner info" role="status">
+        <Icon name="whiteboard" size={16} />
+        <span>{$whiteboardNotice.name} opened the whiteboard.</span>
+        <button class="banner-btn" on:click={openWhiteboard}>Open it</button>
+        <button class="banner-dismiss" on:click={() => whiteboardNotice.set(null)} aria-label="Dismiss">
+          <Icon name="x" size={14} />
+        </button>
+      </div>
+    {/if}
+
+    <div class="room-body">
+      <div class="call-col">
+        <main class="call-area" class:has-stage={!!stage}>
+          {#if stage}
+            <section class="stage" aria-label={stage === 'whiteboard' ? 'Whiteboard' : stage === 'pinned' ? 'Pinned participant' : 'Shared screen'}>
+              {#if stage === 'whiteboard'}
+                <Whiteboard on:close={closeWhiteboard} />
+              {:else if stage === 'local-screen'}
+                <div class="stage-screen">
+                  <!-- svelte-ignore a11y-media-has-caption -->
+                  <video bind:this={localScreenEl} autoplay muted playsinline></video>
+                  <span class="tile-name"><span class="name-text">You are presenting</span></span>
+                  {#if $localPeerIdStore}
+                    <AnnotationLayer videoEl={localScreenEl} screen={$localPeerIdStore} />
+                  {/if}
+                </div>
+              {:else if stage === 'pinned' && stagePeer}
+                {#key stagePeer.id}
+                  <VideoTile
+                    peerConnection={stagePeer}
+                    speaking={$speakingPeers.has(stagePeer.id)}
+                    contain
+                    verification={$verification.get(stagePeer.id)?.state}
+                    selectable
+                    on:select={() => (selectedPeerId = stagePeer?.id ?? null)}
+                  />
+                {/key}
+                <button class="stage-btn" on:click={unpinPeer} title="Put {stagePeer.displayName} back with everyone else">
+                  <Icon name="pin" size={14} /> Unpin
+                </button>
+                {#if otherSharerPeer}
+                  <button class="stage-sharing-btn" on:click={unpinPeer} title="Unpin {stagePeer.displayName} and show the shared screen">
+                    <Icon name="screen-share" size={14} />
+                    <span class="sharing-name">{otherSharerPeer.displayName}</span> is sharing · View
+                  </button>
                 {/if}
-              </div>
-            {:else if stagePeer}
-              {#key stagePeer.id}
-                <VideoTile
-                  peerConnection={stagePeer}
-                  speaking={$speakingPeers.has(stagePeer.id)}
-                  contain
-                  presenting
-                  verification={$verification.get(stagePeer.id)?.state}
-                  bind:videoEl={stageVideoEl}
-                >
-                  <AnnotationLayer videoEl={stageVideoEl} screen={stagePeer.id} />
-                </VideoTile>
-              {/key}
-            {/if}
-          </section>
+              {:else if stagePeer}
+                {#key stagePeer.id}
+                  <VideoTile
+                    peerConnection={stagePeer}
+                    speaking={$speakingPeers.has(stagePeer.id)}
+                    contain
+                    screen
+                    presenting
+                    verification={$verification.get(stagePeer.id)?.state}
+                    bind:videoEl={stageVideoEl}
+                    selectable
+                    on:select={() => (selectedPeerId = stagePeer?.id ?? null)}
+                  >
+                    <AnnotationLayer videoEl={stageVideoEl} screen={stagePeer.id} />
+                  </VideoTile>
+                {/key}
+                <button class="stage-btn" on:click={() => (selectedPeerId = stagePeer?.id ?? null)} aria-label="Options for {stagePeer.displayName}: volume, mute for me, pin">
+                  <Icon name="more-horizontal" size={14} /> Options
+                </button>
+              {/if}
+            </section>
+          {/if}
+
+          <div class={stage ? 'tile-strip' : 'video-grid'} style={stage ? '' : `--cols: ${gridCols}`}>
+            <div class="tile self" class:speaking={localSpeaking}>
+              {#if localHasVideo}
+                <video bind:this={localVideoEl} class:unmirrored={!shouldMirror($cameraFacing)} autoplay muted playsinline></video>
+                {#if canFlipCamera}
+                  <button class="flip-btn" on:click={handleFlipCamera} title="Switch camera" aria-label="Switch between front and back camera">
+                    <Icon name="switch-camera" size={18} />
+                  </button>
+                {/if}
+              {:else}
+                <div class="no-video">
+                  <span class="avatar">{displayName.charAt(0).toUpperCase()}</span>
+                </div>
+              {/if}
+              {#if $localHandRaised}
+                <span class="hand-badge" title="Your hand is raised"><Icon name="hand" size={15} /><span class="sr-only">Your hand is raised</span></span>
+              {/if}
+              <span class="tile-name">
+                <span class="name-text">{displayName} (you){chatOnly ? ' · chat only' : ''}</span>
+                {#if !chatOnly && !$audioEnabled}
+                  <span class="muted-icon" title="Muted"><Icon name="mic-off" size={13} /><span class="sr-only">Muted</span></span>
+                {/if}
+              </span>
+            </div>
+
+            {#each stripPeers as pc (pc.id)}
+              <VideoTile
+                peerConnection={pc}
+                speaking={$speakingPeers.has(pc.id)}
+                presenting={$sharingPeers.has(pc.id)}
+                verification={$verification.get(pc.id)?.state}
+                selectable
+                on:select={() => (selectedPeerId = pc.id)}
+              />
+            {/each}
+
+            {#each stripScreens as pc (pc.id)}
+              <VideoTile peerConnection={pc} contain screen presenting verification={$verification.get(pc.id)?.state} />
+            {/each}
+          </div>
+        </main>
+
+        {#if $hostStatus && $admissionRequests.length > 0}
+          <AdmissionPanel
+            requests={$admissionRequests}
+            on:admit={(e) => admitPeer(e.detail)}
+            on:deny={(e) => denyPeer(e.detail)}
+          />
         {/if}
 
-        <div class={stage ? 'tile-strip' : 'video-grid'} style={stage ? '' : `--cols: ${gridCols}`}>
-          <div class="tile self" class:speaking={localSpeaking}>
-            {#if localHasVideo}
-              <video bind:this={localVideoEl} autoplay muted playsinline></video>
-            {:else}
-              <div class="no-video">
-                <span class="avatar">{displayName.charAt(0).toUpperCase()}</span>
+        <ReactionOverlay reactions={$reactionsStore} />
+
+        {#if showDeviceSettings}
+          <DeviceSettings on:shortcuts={() => { showDeviceSettings = false; showShortcuts = true; }} />
+        {/if}
+
+        <HandToasts />
+
+        {#if showReactionPicker}
+          <ReactionPicker on:react={(e) => { sendReaction(e.detail); showReactionPicker = false; }} />
+        {/if}
+
+        <footer>
+          <div class="controls" role="group" aria-label="Call controls">
+            {#if !chatOnly && $localStream?.getAudioTracks().length}
+              <button
+                class="ctrl-btn"
+                class:off={!$audioEnabled}
+                aria-pressed={$audioEnabled}
+                on:click={handleToggleAudio}
+                title={$audioEnabled ? 'Mute' : 'Unmute'}
+              >
+                <Icon name={$audioEnabled ? 'mic' : 'mic-off'} size={22} />
+                <span class="ctrl-label">Mic</span>
+              </button>
+            {/if}
+
+            {#if !chatOnly && $localStream && !$voiceOnlyMode}
+              <button
+                class="ctrl-btn"
+                class:off={!$videoEnabled}
+                aria-pressed={$videoEnabled}
+                disabled={$cameraStarting}
+                on:click={handleToggleVideo}
+                title={$videoEnabled ? 'Camera off' : 'Camera on'}
+              >
+                <Icon name={$videoEnabled ? 'video' : 'video-off'} size={22} />
+                <span class="ctrl-label">Camera</span>
+              </button>
+            {/if}
+
+            {#if !chatOnly}
+              <button
+                class="ctrl-btn"
+                class:active={$isScreenSharing}
+                aria-pressed={$isScreenSharing}
+                on:click={handleScreenShare}
+                title={$isScreenSharing ? 'Stop sharing' : 'Share screen'}
+              >
+                <Icon name={$isScreenSharing ? 'screen-share-off' : 'screen-share'} size={22} />
+                <span class="ctrl-label">{$isScreenSharing ? 'Stop' : 'Share'}</span>
+              </button>
+            {/if}
+
+            <button
+              class="ctrl-btn"
+              class:active={$whiteboardOpen}
+              aria-pressed={$whiteboardOpen}
+              on:click={toggleWhiteboard}
+              title={$whiteboardOpen ? 'Hide whiteboard' : 'Open the shared whiteboard'}
+            >
+              <Icon name="whiteboard" size={22} />
+              <span class="ctrl-label">Board</span>
+            </button>
+
+            {#if pipMode}
+              <button
+                class="ctrl-btn"
+                class:active={$pipOpen}
+                aria-pressed={$pipOpen}
+                disabled={!$pipAvailable}
+                on:click={() => togglePip({ displayName, chatOnly, onToggleAudio: handleToggleAudio, onToggleVideo: handleToggleVideo, onLeave: handleLeave })}
+                title={$pipOpen ? 'Close the pop-out window' : $pipAvailable ? 'Pop the call out into a small window that stays on top' : 'No video to pop out yet'}
+              >
+                <Icon name="pip" size={22} />
+                <span class="ctrl-label">Pop out</span>
+              </button>
+            {/if}
+
+            <button
+              class="ctrl-btn"
+              class:active={showChat}
+              aria-pressed={showChat}
+              on:click={() => { showChat = !showChat; }}
+              title="Chat"
+            >
+              <Icon name="message" size={22} />
+              <span class="ctrl-label">Chat</span>
+              {#if unreadCount > 0 && !showChat}
+                <span class="unread-badge" aria-hidden="true">{unreadCount > 99 ? '99+' : unreadCount}</span>
+                <span class="sr-only">{unreadCount} unread</span>
+              {/if}
+            </button>
+
+            <button
+              class="ctrl-btn"
+              class:active={showReactionPicker}
+              aria-pressed={showReactionPicker}
+              aria-haspopup="true"
+              on:click={() => { showReactionPicker = !showReactionPicker; showDeviceSettings = false; }}
+              title="React"
+            >
+              <Icon name="smile" size={22} />
+              <span class="ctrl-label">React</span>
+            </button>
+
+            <button
+              class="ctrl-btn"
+              class:active={$localHandRaised}
+              aria-pressed={$localHandRaised}
+              on:click={toggleHand}
+              title={$localHandRaised ? 'Lower your hand' : 'Raise your hand'}
+              aria-keyshortcuts="Control+Alt+H Control+Meta+H"
+            >
+              <Icon name="hand" size={22} />
+              <span class="ctrl-label">Hand</span>
+            </button>
+
+            {#if !chatOnly}
+              <button
+                class="ctrl-btn"
+                class:active={showDeviceSettings}
+                aria-pressed={showDeviceSettings}
+                aria-haspopup="true"
+                on:click={() => { showDeviceSettings = !showDeviceSettings; showReactionPicker = false; }}
+                title="Settings"
+              >
+                <Icon name="settings" size={22} />
+                <span class="ctrl-label">Settings</span>
+              </button>
+            {/if}
+
+            <span class="ctrl-sep" aria-hidden="true"></span>
+
+            <button class="ctrl-btn leave" on:click={handleLeave} title="Leave call">
+              <Icon name="phone-off" size={22} />
+              <span class="ctrl-label">Leave</span>
+            </button>
+          </div>
+        </footer>
+      </div>
+
+      {#if selectedPeer}
+        <!-- svelte-ignore a11y-click-events-have-key-events -->
+        <!-- svelte-ignore a11y-no-static-element-interactions -->
+        <div class="person-backdrop" on:click|self={() => (selectedPeerId = null)}>
+          <div class="person-card" role="dialog" aria-modal="true" aria-label="Actions for {selectedPeer.displayName}">
+            <div class="person-head">
+              <span class="person-avatar">{selectedPeer.displayName.charAt(0).toUpperCase()}</span>
+              <div>
+                <strong>{selectedPeer.displayName}</strong>
+                <p class="person-ver {$verification.get(selectedPeer.id)?.state ?? 'pending'}">
+                  <Icon name={$verification.get(selectedPeer.id)?.state === 'verified' ? 'shield-check' : 'shield-alert'} size={13} />
+                  {verificationText($verification.get(selectedPeer.id)?.state)}
+                </p>
+              </div>
+              <button class="btn ghost small icon" on:click={() => (selectedPeerId = null)} aria-label="Close"><Icon name="x" size={16} /></button>
+            </div>
+            <div class="person-actions">
+              <button class="btn secondary" on:click={() => selectedPeer && messagePerson(selectedPeer.id)}>
+                <Icon name="message" size={16} /> Message privately
+              </button>
+              <button class="btn secondary" on:click={() => personFileInput.click()} disabled={!selectedPeer.connected}>
+                <Icon name="paperclip" size={16} /> Send a file
+              </button>
+              <input type="file" bind:this={personFileInput} on:change={sendFileToPerson} hidden />
+            </div>
+            <PersonControls
+              peer={selectedPeer}
+              onStage={stagePeer?.id === selectedPeer.id}
+              on:pinned={() => (selectedPeerId = null)}
+            />
+            {#if $verification.get(selectedPeer.id)?.code}
+              <div class="safety-code">
+                <span class="muted">Safety code</span>
+                <strong>{$verification.get(selectedPeer.id)?.code}</strong>
+                <p>Read all of it to {selectedPeer.displayName} (by voice, or another app). If you both see the same code, nobody is in the middle of your connection.</p>
               </div>
             {/if}
-            <span class="tile-name">
-              <span class="name-text">{displayName} (you){chatOnly ? ' · chat only' : ''}</span>
-              {#if !chatOnly && !$audioEnabled}
-                <span class="muted-icon" title="Muted"><Icon name="mic-off" size={13} /><span class="sr-only">Muted</span></span>
-              {/if}
-            </span>
+            <ConnectionDetails peerId={selectedPeer.id} />
+            {#if $verification.get(selectedPeer.id)?.state === 'unverified'}
+              <button class="btn secondary" on:click={() => selectedPeer && allowUnverified(selectedPeer.id)}>
+                <Icon name="shield-alert" size={16} /> Allow this unverified connection
+              </button>
+            {/if}
+            {#if $hostStatus}
+              <button class="btn danger-ghost" on:click={removeSelected}>
+                <Icon name="x" size={16} />
+                {confirmRemove ? `Tap again to remove ${selectedPeer.displayName}` : 'Remove from call'}
+              </button>
+            {/if}
+            {#if personNotice}<p class="person-notice" role="alert">{personNotice}</p>{/if}
+            <p class="person-foot">Only {selectedPeer.displayName} receives it, encrypted straight from your device.</p>
           </div>
-
-          {#each stripPeers as pc (pc.id)}
-            <VideoTile
-              peerConnection={pc}
-              speaking={$speakingPeers.has(pc.id)}
-              presenting={$sharingPeers.has(pc.id)}
-              verification={$verification.get(pc.id)?.state}
-              selectable
-              on:select={() => (selectedPeerId = pc.id)}
-            />
-          {/each}
         </div>
-      </main>
+      {/if}
 
-      {#if $hostStatus && $admissionRequests.length > 0}
-        <AdmissionPanel
-          requests={$admissionRequests}
-          on:admit={(e) => admitPeer(e.detail)}
-          on:deny={(e) => denyPeer(e.detail)}
+      {#if showChat}
+        <ChatPanel
+          messages={$chatMessages}
+          bind:recipient={chatRecipient}
+          on:close={() => { showChat = false; }}
         />
       {/if}
-
-      <ReactionOverlay reactions={$reactionsStore} />
-
-      {#if showDeviceSettings}
-        <DeviceSettings />
-      {/if}
-
-      {#if showReactionPicker}
-        <ReactionPicker on:react={(e) => { sendReaction(e.detail); showReactionPicker = false; }} />
-      {/if}
-
-      <footer>
-        <div class="controls" role="group" aria-label="Call controls">
-          {#if !chatOnly && $localStream?.getAudioTracks().length}
-            <button
-              class="ctrl-btn"
-              class:off={!$audioEnabled}
-              aria-pressed={$audioEnabled}
-              on:click={handleToggleAudio}
-              title={$audioEnabled ? 'Mute' : 'Unmute'}
-            >
-              <Icon name={$audioEnabled ? 'mic' : 'mic-off'} size={22} />
-              <span class="ctrl-label">Mic</span>
-            </button>
-          {/if}
-
-          {#if !chatOnly && $localStream?.getVideoTracks().length}
-            <button
-              class="ctrl-btn"
-              class:off={!$videoEnabled}
-              aria-pressed={$videoEnabled}
-              on:click={handleToggleVideo}
-              title={$videoEnabled ? 'Camera off' : 'Camera on'}
-            >
-              <Icon name={$videoEnabled ? 'video' : 'video-off'} size={22} />
-              <span class="ctrl-label">Camera</span>
-            </button>
-          {/if}
-
-          {#if !chatOnly}
-            <button
-              class="ctrl-btn"
-              class:active={$isScreenSharing}
-              aria-pressed={$isScreenSharing}
-              on:click={handleScreenShare}
-              title={$isScreenSharing ? 'Stop sharing' : 'Share screen'}
-            >
-              <Icon name={$isScreenSharing ? 'screen-share-off' : 'screen-share'} size={22} />
-              <span class="ctrl-label">{$isScreenSharing ? 'Stop' : 'Share'}</span>
-            </button>
-          {/if}
-
-          <button
-            class="ctrl-btn"
-            class:active={$whiteboardOpen}
-            aria-pressed={$whiteboardOpen}
-            on:click={toggleWhiteboard}
-            title={$whiteboardOpen ? 'Hide whiteboard' : 'Open the shared whiteboard'}
-          >
-            <Icon name="whiteboard" size={22} />
-            <span class="ctrl-label">Board</span>
-          </button>
-
-          <button
-            class="ctrl-btn"
-            class:active={showChat}
-            aria-pressed={showChat}
-            on:click={() => { showChat = !showChat; }}
-            title="Chat"
-          >
-            <Icon name="message" size={22} />
-            <span class="ctrl-label">Chat</span>
-            {#if unreadCount > 0 && !showChat}
-              <span class="unread-badge" aria-hidden="true">{unreadCount > 99 ? '99+' : unreadCount}</span>
-              <span class="sr-only">{unreadCount} unread</span>
-            {/if}
-          </button>
-
-          <button
-            class="ctrl-btn"
-            class:active={showReactionPicker}
-            aria-pressed={showReactionPicker}
-            aria-haspopup="true"
-            on:click={() => { showReactionPicker = !showReactionPicker; showDeviceSettings = false; }}
-            title="React"
-          >
-            <Icon name="smile" size={22} />
-            <span class="ctrl-label">React</span>
-          </button>
-
-          {#if !chatOnly}
-            <button
-              class="ctrl-btn"
-              class:active={showDeviceSettings}
-              aria-pressed={showDeviceSettings}
-              aria-haspopup="true"
-              on:click={() => { showDeviceSettings = !showDeviceSettings; showReactionPicker = false; }}
-              title="Settings"
-            >
-              <Icon name="settings" size={22} />
-              <span class="ctrl-label">Settings</span>
-            </button>
-          {/if}
-
-          <span class="ctrl-sep" aria-hidden="true"></span>
-
-          <button class="ctrl-btn leave" on:click={handleLeave} title="Leave call">
-            <Icon name="phone-off" size={22} />
-            <span class="ctrl-label">Leave</span>
-          </button>
-        </div>
-      </footer>
     </div>
-
-    {#if selectedPeer}
-      <!-- svelte-ignore a11y-click-events-have-key-events -->
-      <!-- svelte-ignore a11y-no-static-element-interactions -->
-      <div class="person-backdrop" on:click|self={() => (selectedPeerId = null)}>
-        <div class="person-card" role="dialog" aria-modal="true" aria-label="Actions for {selectedPeer.displayName}">
-          <div class="person-head">
-            <span class="person-avatar">{selectedPeer.displayName.charAt(0).toUpperCase()}</span>
-            <div>
-              <strong>{selectedPeer.displayName}</strong>
-              <p class="person-ver {$verification.get(selectedPeer.id)?.state ?? 'pending'}">
-                <Icon name={$verification.get(selectedPeer.id)?.state === 'verified' ? 'shield-check' : 'shield-alert'} size={13} />
-                {verificationText($verification.get(selectedPeer.id)?.state)}
-              </p>
-            </div>
-            <button class="btn ghost small icon" on:click={() => (selectedPeerId = null)} aria-label="Close"><Icon name="x" size={16} /></button>
-          </div>
-          <div class="person-actions">
-            <button class="btn secondary" on:click={() => selectedPeer && messagePerson(selectedPeer.id)}>
-              <Icon name="message" size={16} /> Message privately
-            </button>
-            <button class="btn secondary" on:click={() => personFileInput.click()} disabled={!selectedPeer.connected}>
-              <Icon name="paperclip" size={16} /> Send a file
-            </button>
-            <input type="file" bind:this={personFileInput} on:change={sendFileToPerson} hidden />
-          </div>
-          {#if $verification.get(selectedPeer.id)?.code}
-            <div class="safety-code">
-              <span class="muted">Safety code</span>
-              <strong>{$verification.get(selectedPeer.id)?.code}</strong>
-              <p>Read all of it to {selectedPeer.displayName} (by voice, or another app). If you both see the same code, nobody is in the middle of your connection.</p>
-            </div>
-          {/if}
-          {#if $verification.get(selectedPeer.id)?.state === 'unverified'}
-            <button class="btn secondary" on:click={() => selectedPeer && allowUnverified(selectedPeer.id)}>
-              <Icon name="shield-alert" size={16} /> Allow this unverified connection
-            </button>
-          {/if}
-          {#if $hostStatus}
-            <button class="btn danger-ghost" on:click={removeSelected}>
-              <Icon name="x" size={16} />
-              {confirmRemove ? `Tap again to remove ${selectedPeer.displayName}` : 'Remove from call'}
-            </button>
-          {/if}
-          {#if personNotice}<p class="person-notice" role="alert">{personNotice}</p>{/if}
-          <p class="person-foot">Only {selectedPeer.displayName} receives it, encrypted straight from your device.</p>
-        </div>
-      </div>
-    {/if}
-
-    {#if showChat}
-      <ChatPanel
-        messages={$chatMessages}
-        bind:recipient={chatRecipient}
-        on:close={() => { showChat = false; }}
-      />
-    {/if}
   </div>
-</div>
+{/if}
+
+<KeyboardShortcuts
+  enabled={shortcutsEnabled}
+  {chatOnly}
+  whiteboardOpen={$whiteboardOpen}
+  onToggleVideo={handleToggleVideo}
+  on:chat={() => { showChat = !showChat; }}
+  on:help={() => { showShortcuts = !showShortcuts; }}
+/>
+{#if showShortcuts}
+  <ShortcutsHelp on:close={() => (showShortcuts = false)} />
+{/if}
 
 <style>
+  /* ── Landing (before the call): passcode, then name ─────────────────── */
+  /* The page itself doesn't scroll (body is overflow: hidden), so the landing does. */
+  .landing {
+    height: 100vh;
+    height: 100dvh;
+    display: flex;
+    flex-direction: column;
+    padding: var(--space-6) var(--space-4);
+    overflow-y: auto;
+    background:
+      radial-gradient(ellipse 70% 40% at 50% 0%, var(--accent-soft), transparent 70%),
+      var(--bg);
+  }
+
+  .landing-card {
+    margin: auto;
+    width: min(100%, 440px);
+    padding: var(--space-6);
+    box-shadow: var(--shadow-lg);
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-4);
+  }
+
+  /* The pre-join step has a camera preview next to the form. */
+  .landing-card.wide {
+    width: min(100%, 820px);
+  }
+
+  .landing-head {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    gap: var(--space-2);
+  }
+
+  .landing-head h1 {
+    font-size: var(--text-xl);
+    font-weight: 600;
+    letter-spacing: -0.01em;
+    color: var(--text);
+    overflow-wrap: anywhere;
+  }
+
+  .steps {
+    list-style: none;
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--space-2) var(--space-4);
+    font-size: var(--text-sm);
+    color: var(--text-subtle);
+  }
+
+  .steps li {
+    display: inline-flex;
+    align-items: center;
+    gap: var(--space-2);
+  }
+
+  .steps li.current {
+    color: var(--text);
+    font-weight: 500;
+  }
+
+  .steps li.done {
+    color: var(--text-muted);
+  }
+
+  .step-num {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 22px;
+    height: 22px;
+    border-radius: 50%;
+    border: 1px solid var(--border-strong);
+    font-size: var(--text-xs);
+    font-weight: 600;
+  }
+
+  .steps li.current .step-num {
+    background: var(--accent);
+    border-color: var(--accent);
+    color: var(--accent-text);
+  }
+
+  .steps li.done .step-num {
+    background: var(--success-soft);
+    border-color: transparent;
+    color: var(--success);
+  }
+
+  .step {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-3);
+    padding-top: var(--space-4);
+    border-top: 1px solid var(--border-subtle);
+  }
+
+  .step h2 {
+    font-size: var(--text-lg);
+    font-weight: 600;
+    color: var(--text);
+  }
+
+  .step-sub {
+    color: var(--text-muted);
+    font-size: var(--text-sm);
+    margin-top: calc(var(--space-2) * -1);
+  }
+
+  .step-error {
+    color: var(--danger);
+    font-size: var(--text-sm);
+  }
+
+  .landing-loading {
+    display: flex;
+    align-items: center;
+    gap: var(--space-2);
+    color: var(--text-muted);
+    font-size: var(--text-sm);
+  }
+
+  .landing-spinner {
+    width: 16px;
+    height: 16px;
+    border: 2px solid var(--border);
+    border-top-color: var(--accent);
+    border-radius: 50%;
+    animation: landing-spin 0.8s linear infinite;
+  }
+
+  @keyframes landing-spin {
+    to { transform: rotate(360deg); }
+  }
+
+  @media (max-width: 480px) {
+    .landing {
+      padding: var(--space-4);
+    }
+    .landing-card {
+      padding: var(--space-5);
+    }
+    .step .dialog-actions .btn {
+      flex: 1;
+    }
+  }
+
   .room {
     height: 100vh;
     height: 100dvh;
@@ -1327,6 +1791,33 @@
     transform: scaleX(-1);
   }
 
+  /* A back camera isn't mirrored (text would read backwards). */
+  .tile.self video.unmirrored {
+    transform: none;
+  }
+
+  .flip-btn {
+    position: absolute;
+    top: var(--space-2);
+    right: var(--space-2);
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 44px;
+    height: 44px;
+    border-radius: 50%;
+    border: 1px solid rgba(255, 255, 255, 0.18);
+    background: rgba(11, 13, 18, 0.62);
+    -webkit-backdrop-filter: blur(6px);
+    backdrop-filter: blur(6px);
+    color: #fff;
+  }
+
+  .flip-btn:focus-visible {
+    outline: 2px solid var(--accent-ring);
+    outline-offset: 2px;
+  }
+
   .tile .no-video {
     display: flex;
     align-items: center;
@@ -1385,6 +1876,84 @@
     display: inline-flex;
     color: #f87171;
     flex-shrink: 0;
+  }
+
+  /* Raised hand on your own tile (VideoTile has the same for others) */
+  .hand-badge {
+    position: absolute;
+    top: var(--space-2);
+    left: var(--space-2);
+    display: inline-flex;
+    padding: 5px;
+    border-radius: var(--radius-pill);
+    background: var(--warning);
+    color: #1a1300;
+    box-shadow: var(--shadow-sm);
+    pointer-events: none;
+  }
+
+  /* Unpin / Options, over whoever is on the stage */
+  .stage-btn {
+    position: absolute;
+    right: var(--space-2);
+    bottom: var(--space-2);
+    z-index: 3;
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 4px 10px;
+    border: 0;
+    border-radius: var(--radius-pill);
+    background: rgba(11, 13, 18, 0.62);
+    -webkit-backdrop-filter: blur(6px);
+    backdrop-filter: blur(6px);
+    color: #fff;
+    font-size: var(--text-xs);
+    font-weight: 500;
+    cursor: pointer;
+  }
+
+  /* While your pin holds the stage: someone else is sharing (tap to unpin and view it) */
+  .stage-sharing-btn {
+    position: absolute;
+    top: var(--space-2);
+    left: 50%;
+    transform: translateX(-50%);
+    z-index: 3;
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    max-width: calc(100% - 24px);
+    padding: 4px 12px;
+    border: 0;
+    border-radius: var(--radius-pill);
+    background: var(--accent);
+    color: var(--accent-text);
+    font-size: var(--text-xs);
+    font-weight: 600;
+    white-space: nowrap;
+    cursor: pointer;
+    box-shadow: var(--shadow-md);
+  }
+
+  .stage-sharing-btn .sharing-name {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  .stage-sharing-btn:focus-visible {
+    outline: 2px solid var(--accent-ring);
+    outline-offset: 2px;
+  }
+
+  .stage-btn:hover {
+    background: rgba(11, 13, 18, 0.82);
+  }
+
+  .stage-btn:focus-visible {
+    outline: 2px solid var(--accent-ring);
+    outline-offset: 2px;
   }
 
   /* ── Controls ───────────────────────────────────────────────────────── */
@@ -1455,6 +2024,11 @@
     border-color: var(--danger);
   }
 
+  .ctrl-btn:disabled {
+    opacity: 0.6;
+    cursor: progress;
+  }
+
   .ctrl-btn.active {
     background: var(--accent-soft);
     border-color: transparent;
@@ -1463,6 +2037,11 @@
 
   .ctrl-btn.active:hover {
     border-color: var(--accent);
+  }
+
+  .ctrl-btn:disabled {
+    opacity: 0.45;
+    cursor: not-allowed;
   }
 
   .ctrl-sep {
@@ -1581,142 +2160,11 @@
     justify-content: center;
   }
 
-  .field {
-    display: flex;
-    flex-direction: column;
-  }
-
-  .join-modes {
-    border: none;
-    min-width: 0;
-    display: flex;
-    flex-direction: column;
-    gap: var(--space-2);
-  }
-
-  .join-modes legend {
-    margin-bottom: var(--space-2);
-    padding: 0;
-  }
-
   .code-input {
     font-family: var(--font-mono, monospace);
     font-size: var(--text-xl, 1.25rem);
     letter-spacing: 0.3em;
     text-align: center;
-  }
-
-  .hide-ip {
-    display: flex;
-    gap: var(--space-2);
-    align-items: flex-start;
-    margin-top: var(--space-3);
-    cursor: pointer;
-  }
-
-  .hide-ip input {
-    margin-top: 0.2rem;
-  }
-
-  .hide-ip span {
-    display: grid;
-    gap: 0.15rem;
-  }
-
-  .hide-ip small {
-    color: var(--text-muted);
-    font-size: var(--text-xs, 0.75rem);
-  }
-
-  .mode {
-    position: relative;
-    display: flex;
-    align-items: center;
-    gap: var(--space-3);
-    min-height: 56px;
-    padding: var(--space-2) var(--space-3);
-    background: var(--bg-elevated);
-    border: 1px solid var(--border);
-    border-radius: var(--radius);
-    cursor: pointer;
-    transition: border-color var(--dur-fast) var(--ease), background var(--dur-fast) var(--ease);
-  }
-
-  .mode:hover {
-    border-color: var(--border-strong);
-  }
-
-  .mode.selected {
-    border-color: var(--accent);
-    background: var(--accent-soft);
-  }
-
-  .mode:focus-within {
-    box-shadow: 0 0 0 3px var(--accent-ring);
-  }
-
-  .mode input {
-    position: absolute;
-    opacity: 0;
-    inset: 0;
-    width: 100%;
-    height: 100%;
-    margin: 0;
-    cursor: pointer;
-  }
-
-  .mode-icon {
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    width: 36px;
-    height: 36px;
-    border-radius: var(--radius);
-    background: var(--bg-hover);
-    color: var(--text-muted);
-    flex-shrink: 0;
-  }
-
-  .mode.selected .mode-icon {
-    background: var(--accent);
-    color: var(--accent-text);
-  }
-
-  .mode-text {
-    display: flex;
-    flex-direction: column;
-    flex: 1;
-    min-width: 0;
-    line-height: 1.3;
-  }
-
-  .mode-text strong {
-    font-size: var(--text-base);
-    font-weight: 500;
-    color: var(--text);
-  }
-
-  .mode-text small {
-    font-size: var(--text-xs);
-    color: var(--text-muted);
-  }
-
-  .mode-check {
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    width: 20px;
-    height: 20px;
-    border-radius: 50%;
-    border: 1px solid var(--border-strong);
-    color: transparent;
-    flex-shrink: 0;
-  }
-
-  .mode.selected .mode-check {
-    background: var(--accent);
-    border-color: var(--accent);
-    color: var(--accent-text);
   }
 
   /* ── Responsive ─────────────────────────────────────────────────────── */
@@ -1867,6 +2315,8 @@
     display: flex;
     flex-direction: column;
     gap: var(--space-4, 1rem);
+    max-height: calc(100dvh - 2rem);
+    overflow-y: auto;
   }
 
   .person-head {

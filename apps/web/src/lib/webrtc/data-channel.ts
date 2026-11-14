@@ -1,6 +1,7 @@
 export type DataChannelMessage =
   | { type: 'chat'; text: string; fromPeerId: string; displayName: string; timestamp: number; private?: boolean }
-  | { type: 'screen-state'; sharing: boolean }
+  /** `mid`: which of the sender's own video transceivers carries the screen (see media-slots.ts). */
+  | { type: 'screen-state'; sharing: boolean; mid?: string }
   | { type: 'media-state'; audio: boolean; video: boolean }
   | { type: 'typing'; isTyping: boolean; fromPeerId: string }
   | { type: 'reaction'; emoji: string; fromPeerId: string; displayName: string; timestamp: number }

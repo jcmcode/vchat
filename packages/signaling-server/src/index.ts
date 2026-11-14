@@ -1,6 +1,7 @@
 // Node.js signaling server (used by local dev and the Docker/VPS deployment).
 //
-//   /api/*                  -> shared HTTP API (see core/api.ts): config, ICE servers, owner sign-in, invites
+//   /api/*                  -> shared HTTP API (see core/api.ts): config, ICE servers, owner sign-in,
+//                              invites, invite code checks
 //   GET  /healthz           -> "ok"
 //   WS   /ws?room=<id>      -> signaling (any path is accepted for WebSocket upgrades)
 
@@ -15,6 +16,7 @@ import {
   Room,
   WS_PROTOCOL,
   authorizeJoin,
+  endedCalls,
   socketRole,
   handleApi,
   ipKey,
@@ -85,6 +87,10 @@ const idleTimers = new WeakMap<WebSocket, ReturnType<typeof setTimeout>>();
 /** Keys client hashes; random per process if there's no SECRET_KEY (open mode). */
 const CLIENT_KEY = env.SECRET_KEY || randomBytes(32).toString('hex');
 
+/**
+ * Must stay identical to core `throttleClientId(SECRET_KEY, ip)` (used by POST /api/invite/check),
+ * so checking an invite code and joining share one guess budget per room + client.
+ */
 function clientIdFor(ip: string): string {
   return createHmac('sha256', CLIENT_KEY).update(`client:${ipKey(ip)}`).digest('base64url').slice(0, 22);
 }
@@ -289,6 +295,16 @@ function reapIfEmpty(roomId: string): void {
   if (room && room.isEmpty() && !pendingEnters.get(roomId)) rooms.delete(roomId);
 }
 
+/**
+ * The host ended the call: members were told and closed by the Room. Close the room's other
+ * sockets too (never entered, at the password prompt, denied…), without saying why.
+ */
+function closeRoomSockets(roomId: string): void {
+  for (const client of wss.clients) {
+    if (sockets.get(client)?.roomId === roomId && client.readyState === client.OPEN) client.close(1000, 'Closing');
+  }
+}
+
 function leaveRoom(ws: WebSocket): void {
   const info = sockets.get(ws);
   if (!info) return;
@@ -356,6 +372,8 @@ async function handleMessage(ws: WebSocket, msg: ClientMessage): Promise<void> {
       else if (msg.type === 'admit-peer') room.admitPeer(ws, msg.peerId);
       else if (msg.type === 'deny-peer') room.denyPeer(ws, msg.peerId);
       else if (msg.type === 'remove-peer') room.removePeer(ws, msg.peerId);
+      else if (msg.type === 'lock-room' || msg.type === 'unlock-room') room.setLocked(ws, msg.type === 'lock-room');
+      else if (msg.type === 'end-room' && room.endRoom(ws)) closeRoomSockets(info.roomId);
       reapIfEmpty(info.roomId);
     }
   }
@@ -427,6 +445,7 @@ const housekeeping = setInterval(() => {
     reapIfEmpty(id);
     peers += room.peers().length;
   }
+  endedCalls.sweep();
   sweepApiState();
   if (DEBUG_LOGS && ++ticks % 12 === 0 && rooms.size > 0) {
     console.log(`[stats] ${rooms.size} room(s), ${peers} peer(s)`);

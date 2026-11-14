@@ -12,7 +12,7 @@
     "test": "pnpm --filter @vchat/signaling-server --filter @vchat/web test",
     "check": "pnpm --filter @vchat/signaling-server typecheck && pnpm --filter @vchat/web check && pnpm --filter @vchat/cloudflare typecheck",
     "cf:dev": "pnpm --filter @vchat/cloudflare dev",
-    "cf:deploy": "pnpm --filter @vchat/cloudflare deploy",
+    "cf:deploy": "pnpm --filter @vchat/cloudflare run deploy",
     "desktop:dev": "pnpm --filter @vchat/desktop dev",
     "desktop:build": "pnpm --filter @vchat/desktop build"
   },

@@ -34,7 +34,12 @@ export type ClientMessage =
   | { type: 'admit-peer'; peerId: string }
   | { type: 'deny-peer'; peerId: string }
   /** Host only: remove a participant (or waiting guest) for the rest of the room's life. */
-  | { type: 'remove-peer'; peerId: string };
+  | { type: 'remove-peer'; peerId: string }
+  /** Host only: refuse every new join attempt (admitted peers can still reconnect), or allow them again. */
+  | { type: 'lock-room' }
+  | { type: 'unlock-room' }
+  /** Host only: end the call for everyone, participants and waiting guests alike. */
+  | { type: 'end-room' };
 
 export type ParseResult = { ok: true; msg: ClientMessage } | { ok: false; error: string };
 
@@ -150,6 +155,9 @@ export function parseClientMessage(raw: string): ParseResult {
     }
     case 'leave':
     case 'ping':
+    case 'lock-room':
+    case 'unlock-room':
+    case 'end-room':
       return { ok: true, msg: { type: m.type } };
     case 'signal': {
       if (!isValidPeerId(m.targetPeerId)) return { ok: false, error: 'Invalid targetPeerId' };
