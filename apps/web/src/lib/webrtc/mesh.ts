@@ -207,6 +207,14 @@ export function onPeerSecurityFailure(handler: (peerId: string, reason: string) 
 }
 
 /** The current connection to a peer, if any (verification reads its SDP/stats). */
+/**
+ * Whether the server gave us a TURN relay. Without one, two people whose networks block direct
+ * connections (a VPN, a strict firewall, some mobile networks) can't connect at all.
+ */
+export function hasRelayServer(): boolean {
+  return iceServers.some((s) => (Array.isArray(s.urls) ? s.urls : [s.urls]).some((u) => /^turns?:/i.test(u)));
+}
+
 export function getPeerConnection(peerId: string): PeerConnection | undefined {
   return get(peers).get(peerId);
 }

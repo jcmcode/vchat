@@ -31,6 +31,7 @@ import {
   getLocalDisplayName,
   getLocalPeerId,
   getPeerConnection,
+  hasRelayServer,
   onPeerChannelOpen,
   onPeerCreated,
   onPeerLeft,
@@ -60,7 +61,8 @@ export type Verification =
   | 'unverified' // no proof (no key, or no answer) — blocked unless you allow it
   | 'allowed' // unverified, but you chose to allow it
   | 'failed' // proof or encryption details were wrong — blocked
-  | 'nokey'; // you have no room key, so nobody can be verified (allowed, with a warning)
+  | 'nokey' // you have no room key, so nobody can be verified (allowed, with a warning)
+  | 'unreachable'; // no connection could be made at all (a network problem, not a security one); still retrying
 
 export interface PeerVerification {
   /** Connection session this state belongs to. */
@@ -75,6 +77,8 @@ export interface PeerVerification {
    * of the app, which doesn't take part in the safety-code exchange (they need to reload).
    */
   codeNote?: 'outdated';
+  /** 'unreachable' only: whether the server offers a relay (without one, a VPN or firewall can stop the call). */
+  relay?: boolean;
 }
 
 export const verification = writable<Map<string, PeerVerification>>(new Map());
@@ -91,6 +95,12 @@ const VERIFY_DEADLINE_MS = 20_000;
 let keys: RoomKeys | null = null;
 let keyRoomId = '';
 const deadlines = new Map<string, ReturnType<typeof setTimeout>>();
+/**
+ * When we started trying to reach each peer without ever getting a connection open. A connection
+ * that fails is rebuilt, so this spans the retries: after VERIFY_DEADLINE_MS of nothing, the person
+ * is shown as unreachable (a network problem) rather than unverified (a security warning).
+ */
+const tryingSince = new Map<string, number>();
 
 function entry(peerId: string): PeerVerification | undefined {
   return get(verification).get(peerId);
@@ -206,23 +216,33 @@ onPeerCreated((peerId, sid) => {
   const prev = deadlines.get(peerId);
   if (prev) clearTimeout(prev);
   exchanges.delete(peerId); // a new connection starts a new exchange
-  setEntry(peerId, { sid, state: 'pending' });
+  const now = Date.now();
+  if (!tryingSince.has(peerId)) tryingSince.set(peerId, now);
+  // Still unreachable while we try again: keep saying so instead of flipping back to "verifying".
+  const prior = entry(peerId);
+  if (prior?.state === 'unreachable') setEntry(peerId, { sid, state: 'unreachable', relay: hasRelayServer() });
+  else setEntry(peerId, { sid, state: 'pending' });
   deadlines.set(
     peerId,
     setTimeout(() => {
       deadlines.delete(peerId);
       const cur = entry(peerId);
       const live = currentSid(peerId);
-      if (cur?.state === 'pending' && live && (!cur.sid || cur.sid === live)) {
+      if (cur?.state !== 'pending' || !live || (cur.sid && cur.sid !== live)) return;
+      if (!getPeerConnection(peerId)?.connected) {
+        // Never got a connection at all: nothing to verify (and "Allow anyway" couldn't help).
+        setEntry(peerId, { sid: live, state: 'unreachable', relay: hasRelayServer() });
+      } else {
         setState(peerId, live, 'unverified', { reason: "didn't complete verification in time" });
       }
-    }, VERIFY_DEADLINE_MS)
+    }, Math.max(0, (tryingSince.get(peerId) ?? now) + VERIFY_DEADLINE_MS - now))
   );
 });
 
 onPeerChannelOpen(async (peerId, sid) => {
+  tryingSince.delete(peerId); // connected: any later drop starts a fresh clock
   const cur = entry(peerId);
-  if (cur?.sid === sid) setEntry(peerId, { ...cur, sid });
+  if (cur?.sid === sid && cur.state !== 'unreachable') setEntry(peerId, { ...cur, sid });
   else setEntry(peerId, { sid, state: 'pending' });
 
   if (!keys) {
@@ -356,6 +376,7 @@ export function allowUnverified(peerId: string): void {
 
 onPeerLeft((peerId) => {
   exchanges.delete(peerId);
+  tryingSince.delete(peerId);
   const t = deadlines.get(peerId);
   if (t) clearTimeout(t);
   deadlines.delete(peerId);
@@ -370,6 +391,7 @@ onPeerLeft((peerId) => {
 onRoomLeft(() => {
   for (const t of deadlines.values()) clearTimeout(t);
   deadlines.clear();
+  tryingSince.clear();
   exchanges.clear();
   verifiedThisCall.clear();
   verification.set(new Map());
