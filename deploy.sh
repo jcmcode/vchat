@@ -1,8 +1,16 @@
 #!/usr/bin/env bash
 # Interactive deployment of vchat on a Linux server with Docker. Run with: sudo bash deploy.sh
 # Safe to re-run: existing secrets and your own .env settings are kept, so invite links keep working.
+#
+# Non-interactive answer for the relay on port 443: sudo TURN_TLS=on|off bash deploy.sh skips that
+# question (with TURN_TLS=on, the hostname comes from TURN_TLS_DOMAIN in the environment or .env,
+# else turn.<domain>).
 set -euo pipefail
 cd "$(dirname "$0")"
+
+# Read before .env is: an answer given in the environment wins over the one remembered in .env.
+TURN_TLS_FROM_ENV=${TURN_TLS:-}
+TURN_TLS_DOMAIN_FROM_ENV=${TURN_TLS_DOMAIN:-}
 
 echo "=== vchat deploy ==="
 echo
@@ -23,19 +31,36 @@ command -v openssl &>/dev/null || fail "openssl is required."
 
 # ── .env ──────────────────────────────────────────────────────────────────
 #
-# deploy.sh owns one block of .env (between the two marker lines) and rewrites it on every run,
-# keeping the values. Every other line, comments included, is kept exactly as it is.
+# deploy.sh writes its settings as one block at the top of .env and rewrites that block on every
+# run, keeping the values. Every other line, comments included, is kept exactly as it is. A setting
+# of deploy.sh's that also appears further down is folded into the block (the last one wins, as in
+# Docker Compose).
 
 MANAGED_KEYS="DOMAIN ACME_EMAIL TURN_SECRET SECRET_KEY ADMIN_PASSWORD TURN_TLS TURN_TLS_DOMAIN TURN_TLS_UPSTREAM COMPOSE_FILE"
-ENV_BEGIN="# --- Written by deploy.sh, which rewrites this block on every run (values you change here are kept) ---"
-ENV_END="# --- End of the deploy.sh block. Add your own settings below; deploy.sh keeps them as they are ---"
+ENV_BEGIN="# --- deploy.sh's settings: edit the values here. It rewrites this block on every run and keeps what you set ---"
+ENV_RELAY_NOTE1="# Relay on port 443 (TURN over TLS), optional: README.md → \"Relay on port 443\". TURN_TLS (on/off) is"
+ENV_RELAY_NOTE2="# your choice. TURN_TLS_DOMAIN is its hostname, TURN_TLS_UPSTREAM where Caddy hands it to coturn,"
+ENV_RELAY_NOTE3="# and COMPOSE_FILE lists docker-compose.turn-tls.yml only while it's on and its checks passed."
+ENV_END="# --- End of deploy.sh's settings (edit those above). Add other settings below; deploy.sh keeps them as they are ---"
+# The comment lines deploy.sh writes, now and in earlier versions: dropped when the block is rewritten.
+ENV_OWN_LINES="$ENV_BEGIN
+$ENV_RELAY_NOTE1
+$ENV_RELAY_NOTE2
+$ENV_RELAY_NOTE3
+$ENV_END
+# --- Written by deploy.sh, which rewrites this block on every run (values you change here are kept) ---
+# --- End of the deploy.sh block. Add your own settings below; deploy.sh keeps them as they are ---
+# Relay on port 443 (TURN over TLS), optional: README.md → \"Relay on port 443\". TURN_TLS is
+# your choice; COMPOSE_FILE lists docker-compose.turn-tls.yml only while it's on and its
+# checks passed. TURN_TLS_UPSTREAM is where Caddy hands relay connections to coturn."
 
-# Reads .env the way Docker Compose does: KEY=value (or "export KEY=value"), with the value
+# Reads a .env file the way Docker Compose does: KEY=value (or "export KEY=value"), with the value
 # unquoted (up to a " #" comment), in 'single' or "double" quotes (which may span lines); blank
 # lines and # comments. Modes:
 #   get   print the value Compose uses for `want` (its last assignment)
-#   check report anything that would make deploy.sh misread a managed key, and exit 1 if so
-#   rest  print every line that isn't deploy.sh's: not in its block, not a managed key
+#   check print "error: ..." for anything that stops deploy.sh from reading a setting of its own
+#         safely (and exit 1), and "note: ..." for settings of its own that appear more than once
+#   rest  print every line that isn't deploy.sh's: not one of its settings, not one of its comments
 # shellcheck disable=SC2016
 ENV_AWK='
 function ltrim(s) { sub(/^[ \t]+/, "", s); return s }
@@ -48,7 +73,10 @@ function closing(s, q,    i, c) {
   }
   return 0
 }
-BEGIN { n = split(managed, mk, " "); for (i = 1; i <= n; i++) ismanaged[mk[i]] = 1 }
+BEGIN {
+  n = split(managed, mk, " "); for (i = 1; i <= n; i++) ismanaged[mk[i]] = 1
+  n = split(ENVIRON["ENV_OWN_LINES"], ol, "\n"); for (i = 1; i <= n; i++) if (ol[i] != "") isown[ol[i]] = 1
+}
 {
   sub(/\r$/, "")
   line[NR] = $0
@@ -80,7 +108,7 @@ BEGIN { n = split(managed, mk, " "); for (i = 1; i <= n; i++) ismanaged[mk[i]] =
   }
 }
 END {
-  if (open != "") { print "line " first[cur] ": the quoted value of " key[cur] " is never closed"; exit 1 }
+  if (open != "") { print "error: line " first[cur] ": the quoted value of " key[cur] " is never closed"; exit 1 }
   if (mode == "get") {
     for (i = 1; i <= count; i++) if (key[i] == want) { v = val[i]; got = 1 }
     if (got) printf "%s", v
@@ -90,25 +118,27 @@ END {
     for (i = 1; i <= count; i++) {
       k = key[i]
       if (!(k in ismanaged)) continue
-      if ((k in seen) && seen[k] != val[i]) { print k " is set more than once, to different values"; bad = 1 }
-      seen[k] = val[i]
-      if (quote[i] != "\047" && val[i] ~ /[$\\]/) { print k " has a $ or \\ outside single quotes, which Docker Compose would expand"; bad = 1 }
+      times[k]++
+      lines[k] = (times[k] > 1) ? lines[k] ", " first[i] : first[i]
+      if (quote[i] != "\047" && (index(val[i], "$") || index(val[i], "\\"))) {
+        print "error: line " first[i] ": " k " has a $ or \\ outside single quotes, which Docker Compose would expand"
+        bad = 1
+      }
     }
+    for (k in times) if (times[k] > 1) print "note: " k " is set on lines " lines[k] " of .env; using the last one, as Docker Compose does, and keeping it in deploy.sh'"'"'s block"
     exit bad
   }
   for (i = 1; i <= NR; i++) {
-    if (line[i] == begin) { inblock = 1; continue }
-    if (line[i] == end) { inblock = 0; continue }
     o = owner[i]
     if (o && (key[o] in ismanaged)) continue
-    if (inblock && !o) continue
+    if (!o && (line[i] in isown)) continue
     print line[i]
   }
 }
 '
 
-env_awk() {
-  awk -v mode="$1" -v want="${2:-}" -v managed="$MANAGED_KEYS" -v begin="$ENV_BEGIN" -v end="$ENV_END" "$ENV_AWK" .env
+env_awk() { # mode [key] [file]
+  ENV_OWN_LINES="$ENV_OWN_LINES" awk -v mode="$1" -v want="${2:-}" -v managed="$MANAGED_KEYS" "$ENV_AWK" "${3:-.env}"
 }
 
 # The value Docker Compose uses for a key in .env (nothing if it isn't set).
@@ -118,10 +148,11 @@ env_value() {
 }
 
 if [ -f .env ]; then
-  if ! ENV_PROBLEMS=$(env_awk check); then
+  if ! ENV_REPORT=$(env_awk check); then
     fail "deploy.sh can't safely read .env, so it changed nothing. Fix this by hand and run it again:
-$ENV_PROBLEMS"
+$(printf '%s\n' "$ENV_REPORT" | sed -n 's/^error: /  /p')"
   fi
+  printf '%s\n' "$ENV_REPORT" | sed -n 's/^note: /Note: /p'
 fi
 
 valid_ipv4() {
@@ -146,6 +177,15 @@ resolve_ipv4() {
 }
 
 HOSTNAME_RE='^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$'
+# TURN_TLS_UPSTREAM ends up in Caddy's configuration, so only a plain address:port is accepted.
+UPSTREAM_RE='^(\[[0-9A-Fa-f:.]+\]|[A-Za-z0-9.-]+):[0-9]{1,5}$'
+
+# Lowercase, without a trailing dot.
+normalize_host() {
+  local h
+  h=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')
+  printf '%s' "${h%.}"
+}
 
 # ── Inputs ────────────────────────────────────────────────────────────────
 
@@ -177,38 +217,48 @@ echo "Public IP: $EXTERNAL_IP"
 # .env (TURN_TLS), apart from the hostname, so pressing Enter keeps whatever you chose last time.
 TURN_TLS=$(env_value TURN_TLS)
 [ "$TURN_TLS" = on ] || TURN_TLS=off
-TURN_TLS_DOMAIN=$(env_value TURN_TLS_DOMAIN)
+TURN_TLS_DOMAIN=$(normalize_host "$(env_value TURN_TLS_DOMAIN)")
 TURN_TLS_UPSTREAM=$(env_value TURN_TLS_UPSTREAM)
 OLD_COMPOSE_FILE=$(env_value COMPOSE_FILE)
-# Both end up in Caddy's configuration, so only plain values are accepted.
-UPSTREAM_RE='^(\[[0-9A-Fa-f:.]+\]|[A-Za-z0-9.-]+):[0-9]{1,5}$'
-[ -z "$TURN_TLS_DOMAIN" ] || [[ "$TURN_TLS_DOMAIN" =~ $HOSTNAME_RE ]] ||
-  fail "TURN_TLS_DOMAIN in .env ('$TURN_TLS_DOMAIN') isn't a valid hostname."
-[ -z "$TURN_TLS_UPSTREAM" ] || [[ "$TURN_TLS_UPSTREAM" =~ $UPSTREAM_RE ]] ||
-  fail "TURN_TLS_UPSTREAM in .env ('$TURN_TLS_UPSTREAM') must be address:port, e.g. 203.0.113.7:3478."
-echo
-echo "Relay on port 443 (new, optional). Some networks (offices, hotels, some mobile carriers) only"
-echo "let HTTPS out, which blocks the relay's port 3478. With this on, the relay also answers on port"
-echo "443 (TURN over TLS) under a hostname of its own, which needs a DNS A record pointing at this"
-echo "server. It compiles Caddy with an extra plugin (a few minutes the first time), and so far it has"
-echo "only been checked by review, not on a real server. If any step fails, the script turns it off"
-echo "again and deploys the rest as usual. See README.md → \"Relay on port 443\"."
-if [ "$TURN_TLS" = on ]; then HINT="[Y/n]"; else HINT="[y/N]"; fi
-read -rp "Enable the relay on port 443 (TURN over TLS)? $HINT " ANSWER
-case "$(printf '%s' "$ANSWER" | tr '[:upper:]' '[:lower:]')" in
-  "") ;;
-  y | yes) TURN_TLS=on ;;
-  n | no) TURN_TLS=off ;;
-  *) fail "Please answer y or n." ;;
-esac
+ASK_HOSTNAME=1
+if [ -n "$TURN_TLS_FROM_ENV" ]; then
+  case "$TURN_TLS_FROM_ENV" in
+    on | off) TURN_TLS=$TURN_TLS_FROM_ENV ;;
+    *) fail "TURN_TLS in the environment must be on or off, not '$TURN_TLS_FROM_ENV'." ;;
+  esac
+  if [ -n "$TURN_TLS_DOMAIN_FROM_ENV" ]; then TURN_TLS_DOMAIN=$(normalize_host "$TURN_TLS_DOMAIN_FROM_ENV"); fi
+  ASK_HOSTNAME=""
+  echo
+  echo "Relay on port 443: $TURN_TLS (TURN_TLS from the environment)."
+else
+  echo
+  echo "Relay on port 443 (new, optional). Some networks (offices, hotels, some mobile carriers) only"
+  echo "let HTTPS out, which blocks the relay's port 3478. With this on, the relay also answers on port"
+  echo "443 (TURN over TLS) under a hostname of its own, which needs a DNS A record pointing at this"
+  echo "server. It compiles Caddy with an extra plugin (a few minutes the first time), and so far it has"
+  echo "only been checked by review, not on a real server. If any step fails, the script turns it off"
+  echo "again and deploys the rest as usual. See README.md → \"Relay on port 443\"."
+  if [ "$TURN_TLS" = on ]; then HINT="[Y/n]"; else HINT="[y/N]"; fi
+  read -rp "Enable the relay on port 443 (TURN over TLS)? $HINT " ANSWER
+  case "$(printf '%s' "$ANSWER" | tr '[:upper:]' '[:lower:]')" in
+    "") ;;
+    y | yes) TURN_TLS=on ;;
+    n | no) TURN_TLS=off ;;
+    *) fail "Please answer y or n." ;;
+  esac
+fi
 
 TURN_TLS_ACTIVE="" # on for this deployment: TURN_TLS=on and every check so far passed
 TURN_TLS_OFF_REASON="not enabled"
 if [ "$TURN_TLS" = on ]; then
   DEFAULT_TURN_TLS_DOMAIN=${TURN_TLS_DOMAIN:-turn.$DOMAIN}
-  read -rp "Relay hostname (A record pointing at $EXTERNAL_IP, DNS only) [$DEFAULT_TURN_TLS_DOMAIN]: " ANSWER
-  TURN_TLS_DOMAIN=$(printf '%s' "${ANSWER:-$DEFAULT_TURN_TLS_DOMAIN}" | tr '[:upper:]' '[:lower:]')
-  [[ "$TURN_TLS_DOMAIN" =~ $HOSTNAME_RE ]] || fail "'$TURN_TLS_DOMAIN' is not a valid hostname."
+  if [ -n "$ASK_HOSTNAME" ]; then
+    read -rp "Relay hostname (A record pointing at $EXTERNAL_IP, DNS only) [$DEFAULT_TURN_TLS_DOMAIN]: " ANSWER
+    TURN_TLS_DOMAIN=$(normalize_host "${ANSWER:-$DEFAULT_TURN_TLS_DOMAIN}")
+  else
+    TURN_TLS_DOMAIN=$DEFAULT_TURN_TLS_DOMAIN
+  fi
+  [[ "$TURN_TLS_DOMAIN" =~ $HOSTNAME_RE ]] || fail "'$TURN_TLS_DOMAIN' is not a valid hostname for the relay."
   [ "$TURN_TLS_DOMAIN" != "$DOMAIN" ] || fail "The relay needs a hostname other than $DOMAIN (e.g. turn.$DOMAIN)."
 
   # Caddy tells relay connections apart from the website by this name (TLS SNI), so it must point here.
@@ -246,10 +296,22 @@ if [ "$TURN_TLS" = on ]; then
     valid_ipv4 "$LOCAL_IP" || LOCAL_IP=""
     TURN_TLS_UPSTREAM=${LOCAL_IP:-$DOMAIN}:3478
   fi
+  [[ "$TURN_TLS_UPSTREAM" =~ $UPSTREAM_RE ]] ||
+    fail "TURN_TLS_UPSTREAM in .env ('$TURN_TLS_UPSTREAM') must be address:port, e.g. 203.0.113.7:3478."
   echo "Caddy will hand relay connections to coturn at $TURN_TLS_UPSTREAM ($UPSTREAM_SOURCE). If outside"
   echo "traffic to port 3478 arrives at another address on this server (the anchor IP of a DigitalOcean"
   echo "Reserved IP, a host with several IPs or a VPN as its default route), set TURN_TLS_UPSTREAM in"
   echo ".env to that address and port, and run this script again."
+else
+  # Not used while the relay is off, so a value that wouldn't work is only reported, and left out.
+  if [ -n "$TURN_TLS_DOMAIN" ] && ! [[ "$TURN_TLS_DOMAIN" =~ $HOSTNAME_RE ]]; then
+    warn "TURN_TLS_DOMAIN in .env ('$TURN_TLS_DOMAIN') isn't a valid hostname; leaving it out."
+    TURN_TLS_DOMAIN=""
+  fi
+  if [ -n "$TURN_TLS_UPSTREAM" ] && ! [[ "$TURN_TLS_UPSTREAM" =~ $UPSTREAM_RE ]]; then
+    warn "TURN_TLS_UPSTREAM in .env ('$TURN_TLS_UPSTREAM') isn't address:port; leaving it out."
+    TURN_TLS_UPSTREAM=""
+  fi
 fi
 
 EXISTING_PASSWORD=$(env_value ADMIN_PASSWORD)
@@ -277,9 +339,8 @@ SECRET_KEY=${SECRET_KEY:-$(openssl rand -hex 32)}
 
 # ── Files (readable only by root; coturn's group can read its config) ─────
 
-# COMPOSE_FILE: lists docker-compose.turn-tls.yml only while the relay on port 443 is on for this
-# deployment. Other files you listed there are kept. Prints nothing (leave Compose's defaults) if
-# there's nothing to list.
+# The COMPOSE_FILE value: with "on", it lists docker-compose.turn-tls.yml. Other files you listed
+# there are kept. Prints nothing (leave Compose's defaults) if there's nothing else to list.
 compose_files() {
   local extra="" f
   while IFS= read -r f; do
@@ -288,7 +349,7 @@ compose_files() {
       *) extra="$extra:$f" ;;
     esac
   done < <(printf '%s\n' "$OLD_COMPOSE_FILE" | tr ':' '\n')
-  if [ -n "$TURN_TLS_ACTIVE" ]; then
+  if [ "${1:-}" = on ]; then
     # Setting COMPOSE_FILE stops Compose loading an override file by itself, so list it.
     for f in docker-compose.override.yml docker-compose.override.yaml; do
       if [ -f "$f" ] && [[ ":$extra:" != *":$f:"* ]]; then extra="$extra:$f"; fi
@@ -302,11 +363,18 @@ compose_files() {
   fi
 }
 
+# Whether .env's COMPOSE_FILE lists the add-on. It's only set right before the containers start,
+# after every check passed; until then, builds and checks get COMPOSE_FILE from the environment.
+RELAY_IN_ENV=""
+
 write_env() {
-  local kept="" compose_file
+  local kept="" compose_file target
   if [ -f .env ]; then kept=$(env_awk rest); fi
-  compose_file=$(compose_files)
+  compose_file=$(compose_files "$RELAY_IN_ENV")
   case "$compose_file" in *"'"*) fail "COMPOSE_FILE in .env can't contain a single quote (')." ;; esac
+  # Write next to the real file and move it into place, so a symlinked .env stays a symlink.
+  target=.env
+  if [ -L .env ]; then target=$(readlink -f .env) || fail "Couldn't resolve the .env symlink."; fi
   (
     umask 077
     {
@@ -316,19 +384,22 @@ write_env() {
       printf 'TURN_SECRET=%s\n' "$TURN_SECRET"
       printf 'SECRET_KEY=%s\n' "$SECRET_KEY"
       printf "ADMIN_PASSWORD='%s'\n" "$ADMIN_PASSWORD"
-      printf '%s\n' "# Relay on port 443 (TURN over TLS), optional: README.md → \"Relay on port 443\". TURN_TLS is"
-      printf '%s\n' "# your choice; COMPOSE_FILE lists docker-compose.turn-tls.yml only while it's on and its"
-      printf '%s\n' "# checks passed. TURN_TLS_UPSTREAM is where Caddy hands relay connections to coturn."
+      printf '%s\n' "$ENV_RELAY_NOTE1" "$ENV_RELAY_NOTE2" "$ENV_RELAY_NOTE3"
       printf 'TURN_TLS=%s\n' "$TURN_TLS"
-      printf 'TURN_TLS_DOMAIN=%s\n' "$TURN_TLS_DOMAIN"
-      printf 'TURN_TLS_UPSTREAM=%s\n' "$TURN_TLS_UPSTREAM"
+      if [ -n "$TURN_TLS_DOMAIN" ]; then printf 'TURN_TLS_DOMAIN=%s\n' "$TURN_TLS_DOMAIN"; fi
+      if [ -n "$TURN_TLS_UPSTREAM" ]; then printf 'TURN_TLS_UPSTREAM=%s\n' "$TURN_TLS_UPSTREAM"; fi
       if [ -n "$compose_file" ]; then printf "COMPOSE_FILE='%s'\n" "$compose_file"; fi
       printf '%s\n' "$ENV_END"
       if [ -n "$kept" ]; then printf '%s\n' "$kept"; fi
-    } > .env.new
-    mv -f .env.new .env
+    } > "$target.new"
+    # Never put a file in place that deploy.sh itself couldn't read back.
+    if ! env_awk check "" "$target.new" >/dev/null || [ "$(env_awk get SECRET_KEY "$target.new")" != "$SECRET_KEY" ]; then
+      rm -f "$target.new"
+      fail "The new .env didn't read back correctly, so the old one was left as it is."
+    fi
+    mv -f "$target.new" "$target"
   )
-  chmod 600 .env
+  chmod 600 "$target"
 }
 
 umask 077
@@ -412,54 +483,60 @@ else
   fi
 fi
 
-# ── Build ─────────────────────────────────────────────────────────────────
+# ── Build and check ───────────────────────────────────────────────────────
 
 # Turns the relay on port 443 off for this deployment (TURN_TLS and the hostname stay as they are).
 turn_tls_off() {
   warn "$1. The relay on port 443 is off for this deployment; the rest is unaffected."
   TURN_TLS_ACTIVE=""
   TURN_TLS_OFF_REASON=$1
+  RELAY_IN_ENV=""
   write_env
+}
+
+# Docker Compose with the relay add-on, without writing that to .env yet.
+compose_with_relay() {
+  COMPOSE_FILE="$(compose_files on)" docker compose "$@"
 }
 
 echo
 echo "Pulling and building images..."
 docker compose pull --ignore-buildable 2>/dev/null || docker compose pull coturn
+# The default images, always: they're also what the relay on port 443 falls back to.
+docker compose build --pull
 if [ -n "$TURN_TLS_ACTIVE" ]; then
-  # Compile Caddy with the layer4 plugin on its own first: doing it while the web app builds can run
-  # a 1GB server out of memory. The next step reuses the result.
+  # Compile Caddy with the layer4 plugin on its own: doing it while the web app builds could run a
+  # 1GB server out of memory. The next step reuses the result.
   echo "Compiling Caddy with the layer4 plugin for the relay on port 443 (a few minutes the first time)..."
   docker build --pull --target caddy-l4 --output type=cacheonly -f Dockerfile.web . ||
     turn_tls_off "Compiling Caddy with the layer4 plugin failed (see the output above)"
 fi
-if [ -n "$TURN_TLS_ACTIVE" ] && ! docker compose build --pull; then
-  turn_tls_off "Building the images with the relay on port 443 failed (see the output above)"
-fi
-if [ -z "$TURN_TLS_ACTIVE" ]; then
-  docker compose build --pull
+if [ -n "$TURN_TLS_ACTIVE" ] && ! compose_with_relay build web; then
+  turn_tls_off "Building the web image with the relay on port 443 failed (see the output above)"
 fi
 
-# With the relay on, check Caddy's configuration before replacing the running containers.
-CADDY_VALIDATE="docker compose run --rm --no-deps -T web caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile"
-if [ -n "$TURN_TLS_ACTIVE" ]; then
-  echo "Checking the web server configuration..."
-  if ! $CADDY_VALIDATE &>/dev/null; then
-    turn_tls_off "The web server configuration for the relay on port 443 doesn't validate (to see why:
-  COMPOSE_FILE=docker-compose.yml:docker-compose.turn-tls.yml $CADDY_VALIDATE)"
-    docker compose build --pull
-  fi
+# Check Caddy's configuration, in the image that will run, before replacing any container.
+CADDY_VALIDATE="run --rm --no-deps -T web caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile"
+echo "Checking the web server configuration..."
+# shellcheck disable=SC2086
+if [ -n "$TURN_TLS_ACTIVE" ] && ! compose_with_relay $CADDY_VALIDATE &>/dev/null; then
+  turn_tls_off "The web server configuration for the relay on port 443 doesn't validate (to see why:
+  COMPOSE_FILE=docker-compose.yml:docker-compose.turn-tls.yml docker compose $CADDY_VALIDATE)"
 fi
+# shellcheck disable=SC2086
+docker compose $CADDY_VALIDATE &>/dev/null ||
+  fail "The web server configuration doesn't validate, so the running containers were left as they are. To see why: docker compose $CADDY_VALIDATE"
 
 # ── Start ─────────────────────────────────────────────────────────────────
 
 start_containers() {
-  docker compose up -d
-  # Pick up a changed turnserver.conf on re-deploys
-  docker compose restart coturn >/dev/null
+  docker compose up -d &&
+    docker compose restart coturn >/dev/null # pick up a changed turnserver.conf on re-deploys
 }
 
 # Waits up to 2 minutes for https://$DOMAIN/api/config; sets CONFIG to its answer.
 site_answers() {
+  echo "Checking https://$DOMAIN/api/config (the HTTPS certificate can take a minute)..."
   CONFIG=""
   for _ in $(seq 1 30); do
     if CONFIG=$(curl -fsS --max-time 5 "https://$DOMAIN/api/config" 2>/dev/null); then return 0; fi
@@ -469,16 +546,20 @@ site_answers() {
   return 1
 }
 
-echo "Starting containers..."
-start_containers
-
 echo
-echo "Checking https://$DOMAIN/api/config (the HTTPS certificate can take a minute)..."
-if ! site_answers && [ -n "$TURN_TLS_ACTIVE" ]; then
-  turn_tls_off "https://$DOMAIN/api/config didn't answer with the relay on port 443 on; going back without it"
-  docker compose build --pull
+echo "Starting containers..."
+if [ -n "$TURN_TLS_ACTIVE" ]; then
+  # Every check passed: now .env turns the add-on on, for this and later `docker compose` commands.
+  RELAY_IN_ENV=on
+  write_env
+  if ! start_containers || ! site_answers; then
+    # Back to the default images built above: no build and no network needed.
+    turn_tls_off "The site didn't come up with the relay on port 443 on; starting it without"
+    start_containers
+    site_answers || true
+  fi
+else
   start_containers
-  echo "Checking https://$DOMAIN/api/config again..."
   site_answers || true
 fi
 if [ -z "$CONFIG" ]; then
