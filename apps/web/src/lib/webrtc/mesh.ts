@@ -83,6 +83,8 @@ export const chatMessages = writable<ChatMessage[]>([]);
 export const connectionState = writable<'disconnected' | 'connecting' | 'connected'>('disconnected');
 export const admissionState = writable<'none' | 'waiting' | 'password' | 'denied'>('none');
 export const admissionDeniedReason = writable<string>('');
+/** In the call: the server has sent the room's participant list (we got past any password and lobby). */
+export const admitted = writable<boolean>(false);
 /** While waiting: whether the host is in the call yet. */
 export const hostPresent = writable<boolean>(true);
 export const passwordInvalid = writable<boolean>(false);
@@ -332,6 +334,11 @@ const FATAL_ERRORS: Record<string, string> = {
   'Room is locked': 'This call is locked by the host, so nobody new can join. Ask the host to unlock it, then open the link again.',
 };
 
+/** Plain-words version of a server error (e.g. 'Invite expired'), if it's one we know. */
+export function friendlyJoinError(message: string): string | undefined {
+  return Object.prototype.hasOwnProperty.call(FATAL_ERRORS, message) ? FATAL_ERRORS[message] : undefined;
+}
+
 let iceServers: RTCIceServer[] = [];
 let iceRefreshTimer: ReturnType<typeof setTimeout> | null = null;
 
@@ -524,6 +531,7 @@ export async function joinRoom(opts: JoinOptions): Promise<void> {
   currentRoomId = roomId;
   connectionState.set('connecting');
   admissionState.set('none');
+  admitted.set(false);
   admissionDeniedReason.set('');
   passwordInvalid.set(false);
   roomError.set('');
@@ -612,6 +620,7 @@ export async function joinRoom(opts: JoinOptions): Promise<void> {
 
   on('room-peers', (event) => {
     admissionState.set('none');
+    admitted.set(true);
     roomError.set('');
     roomLocked.set(false); // the server follows up with lock-changed if the room is locked
     roomJoined.set(true);
@@ -764,6 +773,7 @@ export function leaveRoom(): void {
 
   connectionState.set('disconnected');
   admissionState.set('none');
+  admitted.set(false);
   admissionRequests.set([]);
   hostStatus.set(false);
   roomLocked.set(false);

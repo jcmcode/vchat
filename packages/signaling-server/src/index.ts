@@ -1,6 +1,7 @@
 // Node.js signaling server (used by local dev and the Docker/VPS deployment).
 //
-//   /api/*                  -> shared HTTP API (see core/api.ts): config, ICE servers, owner sign-in, invites
+//   /api/*                  -> shared HTTP API (see core/api.ts): config, ICE servers, owner sign-in,
+//                              invites, invite code checks
 //   GET  /healthz           -> "ok"
 //   WS   /ws?room=<id>      -> signaling (any path is accepted for WebSocket upgrades)
 
@@ -86,6 +87,10 @@ const idleTimers = new WeakMap<WebSocket, ReturnType<typeof setTimeout>>();
 /** Keys client hashes; random per process if there's no SECRET_KEY (open mode). */
 const CLIENT_KEY = env.SECRET_KEY || randomBytes(32).toString('hex');
 
+/**
+ * Must stay identical to core `throttleClientId(SECRET_KEY, ip)` (used by POST /api/invite/check),
+ * so checking an invite code and joining share one guess budget per room + client.
+ */
 function clientIdFor(ip: string): string {
   return createHmac('sha256', CLIENT_KEY).update(`client:${ipKey(ip)}`).digest('base64url').slice(0, 22);
 }

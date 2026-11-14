@@ -12,3 +12,10 @@ export interface Env extends ServerEnv {
 
 /** Header the Worker sets on requests it forwards to a Durable Object (any client value is overwritten). */
 export const CLIENT_HEADER = 'X-Vchat-Client';
+
+/**
+ * Internal Durable Object path for POST /api/invite/check: the code is checked inside the room's
+ * object, against the same password-guess throttle as joining. Only the Worker can reach it (it
+ * forwards /ws requests with their own path).
+ */
+export const INVITE_CHECK_PATH = '/internal/invite-check';
