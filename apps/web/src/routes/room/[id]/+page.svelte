@@ -30,8 +30,12 @@
     removePeer,
     startSharingScreen,
     stopSharingScreen,
+    roomLocked,
+    callEnded,
     type PeerConnection,
   } from '$lib/webrtc/mesh';
+  import { startWaitingAlerts } from '$lib/ui/attention';
+  import HostControls from './HostControls.svelte';
   import {
     localStream,
     screenStream,
@@ -424,6 +428,9 @@
   });
   onDestroy(stopWatchingForcedOut);
 
+  // Host: chime, flash the tab title and (opt-in) notify when someone is waiting to join.
+  onDestroy(startWaitingAlerts(admissionRequests));
+
   function handleLeave() {
     leaveRoom();
     stopMedia();
@@ -613,8 +620,8 @@
 {:else if $roomError}
   <div class="overlay">
     <div class="dialog card fade-in center" role="alertdialog" aria-modal="true" aria-labelledby="error-title">
-      <div class="dialog-icon danger"><Icon name="x" size={22} /></div>
-      <h2 id="error-title">Couldn't join</h2>
+      <div class="dialog-icon danger"><Icon name={$callEnded ? 'phone-off' : 'x'} size={22} /></div>
+      <h2 id="error-title">{$callEnded ? 'Call ended' : "Couldn't join"}</h2>
       <p class="dialog-sub">{$roomError}</p>
       <div class="dialog-actions">
         <button class="btn primary" on:click={handleLeave}>Back to home</button>
@@ -707,7 +714,12 @@
         <h1 class="room-id" title={roomId}>{$roomName || roomId}</h1>
       {/if}
       {#if $hostStatus}
-        <span class="chip accent">Host</span>
+        <HostControls locked={$roomLocked} connected={$connectionState === 'connected'} />
+      {/if}
+      {#if $roomLocked}
+        <span class="chip warning" title="The host locked this call: nobody new can join" role="status">
+          <Icon name="lock" size={11} /> Locked
+        </span>
       {/if}
     </div>
     <div class="header-end">

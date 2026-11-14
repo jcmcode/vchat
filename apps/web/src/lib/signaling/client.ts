@@ -14,7 +14,9 @@ export type SignalingEventType =
   | 'admission-granted'
   | 'admission-denied'
   | 'host-changed'
-  | 'replaced';
+  | 'replaced'
+  | 'lock-changed'
+  | 'room-ended';
 
 export interface SignalingEvent {
   type: SignalingEventType | string;
@@ -48,6 +50,10 @@ const REPLACED_CLOSE_CODE = 4000;
 const REMOVED_CLOSE_CODE = 4002;
 /** The invite was refused (invalid, expired, or the server is misconfigured): retrying won't help. */
 const REFUSED_CLOSE_CODE = 4003;
+/** The host ended the call for everyone. */
+const ENDED_CLOSE_CODE = 4004;
+/** The host locked the room, so this new join attempt was refused. */
+const LOCKED_CLOSE_CODE = 4005;
 const PONG_TIMEOUT_MS = 10_000;
 
 export class SignalingClient {
@@ -61,8 +67,18 @@ export class SignalingClient {
   private opened = false;
   private shouldReconnect = true;
   private intent: RoomIntent | null = null;
+  /** The host ended the call: this client is finished for good. */
+  private ended = false;
 
   constructor(private readonly url: string) {}
+
+  private markEnded(): void {
+    this.ended = true;
+    this.shouldReconnect = false;
+    this.intent = null;
+    if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
+    this.reconnectTimer = null;
+  }
 
   connect(): void {
     this.shouldReconnect = true;
@@ -93,7 +109,13 @@ export class SignalingClient {
         this.pongTimer = null;
         return;
       }
+      if (this.ended) return; // nothing after the end of the call matters
       if (msg.type === 'room-peers' && this.intent) this.intent.admitted = true;
+      if (msg.type === 'room-ended') {
+        // The call is over for everyone. Stop right here, before the socket closes: never reconnect,
+        // re-enter or re-create the room, whatever close code (if any) follows.
+        this.markEnded();
+      }
       // We were in this room but everyone left while we were disconnected — reopen it (open mode).
       if (msg.type === 'error' && msg.message === 'Room does not exist' && this.intent?.admitted && !this.intent.token) {
         this.intent.isCreator = true;
@@ -117,17 +139,25 @@ export class SignalingClient {
       if (!this.opened && ++this.failedOpens === FAILED_OPENS_BEFORE_ERROR) {
         this.emit({ type: 'error', message: 'Cannot connect' });
       }
+      if (this.ended) return;
+      if (event.code === ENDED_CLOSE_CODE) {
+        // The host ended the call (and the 'room-ended' message didn't make it).
+        this.markEnded();
+        this.emit({ type: 'room-ended' });
+        return;
+      }
       if (event.code === REPLACED_CLOSE_CODE) {
         // The same identity connected from somewhere else; reconnecting would just kick it off.
         this.shouldReconnect = false;
         this.emit({ type: 'replaced' });
         return;
       }
-      if (event.code === REMOVED_CLOSE_CODE || event.code === REFUSED_CLOSE_CODE) {
+      if (event.code === REMOVED_CLOSE_CODE || event.code === REFUSED_CLOSE_CODE || event.code === LOCKED_CLOSE_CODE) {
         // The server has already said why ('removed' or an error message); don't knock again.
         this.shouldReconnect = false;
         this.intent = null;
         if (event.code === REMOVED_CLOSE_CODE) this.emit({ type: 'removed' });
+        if (event.code === LOCKED_CLOSE_CODE) this.emit({ type: 'error', message: 'Room is locked' });
         return;
       }
       this.scheduleReconnect();
@@ -176,8 +206,10 @@ export class SignalingClient {
     ws?.close();
   }
 
-  send(message: object): void {
-    if (this.ws?.readyState === WebSocket.OPEN) this.ws.send(JSON.stringify(message));
+  send(message: object): boolean {
+    if (this.ws?.readyState !== WebSocket.OPEN) return false;
+    this.ws.send(JSON.stringify(message));
+    return true;
   }
 
   private sendEnter(asCreator: boolean): void {
@@ -218,6 +250,16 @@ export class SignalingClient {
   /** Host only: remove someone from the call (they can't rejoin with the same identity). */
   removePeer(peerId: string): void {
     this.send({ type: 'remove-peer', peerId });
+  }
+
+  /** Host only: refuse (or allow again) new join attempts. Returns false if not connected. */
+  setRoomLocked(locked: boolean): boolean {
+    return this.send({ type: locked ? 'lock-room' : 'unlock-room' });
+  }
+
+  /** Host only: end the call for everyone. Returns false if not connected. */
+  endRoom(): boolean {
+    return this.send({ type: 'end-room' });
   }
 
   leaveRoom(): void {

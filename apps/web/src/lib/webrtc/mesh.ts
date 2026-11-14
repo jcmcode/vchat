@@ -101,6 +101,10 @@ export const peerMediaState = writable<Map<string, { audio: boolean; video: bool
 export const hostPeerIdStore = writable<string | null>(null);
 /** This participant's peer id (for collaboration features). */
 export const localPeerIdStore = writable<string>('');
+/** The host has locked the room: the server refuses anyone new (as reported by the server). */
+export const roomLocked = writable<boolean>(false);
+/** The call was ended for everyone: by the host, or by you as the host. Cleared on the next join. */
+export const callEnded = writable<'host' | 'you' | null>(null);
 
 // ── Extension points for collaboration features ─────────────────────────────
 // Whiteboard, annotations etc. register their own data-channel message types here, so they ride
@@ -315,6 +319,7 @@ const FATAL_ERRORS: Record<string, string> = {
   'Cannot connect': "Can't reach the call server. Check your internet connection, and that you opened the whole invite link.",
   'Too many password attempts': 'Too many wrong passwords for this room. Try again in a few minutes.',
   'Removed by host': 'The host removed you from this call.',
+  'Room is locked': 'This call is locked by the host, so nobody new can join. Ask the host to unlock it, then open the link again.',
 };
 
 let iceServers: RTCIceServer[] = [];
@@ -369,6 +374,8 @@ const claimedNames = new Map<string, string>();
 let localSpeakingCleanup: (() => void) | null = null;
 /** Bumped by every join/leave so an in-flight joinRoom can tell it has been superseded. */
 let joinGeneration = 0;
+/** We (as host) asked the server to end the call, so its `room-ended` is our own doing. */
+let endRequested = false;
 
 // Anything a participant sends us is untrusted. Bound size and rate per peer so a misbehaving
 // participant can't freeze or crash everyone else's tab.
@@ -512,6 +519,9 @@ export async function joinRoom(opts: JoinOptions): Promise<void> {
   roomError.set('');
   admissionRequests.set([]);
   hostStatus.set(false);
+  roomLocked.set(false);
+  callEnded.set(null);
+  endRequested = false;
   knownNames.clear();
   serverNames.clear();
   claimedNames.clear();
@@ -568,10 +578,24 @@ export async function joinRoom(opts: JoinOptions): Promise<void> {
   };
   on('removed', () => forceOut(FATAL_ERRORS['Removed by host']));
   on('replaced', () => forceOut('You joined this call from another tab or window, so this one was disconnected.'));
+  // The host ended the call for everyone (participants and waiting guests). The signaling client has
+  // already stopped reconnecting; tear the call down like leaving does.
+  on('room-ended', () => {
+    callEnded.set(endRequested ? 'you' : 'host');
+    forceOut(endRequested ? 'You ended the call for everyone.' : 'The host ended the call.');
+  });
+  on('lock-changed', (event) => roomLocked.set(event.locked === true));
+  on('error', (event) => {
+    if (event.message === 'Only the host can end the call') endRequested = false;
+    // Refused because the host locked the room. We never got in: release the camera and forget the
+    // invite in this tab, as being removed does (the client won't knock again either).
+    if (event.message === 'Room is locked') forceOut(FATAL_ERRORS['Room is locked']);
+  });
 
   on('room-peers', (event) => {
     admissionState.set('none');
     roomError.set('');
+    roomLocked.set(false); // the server follows up with lock-changed if the room is locked
     const existingPeers = event.peers as { id: string; displayName: string }[];
     // After a reconnect, drop anyone who left while we were away.
     const listed = new Set(existingPeers.map((p) => p.id));
@@ -723,6 +747,8 @@ export function leaveRoom(): void {
   admissionState.set('none');
   admissionRequests.set([]);
   hostStatus.set(false);
+  roomLocked.set(false);
+  endRequested = false;
   typingPeers.set(new Set());
   reactions.set([]);
   speakingPeers.set(new Set());
@@ -752,6 +778,21 @@ export function removePeer(peerId: string): void {
 export function denyPeer(peerId: string): void {
   signalingClient?.denyPeer(peerId);
   admissionRequests.update((reqs) => reqs.filter((r) => r.peerId !== peerId));
+}
+
+/**
+ * Host only (enforced by the server): refuse, or allow again, anyone new joining. `roomLocked`
+ * changes only when the server confirms. Returns false if we're not connected right now.
+ */
+export function setRoomLocked(locked: boolean): boolean {
+  return signalingClient?.setRoomLocked(locked) ?? false;
+}
+
+/** Host only (enforced by the server): end the call for everyone. Returns false if not connected. */
+export function endCallForEveryone(): boolean {
+  if (!signalingClient) return false;
+  endRequested = signalingClient.endRoom();
+  return endRequested;
 }
 
 /**
