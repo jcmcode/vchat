@@ -3,10 +3,6 @@ services:
     build:
       context: .
       dockerfile: Dockerfile.web
-      args:
-        VITE_TURN_URL: ${VITE_TURN_URL}
-        VITE_TURN_USER: ${VITE_TURN_USER}
-        VITE_TURN_CREDENTIAL: ${VITE_TURN_CREDENTIAL}
     ports:
       - "80:80"
       - "443:443"
@@ -36,10 +32,13 @@ services:
     environment:
       - PORT=3001
       - ALLOWED_ORIGIN=https://${DOMAIN}
+      # Short-lived TURN credentials for coturn (TURN REST API / use-auth-secret)
+      - TURN_URLS=turn:${DOMAIN}:3478?transport=udp,turn:${DOMAIN}:3478?transport=tcp,turns:${DOMAIN}:5349?transport=tcp
+      - TURN_SECRET=${TURN_SECRET}
     restart: unless-stopped
 
   coturn:
-    image: coturn/coturn:latest
+    image: coturn/coturn:4.6
     network_mode: host
     volumes:
       - ./turnserver.conf:/etc/coturn/turnserver.conf:ro

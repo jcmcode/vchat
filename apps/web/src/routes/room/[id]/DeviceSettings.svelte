@@ -9,6 +9,7 @@
     switchAudioDevice,
     switchVideoDevice,
     enumerateDevices,
+    isScreenSharing,
   } from '$lib/media/manager';
   import { replaceTrackOnAllPeers } from '$lib/webrtc/mesh';
   import { onMount } from 'svelte';
@@ -26,13 +27,14 @@
   async function handleVideoChange(e: Event) {
     const deviceId = (e.target as HTMLSelectElement).value;
     const track = await switchVideoDevice(deviceId);
-    if (track) replaceTrackOnAllPeers(track, 'video');
+    // While screen sharing, peers keep seeing the screen; the new camera is used when sharing stops.
+    if (track && !$isScreenSharing) replaceTrackOnAllPeers(track, 'video');
   }
 
   function handleOutputChange(e: Event) {
     const deviceId = (e.target as HTMLSelectElement).value;
     selectedAudioOutput.set(deviceId);
-    // Setting audio output requires setSinkId on video elements, handled by caller
+    // VideoTile applies this with setSinkId on each remote video element.
   }
 </script>
 

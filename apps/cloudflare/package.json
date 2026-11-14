@@ -1,0 +1,20 @@
+{
+  "name": "@vchat/cloudflare",
+  "version": "0.2.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "pnpm --filter @vchat/web build && wrangler dev",
+    "deploy": "pnpm --filter @vchat/web build && wrangler deploy",
+    "typecheck": "tsc --noEmit",
+    "cf-typegen": "wrangler types"
+  },
+  "dependencies": {
+    "@vchat/signaling-server": "workspace:*"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20250101.0",
+    "typescript": "^5.3.3",
+    "wrangler": "^4.0.0"
+  }
+}

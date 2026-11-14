@@ -6,3 +6,8 @@ declare namespace App {
 	// interface PageData {}
 	// interface Platform {}
 }
+
+declare module 'simple-peer/simplepeer.min.js' {
+	const SimplePeer: unknown;
+	export default SimplePeer;
+}

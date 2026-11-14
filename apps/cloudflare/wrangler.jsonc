@@ -1,0 +1,38 @@
+// Cloudflare deployment for vchat: static web app + signaling (Durable Objects) in one Worker.
+//
+// Nothing account-specific belongs in this file. Wrangler picks your account from `wrangler login`,
+// secrets are set with `wrangler secret put`, and a custom domain can be attached in the
+// Cloudflare dashboard (Workers & Pages → vchat → Settings → Domains & Routes).
+// See README.md → "Deploy on Cloudflare".
+{
+  "$schema": "../../node_modules/wrangler/config-schema.json",
+  "name": "vchat",
+  "main": "src/worker.ts",
+  "compatibility_date": "2025-09-01",
+  "workers_dev": true,
+
+  "assets": {
+    "directory": "../web/build",
+    "binding": "ASSETS",
+    "not_found_handling": "single-page-application",
+    // The Worker runs first so it can enforce the optional site password and route /ws and /api.
+    "run_worker_first": true
+  },
+
+  "durable_objects": {
+    "bindings": [{ "name": "ROOMS", "class_name": "SignalingRoom" }]
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["SignalingRoom"] }],
+
+  "observability": { "enabled": true }
+
+  // Optional plain-text settings (uncomment to use):
+  // "vars": {
+  //   "ALLOWED_ORIGIN": "https://chat.example.com"
+  // }
+  //
+  // Secrets (set with `npx wrangler secret put NAME`, never committed):
+  //   SITE_PASSWORD       password for the whole site (username: vchat). Strongly recommended.
+  //   CF_TURN_KEY_ID      Cloudflare Realtime TURN key ID       } enables TURN relay for
+  //   CF_TURN_API_TOKEN   Cloudflare Realtime TURN API token    } strict NATs / mobile networks
+}

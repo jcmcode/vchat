@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
+cd "$(dirname "$0")"
 
 echo "=== vchat deploy ==="
 echo
@@ -48,36 +49,36 @@ fi
 
 # Generate bcrypt hash for basic auth
 echo "Generating bcrypt hash..."
-BASIC_AUTH_HASH=$(docker run --rm caddy:2-alpine caddy hash-password --plaintext "$AUTH_PASSWORD")
+BASIC_AUTH_HASH=$(docker run --rm caddy:2-alpine caddy hash-password --plaintext "$AUTH_PASSWORD" | tr -d '\r\n')
 
-# Generate strong TURN password
-TURN_PASSWORD=$(openssl rand -base64 24)
-TURN_USER="vchat"
+# Shared secret for short-lived TURN credentials (reuse the existing one on re-deploys)
+if [ -f .env ] && grep -q '^TURN_SECRET=.' .env; then
+  TURN_SECRET=$(grep '^TURN_SECRET=' .env | cut -d= -f2-)
+else
+  TURN_SECRET=$(openssl rand -hex 32)
+fi
 
 echo
 echo "Configuration:"
 echo "  Domain:      $DOMAIN"
 echo "  Email:       $ACME_EMAIL"
 echo "  External IP: $EXTERNAL_IP"
-echo "  TURN user:   $TURN_USER"
 echo
 
-# Write .env
+# Write .env (bcrypt hashes contain '$', so the hash is single-quoted to stop Compose expanding it)
+umask 077
 cat > .env <<EOF
 DOMAIN=$DOMAIN
 ACME_EMAIL=$ACME_EMAIL
-TURN_USER=$TURN_USER
-TURN_PASSWORD=$TURN_PASSWORD
-BASIC_AUTH_HASH=$BASIC_AUTH_HASH
-VITE_TURN_URL=turn:$DOMAIN:3478
-VITE_TURN_USER=$TURN_USER
-VITE_TURN_CREDENTIAL=$TURN_PASSWORD
+TURN_SECRET=$TURN_SECRET
+BASIC_AUTH_HASH='$BASIC_AUTH_HASH'
 EOF
+umask 022
 echo "Wrote .env"
 
 # Template turnserver.conf
 sed -e "s|EXTERNAL_IP_PLACEHOLDER|$EXTERNAL_IP|g" \
-    -e "s|TURN_PASSWORD_PLACEHOLDER|$TURN_PASSWORD|g" \
+    -e "s|TURN_SECRET_PLACEHOLDER|$TURN_SECRET|g" \
     -e "s|DOMAIN_PLACEHOLDER|$DOMAIN|g" \
     turnserver.conf.template > turnserver.conf
 echo "Wrote turnserver.conf"
@@ -133,6 +134,8 @@ fi
 # Stage 2: Start signaling and coturn
 echo "Starting signaling and coturn services..."
 docker compose up -d --build signaling coturn
+# Restart coturn if it was already running so it picks up a new turnserver.conf
+docker compose restart coturn >/dev/null 2>&1 || true
 
 echo
 echo "=== Deployed! ==="

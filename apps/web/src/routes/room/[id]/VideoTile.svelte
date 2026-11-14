@@ -1,18 +1,27 @@
 <script lang="ts">
   import type { PeerConnection } from '$lib/webrtc/mesh';
+  import { selectedAudioOutput } from '$lib/media/manager';
 
   export let peerConnection: PeerConnection;
   export let speaking = false;
 
   let videoEl: HTMLVideoElement;
 
-  $: if (videoEl && peerConnection.stream) {
+  $: if (videoEl && peerConnection.stream && videoEl.srcObject !== peerConnection.stream) {
     videoEl.srcObject = peerConnection.stream;
+  }
+
+  // Route audio to the speaker picked in Device Settings (Chrome/Edge/Firefox support setSinkId).
+  $: if (videoEl && $selectedAudioOutput && 'setSinkId' in videoEl) {
+    (videoEl as HTMLVideoElement & { setSinkId(id: string): Promise<void> })
+      .setSinkId($selectedAudioOutput)
+      .catch(() => {});
   }
 </script>
 
 <div class="tile" class:speaking>
   {#if peerConnection.stream}
+    <!-- svelte-ignore a11y-media-has-caption -->
     <video
       bind:this={videoEl}
       autoplay

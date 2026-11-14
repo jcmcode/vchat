@@ -1,13 +1,17 @@
 <script lang="ts">
   import { page } from '$app/stores';
   import { onMount, onDestroy } from 'svelte';
-  import { goto } from '$app/navigation';
+  import { goto, replaceState } from '$app/navigation';
   import { browser } from '$app/environment';
   import {
     peers,
     chatMessages,
     connectionState,
     admissionState,
+    admissionDeniedReason,
+    passwordInvalid,
+    roomError,
+    submitRoomPassword,
     admissionRequests,
     hostStatus,
     reactions as reactionsStore,
@@ -36,7 +40,18 @@
     startScreenShare,
     stopScreenShare,
   } from '$lib/media/manager';
-  import { getSignalServerUrl, getSavedDisplayName, peerId } from '$lib/stores/room';
+  import {
+    signalUrlForRoom,
+    getSavedDisplayName,
+    saveDisplayName,
+    takePendingPassword,
+    markRoomCreated,
+    wasRoomCreated,
+    rememberRoomPassword,
+    recallRoomPassword,
+    peerId,
+    peerSecret,
+  } from '$lib/stores/room';
   import VideoTile from './VideoTile.svelte';
   import ChatPanel from './ChatPanel.svelte';
   import WaitingScreen from './WaitingScreen.svelte';
@@ -59,6 +74,26 @@
   let wasConnected = false;
   let unreadCount = 0;
   let lastSeenMessageCount = 0;
+  let passwordAttempt = '';
+  let needsName = false;
+  let nameInput = '';
+  let resolveName: (() => void) | null = null;
+
+  function handleSubmitName() {
+    const trimmed = nameInput.trim();
+    if (!trimmed) return;
+    displayName = trimmed.slice(0, 30);
+    saveDisplayName(displayName);
+    needsName = false;
+    resolveName?.();
+  }
+
+  function handleSubmitPassword() {
+    if (!passwordAttempt) return;
+    rememberRoomPassword(roomId, passwordAttempt);
+    submitRoomPassword(passwordAttempt);
+    passwordAttempt = '';
+  }
 
   function handleWindowClick(e: MouseEvent) {
     const target = e.target as HTMLElement;
@@ -70,7 +105,7 @@
     }
   }
 
-  $: roomId = $page.params.id;
+  $: roomId = ($page.params.id ?? "").toLowerCase();
   $: peerList = Array.from($peers.values());
   $: gridCols = getGridCols(peerList.length + 1);
 
@@ -84,10 +119,17 @@
     if (!browser) return;
 
     const urlName = $page.url.searchParams.get('name');
-    displayName = urlName || getSavedDisplayName() || 'Anonymous';
+    displayName = urlName || getSavedDisplayName();
+    if (!displayName) {
+      // Opened a shared link directly: ask for a name before joining.
+      needsName = true;
+      await new Promise<void>((resolve) => (resolveName = resolve));
+    }
 
-    const isCreator = $page.url.searchParams.get('creator') === '1';
-    const password = $page.url.searchParams.get('password') || undefined;
+    const isCreator = $page.url.searchParams.get('creator') === '1' || wasRoomCreated(roomId);
+    if (isCreator) markRoomCreated(roomId);
+    const password = takePendingPassword() ?? recallRoomPassword(roomId);
+    if (password) rememberRoomPassword(roomId, password);
     const voiceOnly = $page.url.searchParams.get('voiceOnly') === '1';
 
     try {
@@ -109,8 +151,18 @@
       mediaReady = true;
     }
 
-    const serverUrl = getSignalServerUrl();
-    joinRoom(serverUrl, roomId, $peerId, displayName, isCreator, password);
+    // Drop one-time flags from the address bar so a shared or refreshed URL is just the room.
+    replaceState(`/room/${roomId}`, {});
+
+    await joinRoom({
+      serverUrl: signalUrlForRoom(roomId),
+      roomId,
+      peerId: $peerId,
+      secret: peerSecret,
+      displayName,
+      isCreator,
+      password,
+    });
   });
 
   onDestroy(() => {
@@ -157,8 +209,8 @@
   }
 
   function copyLink() {
-    const url = window.location.href.split('?')[0];
-    navigator.clipboard.writeText(url);
+    const url = `${window.location.origin}/room/${roomId}`;
+    navigator.clipboard.writeText(url).catch(() => {});
     copied = true;
     setTimeout(() => { copied = false; }, 2000);
   }
@@ -208,6 +260,21 @@
   $: showReconnecting = wasConnected && $connectionState === 'disconnected';
 </script>
 
+{#if needsName}
+  <div class="denied-overlay">
+    <form class="denied-card neutral" on:submit|preventDefault={handleSubmitName}>
+      <h2>Join room {roomId}</h2>
+      <p>What should others call you?</p>
+      <!-- svelte-ignore a11y-autofocus -->
+      <input class="overlay-input" type="text" bind:value={nameInput} placeholder="Your name" maxlength="30" autofocus />
+      <div class="overlay-actions">
+        <button type="button" class="overlay-btn" on:click={() => goto('/')}>Cancel</button>
+        <button type="submit" class="overlay-btn primary" disabled={!nameInput.trim()}>Join</button>
+      </div>
+    </form>
+  </div>
+{/if}
+
 {#if $admissionState === 'waiting'}
   <WaitingScreen on:cancel={handleCancelWaiting} />
 {/if}
@@ -215,9 +282,37 @@
 {#if $admissionState === 'denied'}
   <div class="denied-overlay">
     <div class="denied-card">
-      <h2>Access Denied</h2>
-      <p>You were not admitted to this room. Redirecting...</p>
+      <h2>Couldn't join</h2>
+      <p>{$admissionDeniedReason || 'You were not admitted to this room.'} Redirecting...</p>
     </div>
+  </div>
+{:else if $roomError}
+  <div class="denied-overlay">
+    <div class="denied-card">
+      <h2>Couldn't join</h2>
+      <p>{$roomError}</p>
+      <button class="overlay-btn" on:click={handleLeave}>Back to home</button>
+    </div>
+  </div>
+{:else if $admissionState === 'password'}
+  <div class="denied-overlay">
+    <form class="denied-card" on:submit|preventDefault={handleSubmitPassword}>
+      <h2>Password required</h2>
+      <p>{$passwordInvalid ? 'That password was wrong. Try again.' : 'This room is password protected.'}</p>
+      <!-- svelte-ignore a11y-autofocus -->
+      <input
+        class="overlay-input"
+        type="password"
+        bind:value={passwordAttempt}
+        placeholder="Room password"
+        autocomplete="off"
+        autofocus
+      />
+      <div class="overlay-actions">
+        <button type="button" class="overlay-btn" on:click={handleLeave}>Cancel</button>
+        <button type="submit" class="overlay-btn primary" disabled={!passwordAttempt}>Join</button>
+      </div>
+    </form>
   </div>
 {/if}
 
@@ -572,6 +667,51 @@
   .denied-card h2 {
     color: var(--danger);
     margin-bottom: 0.5rem;
+  }
+
+  .denied-card.neutral h2 {
+    color: var(--text);
+  }
+
+  .overlay-input {
+    width: 100%;
+    margin-top: 1rem;
+    padding: 0.6rem 0.75rem;
+    border-radius: 6px;
+    border: 1px solid var(--border);
+    background: var(--bg-elevated);
+    color: var(--text);
+    font-size: 0.95rem;
+  }
+
+  .overlay-actions {
+    display: flex;
+    gap: 0.5rem;
+    justify-content: center;
+    margin-top: 1rem;
+  }
+
+  .overlay-btn {
+    margin-top: 1rem;
+    padding: 0.5rem 1rem;
+    border-radius: 6px;
+    border: 1px solid var(--border);
+    background: var(--bg-elevated);
+    color: var(--text);
+  }
+
+  .overlay-actions .overlay-btn {
+    margin-top: 0;
+  }
+
+  .overlay-btn.primary {
+    background: var(--accent);
+    border-color: var(--accent);
+    color: white;
+  }
+
+  .overlay-btn:disabled {
+    opacity: 0.5;
   }
 
   .denied-card p {

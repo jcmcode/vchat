@@ -3,17 +3,21 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "dev": "pnpm -r --parallel dev",
+    "dev": "pnpm --parallel --filter @vchat/web --filter @vchat/signaling-server dev",
     "dev:web": "pnpm --filter @vchat/web dev",
     "dev:signal": "pnpm --filter @vchat/signaling-server dev",
-    "build": "pnpm -r build",
+    "build": "pnpm --filter @vchat/signaling-server --filter @vchat/web build",
     "build:web": "pnpm --filter @vchat/web build",
-    "build:signal": "pnpm --filter @vchat/signaling-server build"
+    "build:signal": "pnpm --filter @vchat/signaling-server build",
+    "test": "pnpm --filter @vchat/signaling-server test",
+    "check": "pnpm --filter @vchat/signaling-server typecheck && pnpm --filter @vchat/web check && pnpm --filter @vchat/cloudflare typecheck",
+    "cf:dev": "pnpm --filter @vchat/cloudflare dev",
+    "cf:deploy": "pnpm --filter @vchat/cloudflare deploy",
+    "desktop:dev": "pnpm --filter @vchat/desktop dev",
+    "desktop:build": "pnpm --filter @vchat/desktop build"
   },
   "engines": {
-    "node": ">=18"
+    "node": ">=20"
   },
-  "pnpm": {
-    "onlyBuiltDependencies": ["esbuild"]
-  }
+  "packageManager": "pnpm@12.18.0"
 }

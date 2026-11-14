@@ -1,5 +1,5 @@
 {
-  "$schema": "https://raw.githubusercontent.com/nicedoc/tauri/v2/crates/tauri-utils/schema.json",
+  "$schema": "https://schema.tauri.app/config/2",
   "productName": "vchat",
   "version": "0.1.0",
   "identifier": "com.vchat.app",

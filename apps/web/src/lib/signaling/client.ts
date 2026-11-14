@@ -10,145 +10,164 @@ export type SignalingEventType =
   | 'password-required'
   | 'waiting-for-admission'
   | 'admission-request'
+  | 'admission-cancelled'
   | 'admission-granted'
   | 'admission-denied'
   | 'host-changed';
 
 export interface SignalingEvent {
-  type: SignalingEventType;
+  type: SignalingEventType | string;
   [key: string]: unknown;
 }
 
 type EventHandler = (event: SignalingEvent) => void;
 
+interface RoomIntent {
+  roomId: string;
+  peerId: string;
+  displayName: string;
+  secret: string;
+  password?: string;
+  isCreator: boolean;
+  /** Set once the server has let us into the room. */
+  admitted?: boolean;
+}
+
+const PING_INTERVAL_MS = 25_000;
+const PONG_TIMEOUT_MS = 10_000;
+
 export class SignalingClient {
   private ws: WebSocket | null = null;
   private handlers = new Map<string, Set<EventHandler>>();
-  private url: string;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+  private pingTimer: ReturnType<typeof setInterval> | null = null;
+  private pongTimer: ReturnType<typeof setTimeout> | null = null;
+  private reconnectAttempts = 0;
   private shouldReconnect = true;
-  private currentRoomId: string | null = null;
-  private currentPeerId: string | null = null;
-  private currentDisplayName: string | null = null;
-  private isCreator = false;
-  private password: string | undefined = undefined;
+  private intent: RoomIntent | null = null;
 
-  constructor(url: string) {
-    this.url = url;
-  }
+  constructor(private readonly url: string) {}
 
   connect(): void {
     this.shouldReconnect = true;
-    this.ws = new WebSocket(this.url);
+    const ws = new WebSocket(this.url);
+    this.ws = ws;
 
-    this.ws.onopen = () => {
+    ws.onopen = () => {
+      this.reconnectAttempts = 0;
+      this.startKeepalive();
       this.emit({ type: 'connected' });
-      // Auto-rejoin room after reconnect
-      if (this.currentRoomId && this.currentPeerId && this.currentDisplayName) {
-        if (this.isCreator) {
-          this.send({
-            type: 'create-room',
-            roomId: this.currentRoomId,
-            peerId: this.currentPeerId,
-            displayName: this.currentDisplayName,
-            ...(this.password ? { password: this.password } : {}),
-          });
-        } else {
-          this.send({
-            type: 'join',
-            roomId: this.currentRoomId,
-            peerId: this.currentPeerId,
-            displayName: this.currentDisplayName,
-            ...(this.password ? { password: this.password } : {}),
-          });
-        }
-      }
+      // Re-enter the room after a reconnect. The server lets us straight back in thanks to our secret.
+      if (this.intent) this.sendEnter(this.intent.isCreator);
     };
 
-    this.ws.onmessage = (event) => {
+    ws.onmessage = (event) => {
+      let msg: SignalingEvent;
       try {
-        const msg = JSON.parse(event.data);
-        // On reconnect, if room already exists, fall back to join
-        if (msg.type === 'error' && msg.message === 'Room already exists' && this.isCreator) {
-          this.send({
-            type: 'join',
-            roomId: this.currentRoomId!,
-            peerId: this.currentPeerId!,
-            displayName: this.currentDisplayName!,
-            ...(this.password ? { password: this.password } : {}),
-          });
-          return;
-        }
-        this.emit(msg);
+        msg = JSON.parse(event.data);
       } catch {
-        // ignore invalid JSON
+        return;
       }
+      if (msg.type === 'pong') {
+        if (this.pongTimer) clearTimeout(this.pongTimer);
+        this.pongTimer = null;
+        return;
+      }
+      if (msg.type === 'room-peers' && this.intent) this.intent.admitted = true;
+      // We were in this room but everyone left while we were disconnected — reopen it.
+      if (msg.type === 'error' && msg.message === 'Room does not exist' && this.intent?.admitted) {
+        this.intent.isCreator = true;
+        this.sendEnter(true);
+        return;
+      }
+      // Our room already exists (e.g. we reconnected after a blip) — join it instead.
+      if (msg.type === 'error' && msg.message === 'Room already exists' && this.intent?.isCreator) {
+        this.intent.isCreator = false;
+        this.sendEnter(false);
+        return;
+      }
+      this.emit(msg);
     };
 
-    this.ws.onclose = () => {
+    ws.onclose = () => {
+      if (this.ws !== ws) return;
+      this.stopKeepalive();
+      this.ws = null;
       this.emit({ type: 'disconnected' });
       this.scheduleReconnect();
     };
 
-    this.ws.onerror = () => {
-      // onclose will fire after this
+    ws.onerror = () => {
+      // onclose fires after this
     };
+  }
+
+  private startKeepalive(): void {
+    this.stopKeepalive();
+    this.pingTimer = setInterval(() => {
+      if (this.ws?.readyState !== WebSocket.OPEN) return;
+      this.ws.send('{"type":"ping"}');
+      if (!this.pongTimer) {
+        this.pongTimer = setTimeout(() => {
+          // No pong: the connection is dead even if the browser hasn't noticed yet.
+          this.ws?.close();
+        }, PONG_TIMEOUT_MS);
+      }
+    }, PING_INTERVAL_MS);
+  }
+
+  private stopKeepalive(): void {
+    if (this.pingTimer) clearInterval(this.pingTimer);
+    if (this.pongTimer) clearTimeout(this.pongTimer);
+    this.pingTimer = null;
+    this.pongTimer = null;
   }
 
   private scheduleReconnect(): void {
     if (!this.shouldReconnect) return;
-    this.reconnectTimer = setTimeout(() => {
-      console.log('Reconnecting to signaling server...');
-      this.connect();
-    }, 2000);
+    const delay = Math.min(1000 * 2 ** this.reconnectAttempts, 15_000);
+    this.reconnectAttempts++;
+    this.reconnectTimer = setTimeout(() => this.connect(), delay);
   }
 
   disconnect(): void {
     this.shouldReconnect = false;
-    if (this.reconnectTimer) {
-      clearTimeout(this.reconnectTimer);
-      this.reconnectTimer = null;
-    }
-    if (this.ws) {
-      this.ws.close();
-      this.ws = null;
-    }
+    this.stopKeepalive();
+    if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
+    this.reconnectTimer = null;
+    const ws = this.ws;
+    this.ws = null;
+    ws?.close();
   }
 
   send(message: object): void {
-    if (this.ws && this.ws.readyState === WebSocket.OPEN) {
-      this.ws.send(JSON.stringify(message));
-    }
+    if (this.ws?.readyState === WebSocket.OPEN) this.ws.send(JSON.stringify(message));
   }
 
-  createRoom(roomId: string, peerId: string, displayName: string, password?: string): void {
-    this.currentRoomId = roomId;
-    this.currentPeerId = peerId;
-    this.currentDisplayName = displayName;
-    this.isCreator = true;
-    this.password = password;
+  private sendEnter(asCreator: boolean): void {
+    if (!this.intent) return;
+    const { roomId, peerId, displayName, secret, password } = this.intent;
     this.send({
-      type: 'create-room',
+      type: asCreator ? 'create-room' : 'join',
       roomId,
       peerId,
       displayName,
+      secret,
       ...(password ? { password } : {}),
     });
   }
 
-  joinRoom(roomId: string, peerId: string, displayName: string, password?: string): void {
-    this.currentRoomId = roomId;
-    this.currentPeerId = peerId;
-    this.currentDisplayName = displayName;
-    this.isCreator = false;
-    this.password = password;
-    this.send({
-      type: 'join',
-      roomId,
-      peerId,
-      displayName,
-      ...(password ? { password } : {}),
-    });
+  enterRoom(intent: RoomIntent): void {
+    this.intent = { ...intent };
+    this.sendEnter(intent.isCreator);
+  }
+
+  /** Retry joining with a (new) room password. */
+  retryWithPassword(password: string): void {
+    if (!this.intent) return;
+    this.intent.password = password;
+    this.intent.isCreator = false;
+    this.sendEnter(false);
   }
 
   admitPeer(peerId: string): void {
@@ -160,11 +179,7 @@ export class SignalingClient {
   }
 
   leaveRoom(): void {
-    this.currentRoomId = null;
-    this.currentPeerId = null;
-    this.currentDisplayName = null;
-    this.isCreator = false;
-    this.password = undefined;
+    this.intent = null;
     this.send({ type: 'leave' });
   }
 
@@ -173,30 +188,15 @@ export class SignalingClient {
   }
 
   on(type: string, handler: EventHandler): () => void {
-    if (!this.handlers.has(type)) {
-      this.handlers.set(type, new Set());
-    }
+    if (!this.handlers.has(type)) this.handlers.set(type, new Set());
     this.handlers.get(type)!.add(handler);
-
-    // Return unsubscribe function
     return () => {
       this.handlers.get(type)?.delete(handler);
     };
   }
 
   private emit(event: SignalingEvent): void {
-    const handlers = this.handlers.get(event.type);
-    if (handlers) {
-      for (const handler of handlers) {
-        handler(event);
-      }
-    }
-    // Also emit to wildcard handlers
-    const wildcardHandlers = this.handlers.get('*');
-    if (wildcardHandlers) {
-      for (const handler of wildcardHandlers) {
-        handler(event);
-      }
-    }
+    for (const handler of this.handlers.get(event.type) ?? []) handler(event);
+    for (const handler of this.handlers.get('*') ?? []) handler(event);
   }
 }

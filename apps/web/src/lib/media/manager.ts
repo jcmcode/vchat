@@ -45,13 +45,21 @@ export async function startMedia(opts?: {
         },
   };
 
-  const stream = await navigator.mediaDevices.getUserMedia(constraints);
-  localStream.set(stream);
-
-  if (isVoiceOnly) {
-    voiceOnlyMode.set(true);
-    videoEnabled.set(false);
+  let stream: MediaStream;
+  let videoUnavailable = false;
+  try {
+    stream = await navigator.mediaDevices.getUserMedia(constraints);
+  } catch (err) {
+    // No camera (or camera blocked/in use) but a working mic? Join with audio only.
+    const name = err instanceof DOMException ? err.name : '';
+    if (isVoiceOnly || !['NotFoundError', 'NotReadableError', 'OverconstrainedError'].includes(name)) throw err;
+    stream = await navigator.mediaDevices.getUserMedia({ audio: constraints.audio, video: false });
+    videoUnavailable = true;
   }
+  localStream.set(stream);
+  audioEnabled.set(true);
+  videoEnabled.set(!isVoiceOnly && !videoUnavailable);
+  voiceOnlyMode.set(isVoiceOnly || videoUnavailable);
 
   await enumerateDevices();
   return stream;
@@ -64,6 +72,9 @@ export function stopMedia(): void {
     localStream.set(null);
   }
   stopScreenShare();
+  audioEnabled.set(true);
+  videoEnabled.set(true);
+  voiceOnlyMode.set(false);
 }
 
 export function toggleAudio(): boolean {
@@ -111,6 +122,7 @@ export async function switchAudioDevice(deviceId: string): Promise<MediaStreamTr
   });
 
   const newTrack = newStream.getAudioTracks()[0];
+  newTrack.enabled = get(audioEnabled); // stay muted if we were muted
   if (oldTrack) stream.removeTrack(oldTrack);
   stream.addTrack(newTrack);
   selectedAudioDevice.set(deviceId);
@@ -139,6 +151,7 @@ export async function switchVideoDevice(deviceId: string): Promise<MediaStreamTr
   });
 
   const newTrack = newStream.getVideoTracks()[0];
+  newTrack.enabled = get(videoEnabled);
   if (oldTrack) stream.removeTrack(oldTrack);
   stream.addTrack(newTrack);
   selectedVideoDevice.set(deviceId);

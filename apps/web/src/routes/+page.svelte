@@ -8,6 +8,7 @@
     setSignalServerUrl,
     getTurnConfig,
     setTurnConfig,
+    setPendingPassword,
   } from '$lib/stores/room';
 
   let name = getSavedDisplayName();
@@ -16,6 +17,7 @@
   let voiceOnly = false;
   let showSettings = false;
   let signalingUrl = getSignalServerUrl();
+  const defaultSignalingUrl = signalingUrl;
   let turnUrl = '';
   let turnUsername = '';
   let turnCredential = '';
@@ -33,24 +35,32 @@
     setTurnConfig(turnUrl, turnUsername, turnCredential);
   }
 
+  // Accept a bare code or a pasted room link.
+  function parseRoomCode(input: string): string {
+    const trimmed = input.trim();
+    const match = trimmed.match(/\/room\/([^/?#]+)/);
+    return (match ? match[1] : trimmed).toLowerCase();
+  }
+
+  function enterRoom(id: string, creator: boolean) {
+    saveDisplayName(name.trim());
+    // The password goes through sessionStorage so it never lands in the URL or browser history.
+    setPendingPassword(roomPasswordInput);
+    const params = new URLSearchParams();
+    if (creator) params.set('creator', '1');
+    if (voiceOnly) params.set('voiceOnly', '1');
+    const query = params.toString();
+    goto(`/room/${id}${query ? `?${query}` : ''}`);
+  }
+
   function createRoom() {
     if (!name.trim()) return;
-    saveDisplayName(name.trim());
-    const id = generateRoomId();
-    const params = new URLSearchParams({ name: name.trim(), creator: '1' });
-    if (roomPasswordInput) params.set('password', roomPasswordInput);
-    if (voiceOnly) params.set('voiceOnly', '1');
-    goto(`/room/${id}?${params.toString()}`);
+    enterRoom(generateRoomId(), true);
   }
 
   function joinRoom() {
     if (!name.trim() || !joinCode.trim()) return;
-    saveDisplayName(name.trim());
-    const code = joinCode.trim().toLowerCase();
-    const params = new URLSearchParams({ name: name.trim() });
-    if (roomPasswordInput) params.set('password', roomPasswordInput);
-    if (voiceOnly) params.set('voiceOnly', '1');
-    goto(`/room/${code}?${params.toString()}`);
+    enterRoom(parseRoomCode(joinCode), false);
   }
 
   function handleKeydown(e: KeyboardEvent) {
@@ -102,9 +112,9 @@
         <input
           type="text"
           bind:value={joinCode}
-          placeholder="Room code"
+          placeholder="Room code or link"
           on:keydown={handleKeydown}
-          maxlength="20"
+          maxlength="200"
         />
         <button
           class="btn secondary"
@@ -130,11 +140,11 @@
             type="text"
             bind:value={signalingUrl}
             on:change={saveSettings}
-            placeholder="ws://localhost:3001"
+            placeholder={defaultSignalingUrl}
           />
         </label>
         <label>
-          <span>TURN Server URL</span>
+          <span>TURN Server URL (optional override)</span>
           <input
             type="text"
             bind:value={turnUrl}

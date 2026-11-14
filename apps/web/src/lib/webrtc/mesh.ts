@@ -1,8 +1,9 @@
-import SimplePeer from 'simple-peer';
+import type SimplePeer from 'simple-peer';
+import Peer from './simple-peer.js';
 import { writable, get } from 'svelte/store';
 import { SignalingClient } from '../signaling/client.js';
 import { localStream, screenStream, isScreenSharing } from '../media/manager.js';
-import { getTurnConfig } from '../stores/room.js';
+import { fetchIceServers } from '../stores/room.js';
 import { deserialize, serialize, type DataChannelMessage } from './data-channel.js';
 import { createSpeakingDetector } from '../media/audio-analysis.js';
 import {
@@ -12,6 +13,8 @@ import {
   handleFileAck,
   handleFileCancel,
   sendFile as ftSendFile,
+  resetFileTransfers,
+  dropRecipient,
   type FileTransferEntry,
 } from './file-transfer.js';
 
@@ -20,6 +23,10 @@ export interface PeerConnection {
   displayName: string;
   peer: SimplePeer.Instance;
   stream: MediaStream | null;
+  /** Session id: lets both sides tell signals for this connection apart from stale ones. */
+  sid: string | null;
+  initiator: boolean;
+  connected: boolean;
 }
 
 export interface ChatMessage {
@@ -53,12 +60,23 @@ export interface AdmissionRequest {
 export const peers = writable<Map<string, PeerConnection>>(new Map());
 export const chatMessages = writable<ChatMessage[]>([]);
 export const connectionState = writable<'disconnected' | 'connecting' | 'connected'>('disconnected');
-export const admissionState = writable<'none' | 'waiting' | 'denied'>('none');
+export const admissionState = writable<'none' | 'waiting' | 'password' | 'denied'>('none');
+export const admissionDeniedReason = writable<string>('');
+export const passwordInvalid = writable<boolean>(false);
+/** Fatal problem joining the room (room missing, full, ...). */
+export const roomError = writable<string>('');
 export const admissionRequests = writable<AdmissionRequest[]>([]);
 export const hostStatus = writable<boolean>(false);
 export const typingPeers = writable<Set<string>>(new Set());
 export const reactions = writable<Reaction[]>([]);
 export const speakingPeers = writable<Set<string>>(new Set());
+
+const FATAL_ERRORS: Record<string, string> = {
+  'Room does not exist': "This room doesn't exist (or everyone has left). Check the code or create a new room.",
+  'Room is full': 'This room is full (6 people max).',
+  'Peer ID already in use': 'You are already in this room in another tab.',
+  'Too many people waiting to join': 'Too many people are waiting to join. Try again shortly.',
+};
 
 let iceServers: RTCIceServer[] = [];
 
@@ -69,92 +87,89 @@ let currentRoomId: string = '';
 const unsubscribers: (() => void)[] = [];
 const disconnectTimers = new Map<string, ReturnType<typeof setTimeout>>();
 const speakingDetectorCleanups = new Map<string, () => void>();
+/** Display names as reported by the signaling server (trusted over names sent peer-to-peer). */
+const knownNames = new Map<string, string>();
 let localSpeakingCleanup: (() => void) | null = null;
 
-function buildIceServers(): RTCIceServer[] {
-  const servers: RTCIceServer[] = [
-    { urls: 'stun:stun.l.google.com:19302' },
-    { urls: 'stun:stun1.l.google.com:19302' },
-  ];
-  const turn = getTurnConfig();
-  if (turn && turn.url) {
-    servers.push({ urls: turn.url, username: turn.username, credential: turn.credential });
-  }
-  return servers;
+function newSid(): string {
+  return Math.random().toString(36).slice(2, 10) + Date.now().toString(36);
 }
 
-// Chat persistence
+// Chat history lives in sessionStorage: it survives a refresh or reconnect,
+// but disappears when the tab is closed (nothing persists after the call).
+function chatKey(roomId: string): string {
+  return `vchat_chat_${roomId}`;
+}
+
 function loadChatHistory(roomId: string): void {
   try {
-    const key = `vchat_chat_${roomId}`;
-    const saved = localStorage.getItem(key);
-    if (saved) {
-      const msgs = (JSON.parse(saved) as ChatMessage[]).map((m, i) => ({
-        ...m,
-        id: m.id || `loaded_${i}_${m.timestamp}`,
-      }));
-      chatMessages.set(msgs.slice(-500));
-    }
+    const saved = sessionStorage.getItem(chatKey(roomId));
+    const msgs = saved ? (JSON.parse(saved) as ChatMessage[]) : [];
+    chatMessages.set(
+      msgs.slice(-500).map((m, i) => ({ ...m, id: m.id || `loaded_${i}_${m.timestamp}` }))
+    );
   } catch {
-    // ignore
+    chatMessages.set([]);
   }
 }
 
 function saveChatHistory(roomId: string): void {
   try {
-    const key = `vchat_chat_${roomId}`;
-    const msgs = get(chatMessages);
-    localStorage.setItem(key, JSON.stringify(msgs.slice(-500)));
+    const msgs = get(chatMessages).map(({ fileTransfer: _ft, ...m }) => m);
+    sessionStorage.setItem(chatKey(roomId), JSON.stringify(msgs.slice(-500)));
   } catch {
-    // ignore
+    // ignore (quota, private mode)
   }
 }
 
 // Data channel helpers
-function broadcastToAllPeers(data: string): void {
-  const peerMap = get(peers);
-  for (const [, pc] of peerMap) {
-    try {
-      pc.peer.send(data);
-    } catch {
-      // peer may not be connected yet
-    }
+function sendIfConnected(pc: PeerConnection, data: string): void {
+  if (!pc.connected) return;
+  try {
+    pc.peer.send(data);
+  } catch {
+    // channel closed mid-send
   }
+}
+
+function broadcastToAllPeers(data: string): void {
+  for (const [, pc] of get(peers)) sendIfConnected(pc, data);
 }
 
 function sendDataToPeer(peerId: string, data: string): void {
-  const peerMap = get(peers);
-  const pc = peerMap.get(peerId);
-  if (pc) {
-    try {
-      pc.peer.send(data);
-    } catch {
-      // peer not connected
-    }
-  }
+  const pc = get(peers).get(peerId);
+  if (pc) sendIfConnected(pc, data);
 }
 
-export function joinRoom(
-  serverUrl: string,
-  roomId: string,
-  peerId: string,
-  displayName: string,
-  isCreator = false,
-  password?: string
-): void {
+function updatePeers(): void {
+  peers.update((map) => new Map(map));
+}
+
+export interface JoinOptions {
+  serverUrl: string;
+  roomId: string;
+  peerId: string;
+  secret: string;
+  displayName: string;
+  isCreator?: boolean;
+  password?: string;
+}
+
+export async function joinRoom(opts: JoinOptions): Promise<void> {
+  const { serverUrl, roomId, peerId, secret, displayName, isCreator = false, password } = opts;
   localPeerId = peerId;
   localDisplayName = displayName;
   currentRoomId = roomId;
-  iceServers = buildIceServers();
   connectionState.set('connecting');
   admissionState.set('none');
+  admissionDeniedReason.set('');
+  passwordInvalid.set(false);
+  roomError.set('');
   admissionRequests.set([]);
   hostStatus.set(false);
+  knownNames.clear();
 
-  // Load chat history
   loadChatHistory(roomId);
-
-  // Init file transfer
   initFileTransfer(sendDataToPeer, broadcastToAllPeers);
 
   // Attach speaking detector to local stream
@@ -170,149 +185,115 @@ export function joinRoom(
     });
   }
 
-  signalingClient = new SignalingClient(serverUrl);
+  iceServers = await fetchIceServers();
+  if (currentRoomId !== roomId) return; // left while we were fetching
 
-  unsubscribers.push(
-    signalingClient.on('connected', () => {
-      connectionState.set('connected');
-      if (isCreator) {
-        signalingClient!.createRoom(roomId, peerId, displayName, password);
-      } else {
-        signalingClient!.joinRoom(roomId, peerId, displayName, password);
-      }
-    })
-  );
+  const client = new SignalingClient(serverUrl);
+  signalingClient = client;
+  const on = (type: string, handler: Parameters<SignalingClient['on']>[1]) =>
+    unsubscribers.push(client.on(type, handler));
 
-  unsubscribers.push(
-    signalingClient.on('disconnected', () => {
-      connectionState.set('disconnected');
-    })
-  );
+  on('connected', () => connectionState.set('connected'));
+  on('disconnected', () => connectionState.set('disconnected'));
 
-  unsubscribers.push(
-    signalingClient.on('room-peers', (event) => {
-      const existingPeers = event.peers as { id: string; displayName: string }[];
-      for (const p of existingPeers) {
-        createPeerConnection(p.id, p.displayName, true);
-      }
-    })
-  );
+  on('room-peers', (event) => {
+    admissionState.set('none');
+    roomError.set('');
+    const existingPeers = event.peers as { id: string; displayName: string }[];
+    for (const p of existingPeers) {
+      knownNames.set(p.id, p.displayName);
+      createPeerConnection(p.id, p.displayName, true);
+    }
+  });
 
-  unsubscribers.push(
-    signalingClient.on('peer-joined', (event) => {
-      const { peerId: newPeerId, displayName: name } = event as {
-        peerId: string;
-        displayName: string;
-        type: string;
-      };
-      createPeerConnection(newPeerId, name, false);
-    })
-  );
+  on('peer-joined', (event) => {
+    const { peerId: newPeerId, displayName: name } = event as unknown as { peerId: string; displayName: string };
+    knownNames.set(newPeerId, name);
+    // The newcomer sends the offer; we wait for it.
+    createPeerConnection(newPeerId, name, false);
+  });
 
-  unsubscribers.push(
-    signalingClient.on('peer-left', (event) => {
-      const { peerId: leftPeerId } = event as { peerId: string; type: string };
-      destroyPeerConnection(leftPeerId);
-    })
-  );
+  on('peer-left', (event) => {
+    const { peerId: leftPeerId } = event as unknown as { peerId: string };
+    destroyPeerConnection(leftPeerId);
+  });
 
-  unsubscribers.push(
-    signalingClient.on('signal', (event) => {
-      const { fromPeerId, signal } = event as {
-        fromPeerId: string;
-        signal: SimplePeer.SignalData;
-        type: string;
-      };
-      const peerMap = get(peers);
-      const pc = peerMap.get(fromPeerId);
-      if (pc) {
-        pc.peer.signal(signal);
-      }
-    })
-  );
+  on('signal', (event) => {
+    const { fromPeerId, signal } = event as unknown as { fromPeerId: string; signal: unknown };
+    handleSignal(fromPeerId, signal);
+  });
 
-  // Host/admission handlers
-  unsubscribers.push(
-    signalingClient.on('host-changed', (event) => {
-      const { hostPeerId } = event as { hostPeerId: string; type: string };
-      hostStatus.set(hostPeerId === localPeerId);
-    })
-  );
+  on('host-changed', (event) => {
+    const { hostPeerId } = event as unknown as { hostPeerId: string };
+    hostStatus.set(hostPeerId === localPeerId);
+    if (hostPeerId !== localPeerId) admissionRequests.set([]);
+  });
 
-  unsubscribers.push(
-    signalingClient.on('waiting-for-admission', () => {
-      admissionState.set('waiting');
-    })
-  );
+  on('waiting-for-admission', () => admissionState.set('waiting'));
+  on('admission-granted', () => admissionState.set('none'));
 
-  unsubscribers.push(
-    signalingClient.on('admission-granted', () => {
-      admissionState.set('none');
-    })
-  );
+  on('admission-denied', (event) => {
+    const { reason } = event as { reason?: string };
+    admissionDeniedReason.set(reason ?? '');
+    admissionState.set('denied');
+  });
 
-  unsubscribers.push(
-    signalingClient.on('admission-denied', (event) => {
-      const { reason } = event as { reason?: string; type: string };
-      admissionState.set('denied');
-      console.log('Admission denied:', reason);
-    })
-  );
+  on('admission-request', (event) => {
+    const { peerId: reqPeerId, displayName: reqName } = event as unknown as AdmissionRequest;
+    admissionRequests.update((reqs) => [
+      ...reqs.filter((r) => r.peerId !== reqPeerId),
+      { peerId: reqPeerId, displayName: reqName },
+    ]);
+  });
 
-  unsubscribers.push(
-    signalingClient.on('admission-request', (event) => {
-      const { peerId: reqPeerId, displayName: reqName } = event as {
-        peerId: string;
-        displayName: string;
-        type: string;
-      };
-      admissionRequests.update((reqs) => [...reqs, { peerId: reqPeerId, displayName: reqName }]);
-    })
-  );
+  on('admission-cancelled', (event) => {
+    const { peerId: reqPeerId } = event as unknown as { peerId: string };
+    admissionRequests.update((reqs) => reqs.filter((r) => r.peerId !== reqPeerId));
+  });
 
-  unsubscribers.push(
-    signalingClient.on('password-required', () => {
-      // Emit as error for UI to handle
-      admissionState.set('denied');
-    })
-  );
+  on('password-required', (event) => {
+    passwordInvalid.set(!!event.invalid);
+    admissionState.set('password');
+  });
 
-  signalingClient.connect();
+  on('error', (event) => {
+    const message = String(event.message ?? '');
+    const friendly = FATAL_ERRORS[message] ?? (message.startsWith('Invalid roomId') ? 'That room code is not valid.' : '');
+    if (friendly) roomError.set(friendly);
+    else console.warn('Signaling error:', message);
+  });
+
+  client.enterRoom({ roomId, peerId, displayName, secret, password, isCreator });
+  client.connect();
+}
+
+export function submitRoomPassword(password: string): void {
+  passwordInvalid.set(false);
+  admissionState.set('none');
+  signalingClient?.retryWithPassword(password);
 }
 
 export function leaveRoom(): void {
-  // Clean up speaking detectors
-  for (const cleanup of speakingDetectorCleanups.values()) {
-    cleanup();
-  }
+  for (const cleanup of speakingDetectorCleanups.values()) cleanup();
   speakingDetectorCleanups.clear();
   if (localSpeakingCleanup) {
     localSpeakingCleanup();
     localSpeakingCleanup = null;
   }
 
-  // Save chat before leaving
-  if (currentRoomId) {
-    saveChatHistory(currentRoomId);
-  }
+  if (currentRoomId) saveChatHistory(currentRoomId);
+  currentRoomId = '';
 
-  // Clean up disconnect timers
-  for (const timer of disconnectTimers.values()) {
-    clearTimeout(timer);
-  }
+  for (const timer of disconnectTimers.values()) clearTimeout(timer);
   disconnectTimers.clear();
+  for (const timer of typingTimers.values()) clearTimeout(timer);
+  typingTimers.clear();
 
-  // Clean up all peer connections
   const peerMap = get(peers);
-  for (const [, pc] of peerMap) {
-    pc.peer.destroy();
-  }
   peers.set(new Map());
+  for (const [, pc] of peerMap) pc.peer.destroy();
 
-  // Clean up signaling
-  for (const unsub of unsubscribers) {
-    unsub();
-  }
+  for (const unsub of unsubscribers) unsub();
   unsubscribers.length = 0;
 
   if (signalingClient) {
@@ -321,7 +302,11 @@ export function leaveRoom(): void {
     signalingClient = null;
   }
 
-  // Don't clear chat messages — keep for persistence
+  cleanupMixedAudio();
+  screenShareActive = false;
+  pendingTrackReplacements.clear();
+  resetFileTransfers();
+
   connectionState.set('disconnected');
   admissionState.set('none');
   admissionRequests.set([]);
@@ -408,14 +393,16 @@ const typingTimers = new Map<string, ReturnType<typeof setTimeout>>();
 function handleDataChannelMessage(fromPeerId: string, msg: DataChannelMessage): void {
   switch (msg.type) {
     case 'chat': {
+      if (typeof msg.text !== 'string' || !msg.text.trim()) break;
       chatMessages.update((msgs) => [
         ...msgs,
         {
           id: nextMsgId(),
-          fromPeerId: msg.fromPeerId,
-          displayName: msg.displayName,
-          text: msg.text,
-          timestamp: msg.timestamp,
+          fromPeerId,
+          // Use the server-verified name; peers can't impersonate each other in chat.
+          displayName: knownNames.get(fromPeerId) ?? String(msg.displayName ?? 'Peer').slice(0, 30),
+          text: msg.text.slice(0, 5000),
+          timestamp: Date.now(),
           isLocal: false,
         },
       ]);
@@ -424,13 +411,13 @@ function handleDataChannelMessage(fromPeerId: string, msg: DataChannelMessage): 
       // Clear typing indicator for this peer
       typingPeers.update((s) => {
         const next = new Set(s);
-        next.delete(msg.fromPeerId);
+        next.delete(fromPeerId);
         return next;
       });
       break;
     }
     case 'typing': {
-      const pid = msg.fromPeerId;
+      const pid = fromPeerId;
       if (msg.isTyping) {
         typingPeers.update((s) => new Set(s).add(pid));
         // Auto-clear after 3s
@@ -459,15 +446,25 @@ function handleDataChannelMessage(fromPeerId: string, msg: DataChannelMessage): 
       break;
     }
     case 'reaction': {
+      if (typeof msg.emoji !== 'string' || msg.emoji.length > 16) break;
       const id = `${Date.now()}_${Math.random()}`;
-      reactions.update((r) => [...r, { ...msg, id }]);
+      reactions.update((r) => [
+        ...r,
+        {
+          emoji: msg.emoji,
+          fromPeerId,
+          displayName: knownNames.get(fromPeerId) ?? 'Peer',
+          timestamp: Date.now(),
+          id,
+        },
+      ]);
       setTimeout(() => {
         reactions.update((r) => r.filter((x) => x.id !== id));
       }, 2500);
       break;
     }
     case 'file-meta':
-      handleFileMeta(msg);
+      handleFileMeta({ ...msg, fromPeerId, displayName: knownNames.get(fromPeerId) ?? 'Peer' });
       break;
     case 'file-chunk':
       handleFileChunk(msg, fromPeerId);
@@ -476,7 +473,7 @@ function handleDataChannelMessage(fromPeerId: string, msg: DataChannelMessage): 
       handleFileAck(msg, fromPeerId);
       break;
     case 'file-cancel':
-      handleFileCancel(msg);
+      handleFileCancel(msg, fromPeerId);
       break;
   }
 }
@@ -627,22 +624,52 @@ function getStreamForNewPeer(): MediaStream | undefined {
   return stream ?? undefined;
 }
 
+/** Route an incoming signal to the right connection, (re)creating it when the remote starts a new session. */
+function handleSignal(fromPeerId: string, raw: unknown): void {
+  const envelope = raw as { sid?: unknown; data?: SimplePeer.SignalData } | null;
+  if (!envelope || typeof envelope.sid !== 'string' || !envelope.data) return;
+  const { sid, data } = envelope;
+  const isOffer = (data as { type?: string }).type === 'offer';
+  const pc = get(peers).get(fromPeerId);
+
+  const feed = (target: PeerConnection) => {
+    try {
+      target.peer.signal(data);
+    } catch (err) {
+      console.warn('Ignoring bad signal:', err);
+    }
+  };
+
+  if (pc && pc.sid === sid) {
+    feed(pc);
+    return;
+  }
+  if (pc && pc.sid === null && !pc.initiator && isOffer) {
+    pc.sid = sid; // first offer for a connection we were expecting
+    feed(pc);
+    return;
+  }
+  if (!isOffer) return; // leftover candidate/answer from a connection we've already replaced
+
+  // The remote restarted the connection. If we restarted at the same moment ("glare"),
+  // the peer with the smaller id wins and the other side yields.
+  if (pc && pc.initiator && !pc.connected && localPeerId < fromPeerId) return;
+
+  const name = pc?.displayName ?? knownNames.get(fromPeerId) ?? 'Peer';
+  feed(createPeerConnection(fromPeerId, name, false, sid));
+}
+
 function createPeerConnection(
   remotePeerId: string,
   remoteDisplayName: string,
-  initiator: boolean
-): void {
-  const existingMap = get(peers);
-  const existing = existingMap.get(remotePeerId);
-  if (existing) {
-    existing.peer.destroy();
-  }
+  initiator: boolean,
+  sid: string | null = initiator ? newSid() : null
+): PeerConnection {
+  teardownPeer(remotePeerId);
 
-  const stream = getStreamForNewPeer();
-
-  const peer = new SimplePeer({
+  const peer = new Peer({
     initiator,
-    stream,
+    stream: getStreamForNewPeer(),
     trickle: true,
     config: { iceServers },
   });
@@ -652,43 +679,44 @@ function createPeerConnection(
     displayName: remoteDisplayName,
     peer,
     stream: null,
+    sid,
+    initiator,
+    connected: false,
   };
 
-  peer.on('signal', (signal) => {
-    signalingClient?.sendSignal(remotePeerId, signal);
+  // Events from a connection we've since replaced must not touch the new one.
+  const isCurrent = () => get(peers).get(remotePeerId)?.peer === peer;
+
+  peer.on('signal', (data) => {
+    if (!isCurrent() || !pc.sid) return;
+    signalingClient?.sendSignal(remotePeerId, { sid: pc.sid, data });
   });
 
   peer.on('connect', () => {
+    if (!isCurrent()) return;
+    pc.connected = true;
     const pendingTrack = pendingTrackReplacements.get(remotePeerId);
     if (pendingTrack !== undefined) {
       pendingTrackReplacements.delete(remotePeerId);
       replaceVideoTrack(pc, pendingTrack);
     }
+    updatePeers();
   });
 
-  // Data channel messages
   peer.on('data', (data: Uint8Array | string) => {
+    if (!isCurrent()) return;
     const str = typeof data === 'string' ? data : new TextDecoder().decode(data);
     const msg = deserialize(str);
-    if (msg) {
-      handleDataChannelMessage(remotePeerId, msg);
-    }
+    if (msg) handleDataChannelMessage(remotePeerId, msg);
   });
 
-  peer.on('stream', (remoteStream) => {
+  peer.on('stream', (remoteStream: MediaStream) => {
+    if (!isCurrent()) return;
     pc.stream = remoteStream;
-    peers.update((map) => {
-      const updated = new Map(map);
-      updated.set(remotePeerId, { ...pc, stream: remoteStream });
-      return updated;
-    });
+    updatePeers();
 
-    // Attach speaking detector to remote stream
     if (remoteStream.getAudioTracks().length > 0) {
-      // Clean up previous detector if any
-      const prevCleanup = speakingDetectorCleanups.get(remotePeerId);
-      if (prevCleanup) prevCleanup();
-
+      speakingDetectorCleanups.get(remotePeerId)?.();
       const cleanup = createSpeakingDetector(remoteStream, (isSpeaking) => {
         speakingPeers.update((s) => {
           const next = new Set(s);
@@ -702,100 +730,99 @@ function createPeerConnection(
   });
 
   peer.on('close', () => {
-    destroyPeerConnection(remotePeerId);
+    if (isCurrent()) destroyPeerConnection(remotePeerId);
   });
 
-  peer.on('error', (err) => {
-    console.error(`Peer connection error with ${remoteDisplayName}:`, err.message);
-    destroyPeerConnection(remotePeerId);
+  peer.on('error', (err: Error) => {
+    if (!isCurrent()) return;
+    console.warn(`Connection error with ${remoteDisplayName}:`, err.message);
+    // Try again rather than silently dropping the person from the call.
+    reconnectPeer(remotePeerId, remoteDisplayName);
   });
 
-  // ICE connection state monitoring
-  try {
-    const rtcPc = (peer as unknown as { _pc: RTCPeerConnection })._pc;
-    if (rtcPc) {
-      rtcPc.addEventListener('iceconnectionstatechange', () => {
-        const state = rtcPc.iceConnectionState;
+  // ICE connection state monitoring → automatic recovery
+  const rtcPc = (peer as unknown as { _pc?: RTCPeerConnection })._pc;
+  rtcPc?.addEventListener('iceconnectionstatechange', () => {
+    if (!isCurrent()) return;
+    const state = rtcPc.iceConnectionState;
+    const clearTimer = () => {
+      const timer = disconnectTimers.get(remotePeerId);
+      if (timer) clearTimeout(timer);
+      disconnectTimers.delete(remotePeerId);
+    };
 
-        if (state === 'connected' || state === 'completed') {
-          const timer = disconnectTimers.get(remotePeerId);
-          if (timer) {
-            clearTimeout(timer);
-            disconnectTimers.delete(remotePeerId);
-          }
-        } else if (state === 'disconnected') {
-          const timer = setTimeout(() => {
-            disconnectTimers.delete(remotePeerId);
-            console.warn(`Peer ${remoteDisplayName} disconnected — reconnecting`);
-            reconnectPeer(remotePeerId, remoteDisplayName);
-          }, 5000);
-          disconnectTimers.set(remotePeerId, timer);
-        } else if (state === 'failed') {
-          const timer = disconnectTimers.get(remotePeerId);
-          if (timer) {
-            clearTimeout(timer);
-            disconnectTimers.delete(remotePeerId);
-          }
-          console.warn(`Peer ${remoteDisplayName} ICE failed — reconnecting`);
-          reconnectPeer(remotePeerId, remoteDisplayName);
-        }
-      });
+    if (state === 'connected' || state === 'completed') {
+      clearTimer();
+    } else if (state === 'disconnected') {
+      clearTimer();
+      // "disconnected" often recovers on its own; give it a few seconds first.
+      disconnectTimers.set(
+        remotePeerId,
+        setTimeout(() => {
+          disconnectTimers.delete(remotePeerId);
+          if (isCurrent()) reconnectPeer(remotePeerId, remoteDisplayName);
+        }, 5000)
+      );
+    } else if (state === 'failed') {
+      clearTimer();
+      reconnectPeer(remotePeerId, remoteDisplayName);
     }
-  } catch {
-    // _pc may not be available yet
-  }
-
-  peers.update((map) => {
-    const updated = new Map(map);
-    updated.set(remotePeerId, pc);
-    return updated;
   });
+
+  peers.update((map) => new Map(map).set(remotePeerId, pc));
+  return pc;
 }
 
+const reconnectAttempts = new Map<string, number[]>();
+
 function reconnectPeer(remotePeerId: string, remoteDisplayName: string): void {
-  const peerMap = get(peers);
-  const existing = peerMap.get(remotePeerId);
-  if (existing) {
-    existing.peer.destroy();
+  // Back off if a connection keeps failing (e.g. no TURN and a strict NAT): max 5 tries/minute.
+  const now = Date.now();
+  const recent = (reconnectAttempts.get(remotePeerId) ?? []).filter((t) => now - t < 60_000);
+  if (recent.length >= 5) {
+    console.warn(`Giving up reconnecting to ${remoteDisplayName} for now`);
+    destroyPeerConnection(remotePeerId);
+    return;
   }
+  reconnectAttempts.set(remotePeerId, [...recent, now]);
+  console.warn(`Reconnecting to ${remoteDisplayName}`);
   createPeerConnection(remotePeerId, remoteDisplayName, true);
 }
 
-function destroyPeerConnection(remotePeerId: string): void {
+/** Stop everything attached to a peer's current connection, but keep its entry in the store. */
+function teardownPeer(remotePeerId: string): void {
   const timer = disconnectTimers.get(remotePeerId);
-  if (timer) {
-    clearTimeout(timer);
-    disconnectTimers.delete(remotePeerId);
-  }
+  if (timer) clearTimeout(timer);
+  disconnectTimers.delete(remotePeerId);
 
-  // Clean up speaking detector
-  const cleanup = speakingDetectorCleanups.get(remotePeerId);
-  if (cleanup) {
-    cleanup();
-    speakingDetectorCleanups.delete(remotePeerId);
-  }
+  speakingDetectorCleanups.get(remotePeerId)?.();
+  speakingDetectorCleanups.delete(remotePeerId);
 
-  // Clean up typing state
+  const pc = get(peers).get(remotePeerId);
+  if (pc) {
+    // Detach first so the old peer's async 'close' event is recognised as stale.
+    peers.update((map) => {
+      const next = new Map(map);
+      next.delete(remotePeerId);
+      return next;
+    });
+    pc.peer.destroy();
+  }
+}
+
+function destroyPeerConnection(remotePeerId: string): void {
+  teardownPeer(remotePeerId);
+  pendingTrackReplacements.delete(remotePeerId);
+  dropRecipient(remotePeerId);
+
   typingPeers.update((s) => {
     const next = new Set(s);
     next.delete(remotePeerId);
     return next;
   });
-
   speakingPeers.update((s) => {
     const next = new Set(s);
     next.delete(remotePeerId);
     return next;
-  });
-
-  const peerMap = get(peers);
-  const pc = peerMap.get(remotePeerId);
-  if (pc) {
-    pc.peer.destroy();
-  }
-  peers.update((map) => {
-    const updated = new Map(map);
-    updated.delete(remotePeerId);
-    return updated;
   });
 }

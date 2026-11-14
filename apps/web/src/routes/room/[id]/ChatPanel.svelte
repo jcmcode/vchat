@@ -2,7 +2,18 @@
   import { createEventDispatcher, afterUpdate, onDestroy } from 'svelte';
   import type { ChatMessage } from '$lib/webrtc/mesh';
   import { typingPeers, sendTypingIndicator, sendFileToRoom, peers } from '$lib/webrtc/mesh';
-  import { fileTransfers } from '$lib/webrtc/file-transfer';
+  import { fileTransfers, MAX_FILE_SIZE } from '$lib/webrtc/file-transfer';
+
+  // One object URL per received image, revoked when the panel closes.
+  const previewUrls = new Map<Blob, string>();
+  function previewUrl(blob: Blob): string {
+    let url = previewUrls.get(blob);
+    if (!url) {
+      url = URL.createObjectURL(blob);
+      previewUrls.set(blob, url);
+    }
+    return url;
+  }
 
   export let messages: ChatMessage[];
 
@@ -21,6 +32,7 @@
   });
 
   onDestroy(() => {
+    for (const url of previewUrls.values()) URL.revokeObjectURL(url);
     if (typingTimer) clearTimeout(typingTimer);
     if (isTyping) sendTypingIndicator(false);
   });
@@ -67,12 +79,16 @@
     const files = (e.target as HTMLInputElement).files;
     if (!files || files.length === 0) return;
     const file = files[0];
-    if (file.size > 50 * 1024 * 1024) {
+    fileInput.value = '';
+    if (file.size > MAX_FILE_SIZE) {
       alert('File too large. Maximum size is 50MB.');
       return;
     }
+    if ($peers.size === 0) {
+      alert('Nobody else is in the call yet.');
+      return;
+    }
     sendFileToRoom(file);
-    fileInput.value = '';
   }
 
   function downloadFile(blob: Blob, fileName: string) {
@@ -81,7 +97,7 @@
     a.href = url;
     a.download = fileName;
     a.click();
-    URL.revokeObjectURL(url);
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
   }
 
   function isImage(mimeType: string): boolean {
@@ -136,8 +152,8 @@
             <span class="progress-text">{Math.round(ft.progress * 100)}%</span>
           </div>
         {:else if ft.status === 'complete' && ft.direction === 'receive' && ft.blob}
-          {#if isImage(ft.mimeType)}
-            <img class="file-preview" src={URL.createObjectURL(ft.blob)} alt={ft.fileName} />
+          {#if isImage(ft.mimeType) && ft.mimeType !== 'image/svg+xml'}
+            <img class="file-preview" src={previewUrl(ft.blob)} alt={ft.fileName} />
           {/if}
           <button class="file-download" on:click={() => { if (ft.blob) downloadFile(ft.blob, ft.fileName); }}>
             Download {ft.fileName}
