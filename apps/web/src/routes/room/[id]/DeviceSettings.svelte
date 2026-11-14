@@ -10,9 +10,16 @@
     switchVideoDevice,
     enumerateDevices,
     isScreenSharing,
+    videoEnabled,
   } from '$lib/media/manager';
   import { replaceTrackOnAllPeers, useNewMicTrack } from '$lib/webrtc/mesh';
+  import { rememberDevice } from '$lib/media/device-prefs';
+  import { cameraNeedsReopen, flipCamera, isTouchDevice, syncCameraFacing } from '$lib/media/call-camera';
+  import Icon from '$lib/ui/Icon.svelte';
   import { onMount } from 'svelte';
+
+  const touch = isTouchDevice();
+  $: canFlip = touch && $videoEnabled && $videoDevices.length > 1;
 
   onMount(() => {
     enumerateDevices();
@@ -26,6 +33,7 @@
     try {
       const track = await switchAudioDevice(deviceId);
       if (track) useNewMicTrack(track); // keeps shared-screen audio mixed in while presenting
+      rememberDevice('audioInput', deviceId);
     } catch {
       deviceError = "Couldn't switch microphone — it may be in use by another app.";
     }
@@ -34,10 +42,18 @@
   async function handleVideoChange(e: Event) {
     const deviceId = (e.target as HTMLSelectElement).value;
     deviceError = '';
+    // The camera is released (joined with it off): don't open it now, just use this one when it's turned on.
+    if (cameraNeedsReopen()) {
+      selectedVideoDevice.set(deviceId);
+      rememberDevice('videoInput', deviceId);
+      return;
+    }
     try {
       const track = await switchVideoDevice(deviceId);
       // While screen sharing, peers keep seeing the screen; the new camera is used when sharing stops.
       if (track && !$isScreenSharing) replaceTrackOnAllPeers(track, 'video');
+      syncCameraFacing();
+      rememberDevice('videoInput', deviceId);
     } catch {
       deviceError = "Couldn't switch camera — it may be in use by another app.";
     }
@@ -46,7 +62,18 @@
   function handleOutputChange(e: Event) {
     const deviceId = (e.target as HTMLSelectElement).value;
     selectedAudioOutput.set(deviceId);
+    rememberDevice('audioOutput', deviceId);
     // VideoTile applies this with setSinkId on each remote video element.
+  }
+
+  async function handleFlip() {
+    deviceError = '';
+    try {
+      const track = await flipCamera();
+      if (track && !$isScreenSharing) replaceTrackOnAllPeers(track, 'video');
+    } catch {
+      deviceError = "Couldn't switch camera.";
+    }
   }
 </script>
 
@@ -70,6 +97,11 @@
         <option value={device.deviceId}>{device.label || 'Camera'}</option>
       {/each}
     </select>
+    {#if canFlip}
+      <button type="button" class="btn small flip" on:click={handleFlip}>
+        <Icon name="switch-camera" size={16} /> Switch front / back camera
+      </button>
+    {/if}
   </div>
 
   {#if $audioOutputDevices.length > 0}
@@ -115,6 +147,12 @@
       bottom: 68px;
     }
   }
+  .flip {
+    margin-top: var(--space-2);
+    gap: var(--space-2);
+    align-self: flex-start;
+  }
+
   .device-error {
     margin: 0;
     font-size: var(--text-xs);

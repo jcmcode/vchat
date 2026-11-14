@@ -16,6 +16,9 @@
     video: '<rect x="2" y="6" width="14" height="12" rx="3"/><path d="M16 10.5l5.2-3a.6.6 0 0 1 .8.5v8a.6.6 0 0 1-.8.5l-5.2-3"/>',
     'video-off':
       '<path d="M10.5 6H13a3 3 0 0 1 3 3v2.5"/><path d="M16 14.5V15a3 3 0 0 1-3 3H5a3 3 0 0 1-3-3V9a3 3 0 0 1 2-2.8"/><path d="M16 10.5l5.2-3a.6.6 0 0 1 .8.5v8a.6.6 0 0 1-.8.5l-1.7-1"/><path d="M3 3l18 18"/>',
+    'switch-camera':
+      '<path d="M4 8h3l2-3h6l2 3h3a1 1 0 0 1 1 1v9a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1V9a1 1 0 0 1 1-1z"/><path d="M9.5 12.5a2.5 2.5 0 0 1 4.3-1.7"/><path d="M14.5 13.5a2.5 2.5 0 0 1-4.3 1.7"/><path d="M14 9.3v1.7h-1.7"/><path d="M10 16.7V15h1.7"/>',
+    volume: '<path d="M4 9h3l5-4v14l-5-4H4z"/><path d="M16 9a4 4 0 0 1 0 6"/><path d="M18.5 6.5a7.5 7.5 0 0 1 0 11"/>',
     'screen-share':
       '<rect x="2" y="3" width="20" height="14" rx="2"/><path d="M8 21h8"/><path d="M12 17v4"/><path d="M12 13V8"/><path d="M9.5 10.5L12 8l2.5 2.5"/>',
     'screen-share-off':

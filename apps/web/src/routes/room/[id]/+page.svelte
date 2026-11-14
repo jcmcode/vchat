@@ -30,6 +30,7 @@
     removePeer,
     startSharingScreen,
     stopSharingScreen,
+    replaceTrackOnAllPeers,
     type PeerConnection,
   } from '$lib/webrtc/mesh';
   import {
@@ -45,6 +46,8 @@
     toggleVideo,
     startScreenShare,
     stopScreenShare,
+    adoptMedia,
+    videoDevices,
   } from '$lib/media/manager';
   import {
     signalUrlForRoom,
@@ -62,7 +65,6 @@
     getPeerSecret,
     useRoomIdentity,
     getRelayOnly,
-    setRelayOnly,
     ensureUniqueTabIdentity,
     fetchServerConfig,
     setRoomToken,
@@ -88,6 +90,19 @@
   import ReactionPicker from './ReactionPicker.svelte';
   import Whiteboard from './Whiteboard.svelte';
   import AnnotationLayer from './AnnotationLayer.svelte';
+  import PreJoin from './PreJoin.svelte';
+  import type { PreJoinResult } from '$lib/media/preview';
+  import { shouldMirror } from '$lib/media/camera';
+  import {
+    cameraFacing,
+    cameraNeedsReopen,
+    flipCamera,
+    isTouchDevice,
+    reattachOnTrackChange,
+    reopenCamera,
+    syncCameraFacing,
+  } from '$lib/media/call-camera';
+  import { createWakeLock } from '$lib/media/wake-lock';
 
   type JoinMode = 'video' | 'audio' | 'chat';
 
@@ -111,10 +126,11 @@
   /** Chat-only: joined without camera or microphone. */
   let chatOnly = false;
 
-  // Pre-join screen: name + how to join (video / audio / chat only)
+  // Pre-join screen (PreJoin.svelte): name, how to join (video / audio / chat only), device check
   let showPrejoin = false;
-  let prejoinName = '';
   let prejoinMode: JoinMode = 'video';
+  /** What the pre-join screen handed over, including the already-open camera/microphone. */
+  let prejoinResult: PreJoinResult | null = null;
   /** Joined with a personal invite emailed to one person (asks for their 6-digit code). */
   let personalInvite = false;
   /** Connect only through the relay server, so other participants never learn your IP address. */
@@ -125,13 +141,34 @@
   let editingName = false;
   let nameDraft = '';
 
-  function handleSubmitPrejoin() {
-    const trimmed = prejoinName.trim();
-    if (!trimmed) return;
-    displayName = trimmed.slice(0, 30);
+  function handlePrejoinJoin(e: CustomEvent<PreJoinResult>) {
+    prejoinResult = e.detail;
+    displayName = e.detail.name;
     saveDisplayName(displayName);
+    prejoinMode = e.detail.mode;
+    hideIp = e.detail.hideIp;
     showPrejoin = false;
     resolvePrejoin?.();
+  }
+
+  // Keep the screen on while in the call (released on leaving, removal and errors).
+  const wakeLock = createWakeLock();
+  let inCall = false;
+  $: if (inCall && !$roomError && $admissionState !== 'denied') void wakeLock.enable();
+  else wakeLock.disable();
+
+  // Front/back camera flip on phones and tablets.
+  const touchDevice = browser && isTouchDevice();
+  let cameraNotice = '';
+  async function handleFlipCamera() {
+    cameraNotice = '';
+    try {
+      const track = await flipCamera();
+      // While presenting, peers keep seeing the screen; the new camera is used when sharing stops.
+      if (track && !$isScreenSharing) replaceTrackOnAllPeers(track, 'video');
+    } catch {
+      cameraNotice = "Couldn't switch camera.";
+    }
   }
 
   function handleSubmitPassword() {
@@ -343,7 +380,6 @@
     // Pre-join: confirm your name and choose video, audio only or chat only.
     // Skipped when coming from the home page, where those choices were just made.
     displayName = pendingJoin?.name || getSavedDisplayName();
-    prejoinName = displayName;
     prejoinMode = pendingJoin?.mode ?? 'video';
     if (!pendingJoin || !displayName) {
       showPrejoin = true;
@@ -359,7 +395,18 @@
 
     if (!chatOnly) {
       try {
-        await startMedia({ voiceOnly: prejoinMode === 'audio' });
+        // Use the devices the pre-join check already opened (with your mute/camera-off choices).
+        if (prejoinResult?.stream) {
+          await adoptMedia(prejoinResult.stream, {
+            audio: prejoinResult.micOn,
+            video: prejoinResult.camOn,
+            videoDeviceId: prejoinResult.videoDeviceId,
+          });
+          cameraFacing.set(prejoinResult.facing);
+        } else {
+          await startMedia({ voiceOnly: prejoinMode === 'audio' });
+          syncCameraFacing();
+        }
         if (destroyed) {
           stopMedia(); // left during the camera prompt — release the camera again
           return;
@@ -388,7 +435,7 @@
     await ensureUniqueTabIdentity(roomId);
     if (destroyed) return;
 
-
+    inCall = true;
     await joinRoom({
       serverUrl: signalUrlForRoom(roomId),
       roomId,
@@ -407,9 +454,11 @@
 
   onDestroy(() => {
     destroyed = true;
+    wakeLock.disable();
     if (browser) {
       leaveRoom();
       stopMedia();
+      prejoinResult?.stream?.getTracks().forEach((t) => t.stop()); // handed over but not yet used
       // Leaving the page (any way except a reload) forgets this call's chat, password and keys.
       if (roomId) forgetRoom(roomId);
     }
@@ -419,6 +468,8 @@
   // the camera and microphone and forget this call's invite, key and password right away, rather
   // than when "Back to home" is clicked (which may never happen if the tab is just closed).
   const stopWatchingForcedOut = onForcedOut(() => {
+    inCall = false;
+    wakeLock.disable();
     stopMedia();
     if (roomId) forgetRoom(roomId);
   });
@@ -442,7 +493,18 @@
     toggleAudio();
   }
 
-  function handleToggleVideo() {
+  async function handleToggleVideo() {
+    // Joined with the camera off (or a flip released it): open it now rather than just unmuting.
+    if (!$videoEnabled && cameraNeedsReopen()) {
+      cameraNotice = '';
+      try {
+        const track = await reopenCamera();
+        if (track && !$isScreenSharing) replaceTrackOnAllPeers(track, 'video');
+      } catch {
+        cameraNotice = "Couldn't turn on your camera. Check that it's connected and that this site may use it.";
+      }
+      return;
+    }
     toggleVideo();
   }
 
@@ -510,6 +572,7 @@
   $: if (localVideoEl && $localStream && localVideoEl.srcObject !== $localStream) {
     localVideoEl.srcObject = $localStream;
   }
+  $: if (localVideoEl) reattachOnTrackChange(localVideoEl, $localStream?.getVideoTracks()[0]);
   $: if (localScreenEl && $screenStream && localScreenEl.srcObject !== $screenStream) {
     localScreenEl.srcObject = $screenStream;
   }
@@ -529,6 +592,7 @@
 
   $: localSpeaking = $speakingPeers.has('local');
   $: localHasVideo = !chatOnly && !$voiceOnlyMode && $videoEnabled && !!$localStream?.getVideoTracks().length;
+  $: canFlipCamera = touchDevice && localHasVideo && $videoDevices.length > 1;
 
   // Track unread messages when chat is closed
   $: {
@@ -547,55 +611,14 @@
 </script>
 
 {#if showPrejoin}
-  <div class="overlay">
-    <form
-      class="dialog card fade-in prejoin"
-      role="dialog"
-      aria-modal="true"
-      aria-labelledby="prejoin-title"
-      on:submit|preventDefault={handleSubmitPrejoin}
-    >
-      <h2 id="prejoin-title">{$roomName || 'Join the call'}</h2>
-      <p class="dialog-sub">Choose your name and how you'd like to join.</p>
-      <div class="field">
-        <label class="field-label" for="prejoin-name">Your name</label>
-        <!-- svelte-ignore a11y-autofocus -->
-        <input id="prejoin-name" class="input" type="text" bind:value={prejoinName} placeholder="Your name" maxlength="30" autofocus />
-      </div>
-      <fieldset class="join-modes">
-        <legend class="field-label">Join with</legend>
-        <label class="mode" class:selected={prejoinMode === 'video'}>
-          <input type="radio" bind:group={prejoinMode} value="video" />
-          <span class="mode-icon"><Icon name="video" size={18} /></span>
-          <span class="mode-text"><strong>Camera &amp; mic</strong><small>Video and voice</small></span>
-          <span class="mode-check" aria-hidden="true"><Icon name="check" size={14} /></span>
-        </label>
-        <label class="mode" class:selected={prejoinMode === 'audio'}>
-          <input type="radio" bind:group={prejoinMode} value="audio" />
-          <span class="mode-icon"><Icon name="mic" size={18} /></span>
-          <span class="mode-text"><strong>Audio only</strong><small>Voice, no camera</small></span>
-          <span class="mode-check" aria-hidden="true"><Icon name="check" size={14} /></span>
-        </label>
-        <label class="mode" class:selected={prejoinMode === 'chat'}>
-          <input type="radio" bind:group={prejoinMode} value="chat" />
-          <span class="mode-icon"><Icon name="message" size={18} /></span>
-          <span class="mode-text"><strong>Chat only</strong><small>No camera or mic · you still see and hear everyone</small></span>
-          <span class="mode-check" aria-hidden="true"><Icon name="check" size={14} /></span>
-        </label>
-      </fieldset>
-      <label class="hide-ip">
-        <input type="checkbox" bind:checked={hideIp} on:change={() => setRelayOnly(hideIp)} />
-        <span>
-          <strong>Hide my IP address</strong>
-          <small>Route through the server's relay instead of connecting directly. Still end-to-end encrypted; may add a little delay. Needs a TURN relay on this server.</small>
-        </span>
-      </label>
-      <div class="dialog-actions">
-        <button type="button" class="btn ghost" on:click={() => goto('/')}>Cancel</button>
-        <button type="submit" class="btn primary" disabled={!prejoinName.trim()}>Join</button>
-      </div>
-    </form>
-  </div>
+  <PreJoin
+    title={$roomName}
+    initialName={displayName}
+    initialMode={prejoinMode}
+    {hideIp}
+    on:join={handlePrejoinJoin}
+    on:cancel={() => goto('/')}
+  />
 {/if}
 
 {#if $admissionState === 'waiting'}
@@ -761,6 +784,13 @@
     </div>
   {/if}
 
+  {#if cameraNotice}
+    <div class="banner danger" role="alert">
+      {cameraNotice}
+      <button class="banner-dismiss" on:click={() => (cameraNotice = '')} aria-label="Dismiss"><Icon name="x" size={14} /></button>
+    </div>
+  {/if}
+
   {#if $whiteboardNotice && !$whiteboardOpen}
     <div class="banner info" role="status">
       <Icon name="whiteboard" size={16} />
@@ -808,7 +838,12 @@
         <div class={stage ? 'tile-strip' : 'video-grid'} style={stage ? '' : `--cols: ${gridCols}`}>
           <div class="tile self" class:speaking={localSpeaking}>
             {#if localHasVideo}
-              <video bind:this={localVideoEl} autoplay muted playsinline></video>
+              <video bind:this={localVideoEl} class:unmirrored={!shouldMirror($cameraFacing)} autoplay muted playsinline></video>
+              {#if canFlipCamera}
+                <button class="flip-btn" on:click={handleFlipCamera} title="Switch camera" aria-label="Switch between front and back camera">
+                  <Icon name="switch-camera" size={18} />
+                </button>
+              {/if}
             {:else}
               <div class="no-video">
                 <span class="avatar">{displayName.charAt(0).toUpperCase()}</span>
@@ -1327,6 +1362,33 @@
     transform: scaleX(-1);
   }
 
+  /* A back camera isn't mirrored (text would read backwards). */
+  .tile.self video.unmirrored {
+    transform: none;
+  }
+
+  .flip-btn {
+    position: absolute;
+    top: var(--space-2);
+    right: var(--space-2);
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 44px;
+    height: 44px;
+    border-radius: 50%;
+    border: 1px solid rgba(255, 255, 255, 0.18);
+    background: rgba(11, 13, 18, 0.62);
+    -webkit-backdrop-filter: blur(6px);
+    backdrop-filter: blur(6px);
+    color: #fff;
+  }
+
+  .flip-btn:focus-visible {
+    outline: 2px solid var(--accent-ring);
+    outline-offset: 2px;
+  }
+
   .tile .no-video {
     display: flex;
     align-items: center;
@@ -1581,142 +1643,11 @@
     justify-content: center;
   }
 
-  .field {
-    display: flex;
-    flex-direction: column;
-  }
-
-  .join-modes {
-    border: none;
-    min-width: 0;
-    display: flex;
-    flex-direction: column;
-    gap: var(--space-2);
-  }
-
-  .join-modes legend {
-    margin-bottom: var(--space-2);
-    padding: 0;
-  }
-
   .code-input {
     font-family: var(--font-mono, monospace);
     font-size: var(--text-xl, 1.25rem);
     letter-spacing: 0.3em;
     text-align: center;
-  }
-
-  .hide-ip {
-    display: flex;
-    gap: var(--space-2);
-    align-items: flex-start;
-    margin-top: var(--space-3);
-    cursor: pointer;
-  }
-
-  .hide-ip input {
-    margin-top: 0.2rem;
-  }
-
-  .hide-ip span {
-    display: grid;
-    gap: 0.15rem;
-  }
-
-  .hide-ip small {
-    color: var(--text-muted);
-    font-size: var(--text-xs, 0.75rem);
-  }
-
-  .mode {
-    position: relative;
-    display: flex;
-    align-items: center;
-    gap: var(--space-3);
-    min-height: 56px;
-    padding: var(--space-2) var(--space-3);
-    background: var(--bg-elevated);
-    border: 1px solid var(--border);
-    border-radius: var(--radius);
-    cursor: pointer;
-    transition: border-color var(--dur-fast) var(--ease), background var(--dur-fast) var(--ease);
-  }
-
-  .mode:hover {
-    border-color: var(--border-strong);
-  }
-
-  .mode.selected {
-    border-color: var(--accent);
-    background: var(--accent-soft);
-  }
-
-  .mode:focus-within {
-    box-shadow: 0 0 0 3px var(--accent-ring);
-  }
-
-  .mode input {
-    position: absolute;
-    opacity: 0;
-    inset: 0;
-    width: 100%;
-    height: 100%;
-    margin: 0;
-    cursor: pointer;
-  }
-
-  .mode-icon {
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    width: 36px;
-    height: 36px;
-    border-radius: var(--radius);
-    background: var(--bg-hover);
-    color: var(--text-muted);
-    flex-shrink: 0;
-  }
-
-  .mode.selected .mode-icon {
-    background: var(--accent);
-    color: var(--accent-text);
-  }
-
-  .mode-text {
-    display: flex;
-    flex-direction: column;
-    flex: 1;
-    min-width: 0;
-    line-height: 1.3;
-  }
-
-  .mode-text strong {
-    font-size: var(--text-base);
-    font-weight: 500;
-    color: var(--text);
-  }
-
-  .mode-text small {
-    font-size: var(--text-xs);
-    color: var(--text-muted);
-  }
-
-  .mode-check {
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    width: 20px;
-    height: 20px;
-    border-radius: 50%;
-    border: 1px solid var(--border-strong);
-    color: transparent;
-    flex-shrink: 0;
-  }
-
-  .mode.selected .mode-check {
-    background: var(--accent);
-    border-color: var(--accent);
-    color: var(--accent-text);
   }
 
   /* ── Responsive ─────────────────────────────────────────────────────── */
