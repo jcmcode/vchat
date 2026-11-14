@@ -2,7 +2,9 @@
   import { createEventDispatcher } from 'svelte';
   import Icon from '$lib/ui/Icon.svelte';
   import { apiUrl, type SavedRoom } from '$lib/stores/room';
-  import { DURATIONS, durationLabel, toDatetimeLocal } from '$lib/invites';
+  import WhenPicker from '$lib/ui/WhenPicker.svelte';
+  import { durationLabel } from '$lib/invites';
+  import { formatRange, type When } from '$lib/when';
   import { MAX_RECIPIENTS, addRecipients, isValidEmail, parseEmailList, splitTyped } from '$lib/email-list';
 
   export let room: SavedRoom;
@@ -29,13 +31,18 @@
   let passcode = true;
   let includeKey = true;
 
+  // The host's note, shown in each email and calendar invite. Kept after sending, for the next batch.
+  const MESSAGE_MAX = 500;
+  let message = '';
+  $: messageLength = Array.from(message.trim()).length;
+  $: messageTooLong = messageLength > MESSAGE_MAX;
+
   // Schedule (taken from the room; can be changed or removed for these invites)
-  let scheduleAt = room.startsAt ? toDatetimeLocal(room.startsAt) : '';
-  let duration = room.durationMinutes ?? 60;
-  /** Inputs shown (always, until a time is set and confirmed); otherwise a one-line summary. */
+  let when: When = { startsAt: room.startsAt ?? null, durationMinutes: room.durationMinutes ?? 60 };
+  /** Picker shown (always, until a time is set and confirmed); otherwise a one-line summary. */
   let editingSchedule = !room.startsAt;
-  $: durationOptions = DURATIONS.includes(duration) ? DURATIONS : [...DURATIONS, duration].sort((a, b) => a - b);
-  $: startsAt = scheduleAt ? new Date(scheduleAt).getTime() : NaN;
+  $: startsAt = when.startsAt ?? NaN;
+  $: duration = when.durationMinutes;
   $: hasSchedule = Number.isFinite(startsAt);
   $: scheduleInPast = hasSchedule && startsAt < Date.now() - 5 * 60_000;
   $: endsAfterExpiry = hasSchedule && startsAt + duration * 60_000 > room.expiresAt;
@@ -107,12 +114,8 @@
   }
 
   function removeSchedule() {
-    scheduleAt = '';
+    when = { ...when, startsAt: null };
     editingSchedule = true;
-  }
-
-  function formatWhen(ms: number): string {
-    return new Date(ms).toLocaleString([], { weekday: 'short', month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' });
   }
 
   const REASONS: Record<FailReason, string> = {
@@ -148,6 +151,7 @@
           inviteToken: room.inviteToken,
           emails,
           passcode,
+          ...(message.trim() ? { message: Array.from(message.trim()).slice(0, MESSAGE_MAX).join('') } : {}),
           ...(includeKey && room.key ? { key: room.key } : {}),
           ...(hasSchedule ? { schedule: { startsAt, durationMinutes: duration } } : {}),
         }),
@@ -246,6 +250,22 @@
     </p>
   </div>
 
+  <div>
+    <label class="field-label" for="{uid}-message">Message (optional)</label>
+    <textarea
+      id="{uid}-message"
+      class="input message"
+      rows="3"
+      bind:value={message}
+      placeholder="e.g. Quick catch-up about the trip. Bring your questions!"
+      aria-describedby="{uid}-message-hint"
+    ></textarea>
+    <p id="{uid}-message-hint" class="hint message-hint" class:warn={messageTooLong}>
+      <span>{messageTooLong ? `Only the first ${MESSAGE_MAX} characters will be sent.` : 'Shown in the email and calendar invite.'}</span>
+      <span class="count" aria-label="{messageLength} of {MESSAGE_MAX} characters">{messageLength}/{MESSAGE_MAX}</span>
+    </p>
+  </div>
+
   <label class="option">
     <input type="checkbox" bind:checked={passcode} />
     <span>
@@ -268,35 +288,28 @@
     {#if hasSchedule && !editingSchedule}
       <p class="schedule-summary">
         <Icon name="calendar" size={16} />
-        <span>Calendar invite for <strong>{formatWhen(startsAt)}</strong>, {durationLabel(duration)}</span>
+        <span>Calendar invite for <strong>{formatRange(startsAt, duration)}</strong> ({durationLabel(duration)})</span>
       </p>
       <div class="schedule-actions">
         <button type="button" class="link-btn" on:click={() => (editingSchedule = true)}>Change</button>
         <button type="button" class="link-btn" on:click={removeSchedule}>Remove</button>
       </div>
     {:else}
-      <div class="schedule-fields">
-        <div>
-          <label class="field-label" for="{uid}-when">Meeting time (optional)</label>
-          <input id="{uid}-when" class="input" type="datetime-local" bind:value={scheduleAt} />
-        </div>
-        <div>
-          <label class="field-label" for="{uid}-length">Length</label>
-          <select id="{uid}-length" class="input" bind:value={duration} disabled={!scheduleAt}>
-            {#each durationOptions as d}<option value={d}>{durationLabel(d)}</option>{/each}
-          </select>
-        </div>
-      </div>
+      <WhenPicker
+        id="{uid}-when"
+        legend="Meeting time (optional)"
+        emptyText="No date: the emails go out without a calendar invite. Pick a day to add one."
+        bind:value={when}
+      />
       {#if hasSchedule}
         <div class="schedule-actions">
           <button type="button" class="link-btn" on:click={() => (editingSchedule = false)}>Done</button>
-          <button type="button" class="link-btn" on:click={removeSchedule}>Remove</button>
         </div>
       {/if}
     {/if}
-    <p class="hint">
-      {hasSchedule ? 'Each email includes a calendar invite they can add to their calendar.' : 'Set a time and each email includes a calendar invite.'}
-    </p>
+    {#if hasSchedule}
+      <p class="hint">Each email includes a calendar invite they can add to their calendar{passcode ? ", with the link and their code" : ", with the link"}.</p>
+    {/if}
     {#if scheduleInPast}
       <p class="hint warn">That time is in the past.</p>
     {:else if endsAfterExpiry}
@@ -459,6 +472,25 @@
     color: var(--warning);
   }
 
+  .message {
+    display: block;
+    min-height: 76px;
+    padding: var(--space-2) var(--space-3);
+    line-height: 1.45;
+    resize: vertical;
+  }
+
+  .message-hint {
+    display: flex;
+    justify-content: space-between;
+    gap: var(--space-3);
+  }
+
+  .count {
+    flex-shrink: 0;
+    font-variant-numeric: tabular-nums;
+  }
+
   .option {
     display: flex;
     gap: var(--space-2);
@@ -518,13 +550,6 @@
   .schedule-actions .link-btn {
     padding-left: 0;
     padding-right: var(--space-2);
-  }
-
-  .schedule-fields {
-    display: grid;
-    grid-template-columns: minmax(0, 1fr) auto;
-    gap: var(--space-3);
-    align-items: end;
   }
 
   .send {
@@ -609,9 +634,6 @@
   @media (max-width: 480px) {
     .invite-form {
       padding: var(--space-3);
-    }
-    .schedule-fields {
-      grid-template-columns: minmax(0, 1fr);
     }
     .send {
       align-self: stretch;

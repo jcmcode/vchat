@@ -3,7 +3,9 @@
   import { goto } from '$app/navigation';
   import Icon from '$lib/ui/Icon.svelte';
   import { generateRoomKey } from '$lib/webrtc/e2e-proof';
-  import { DURATIONS, downloadIcs, durationLabel, inviteText, mailtoLink, type MeetingInvite } from '$lib/invites';
+  import { downloadIcs, inviteText, mailtoLink, type MeetingInvite } from '$lib/invites';
+  import type { When } from '$lib/when';
+  import WhenPicker from '$lib/ui/WhenPicker.svelte';
   import InviteForm from './InviteForm.svelte';
   import {
     apiUrl,
@@ -41,9 +43,8 @@
   let roomPassword = '';
   let approval = true;
   let expiresInHours = 24;
-  /** Optional schedule (datetime-local value) and length, for calendar/email invites. */
-  let scheduleAt = '';
-  let durationMinutes = 60;
+  /** Optional schedule and length, for calendar/email invites. */
+  let when: When = { startsAt: null, durationMinutes: 60 };
   let creating = false;
   let createError = '';
 
@@ -200,7 +201,8 @@
     creating = true;
     try {
       // A scheduled meeting's invite must stay valid until the meeting is over (plus some slack).
-      const startsAt = scheduleAt ? new Date(scheduleAt).getTime() : undefined;
+      const startsAt = when.startsAt ?? undefined;
+      const durationMinutes = when.durationMinutes;
       let hours = expiresInHours;
       if (startsAt && Number.isFinite(startsAt)) {
         const needed = Math.ceil((startsAt + durationMinutes * 60_000 + 2 * 3600_000 - Date.now()) / 3600_000);
@@ -236,7 +238,7 @@
       created = { room, password: roomPassword };
       label = '';
       roomPassword = '';
-      scheduleAt = '';
+      when = { ...when, startsAt: null };
     } finally {
       creating = false;
     }
@@ -422,22 +424,9 @@
           <input type="checkbox" bind:checked={approval} />
           <span>Guests wait for my approval</span>
         </label>
-        <div class="schedule">
-          <div>
-            <label class="field-label" for="when">When (optional, for calendar invites)</label>
-            <input id="when" class="input" type="datetime-local" bind:value={scheduleAt} />
-          </div>
-          {#if scheduleAt}
-            <div>
-              <label class="field-label" for="duration">Length</label>
-              <select id="duration" class="input" bind:value={durationMinutes}>
-                {#each DURATIONS as d}<option value={d}>{durationLabel(d)}</option>{/each}
-              </select>
-            </div>
-          {/if}
-        </div>
+        <WhenPicker id="when" legend="When (optional, for calendar invites)" bind:value={when} />
         <label class="select-row">
-          <span>Invite link expires after{scheduleAt ? ' (at least until the meeting ends)' : ''}</span>
+          <span>Invite link expires after{when.startsAt != null ? ' (at least until the meeting ends)' : ''}</span>
           <select class="input" bind:value={expiresInHours}>
             {#each EXPIRY_OPTIONS as opt}
               <option value={opt.hours}>{opt.label}</option>
@@ -796,18 +785,6 @@
     .select-row .input {
       margin-left: 0;
       width: 100%;
-    }
-  }
-  .schedule {
-    display: grid;
-    grid-template-columns: 1fr auto;
-    gap: var(--space-3);
-    align-items: end;
-  }
-
-  @media (max-width: 480px) {
-    .schedule {
-      grid-template-columns: 1fr;
     }
   }
 </style>

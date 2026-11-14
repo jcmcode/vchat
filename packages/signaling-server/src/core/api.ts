@@ -9,7 +9,7 @@
 //   POST /api/admin/login/verify        -> sets owner session cookie        email sign-in only
 //   POST /api/admin/logout
 //   POST /api/admin/rooms               -> new room + invite/host links     owner only
-//   POST /api/admin/rooms/email-invite  -> emails personal invites (+ codes, calendar file)  owner only, Resend
+//   POST /api/admin/rooms/email-invite  -> emails personal invites (+ codes, message, calendar file)  owner only, Resend
 //   POST /api/invite/check              -> checks an invite's passcode/room password before joining  public
 //
 // Modes:
@@ -22,6 +22,7 @@
 import { verifyAccessJwt } from './access.js';
 import {
   buildInviteIcs,
+  cleanInviteMessage,
   inviteEmail,
   isCode,
   isValidSender,
@@ -303,8 +304,8 @@ const INVITE_SEND_SPACING_MS = 550;
 const INVITE_SEND_BUDGET_MS = 25_000;
 /** Recipients per email-invite request (each one is a separate email and counts against the cap). */
 const MAX_INVITE_RECIPIENTS = 20;
-/** Room for 20 addresses plus the invite token, key and schedule (Node reads at most 16 KB). */
-const INVITE_BODY_MAX_BYTES = 12 * 1024;
+/** Room for 20 addresses plus the invite token, key, schedule and message (Node reads at most 16 KB). */
+const INVITE_BODY_MAX_BYTES = 14 * 1024;
 const DAY_MS = 24 * 60 * 60 * 1000;
 
 export interface InviteSchedule {
@@ -798,6 +799,8 @@ export async function handleApi(request: Request, env: ServerEnv, opts: ApiOptio
 
       // Without a passcode the host must admit each guest from the lobby.
       const passcode = body.passcode !== false;
+      // The host's optional note, shown in the email and calendar invite. Never logged.
+      const message = cleanInviteMessage(body.message);
       const now = Date.now();
       const warnings: string[] = [];
       let schedule: InviteSchedule | null = null;
@@ -858,7 +861,8 @@ export async function handleApi(request: Request, env: ServerEnv, opts: ApiOptio
               durationMinutes: schedule.durationMinutes,
               summary: p.label || 'Video call',
               link,
-              passcode,
+              ...(code ? { passcode: code } : {}),
+              ...(message ? { message } : {}),
               organizer,
               attendee: email,
             })
@@ -867,7 +871,14 @@ export async function handleApi(request: Request, env: ServerEnv, opts: ApiOptio
         const stamp = Date.now();
         invitesSent.push(stamp);
         try {
-          await sendEmail(env, inviteEmail(email, { link, code, label: p.label, exp: p.exp, ...(schedule ? { schedule, ics } : {}) }));
+          await sendEmail(env, inviteEmail(email, {
+              link,
+              code,
+              label: p.label,
+              exp: p.exp,
+              ...(message ? { message } : {}),
+              ...(schedule ? { schedule, ics } : {}),
+            }));
           sent.push(email);
         } catch (err) {
           const at = invitesSent.lastIndexOf(stamp);

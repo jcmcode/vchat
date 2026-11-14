@@ -18,6 +18,7 @@ import {
   getIceServers,
   handleApi,
   hashRoomPassword,
+  cleanInviteMessage,
   icsFold,
   icsText,
   ipKey,
@@ -1027,7 +1028,7 @@ test('ics: escaping and UTF-8-safe folding at 75 octets', () => {
   assert.equal(folded.replace(/\r\n /g, ''), long);
 });
 
-test('email invite: a schedule adds a When line and a valid METHOD:REQUEST invite.ics without the code', async () => {
+test('email invite: a schedule adds a When line and a valid METHOD:REQUEST invite.ics with the passcode', async () => {
   const cookie = await ownerCookie('25.0.0.4');
   const label = 'Planning, review; budget \\ next — café ☕ ünïcödé ñ';
   const room = await newRoom(cookie, { label, expiresInHours: 24 * 7 });
@@ -1083,7 +1084,7 @@ test('email invite: a schedule adds a When line and a valid METHOD:REQUEST invit
   assert.equal(prop('DTSTART'), `DTSTART:${iso(startsAt)}`);
   assert.equal(prop('DTEND'), `DTEND:${iso(startsAt + 90 * 60_000)}`);
   assert.equal(prop('SUMMARY'), 'SUMMARY:Planning\\, review\\; budget \\\\ next — café ☕ ünïcödé ñ');
-  assert.equal(prop('DESCRIPTION'), `DESCRIPTION:Join: ${link}\\nYour passcode is in the invitation email.`);
+  assert.equal(prop('DESCRIPTION'), `DESCRIPTION:Join: ${link}\\nPasscode: ${code}`);
   assert.equal(prop('URL'), `URL:${link}`);
   assert.equal(prop('LOCATION'), `LOCATION:${link}`);
   assert.equal(prop('ORGANIZER'), 'ORGANIZER;CN=vchat:mailto:invites@example.com');
@@ -1091,10 +1092,11 @@ test('email invite: a schedule adds a When line and a valid METHOD:REQUEST invit
   assert.ok(lines.includes('STATUS:CONFIRMED') && lines.includes('SEQUENCE:0'));
   assert.ok(lines.includes('BEGIN:VALARM') && lines.includes('ACTION:DISPLAY') && lines.includes('TRIGGER:-PT10M'));
 
-  // The code is nowhere in the calendar file (ignoring the link and timestamps, which hold random digits).
+  // The guest's own code is in the calendar file, in the description only, labelled as the passcode
+  // (ignoring the link and timestamps, which hold random digits).
   const scrubbed = lines.filter((l) => !/^(UID|DTSTAMP|DTSTART|DTEND):/.test(l)).join('\n').split(link).join('');
-  assert.ok(!scrubbed.includes(code), 'no code in the .ics');
-  assert.ok(!/passcode is \d/.test(ics));
+  assert.equal(scrubbed.split(code).length, 2, 'the code appears exactly once');
+  assert.ok(prop('DESCRIPTION')!.endsWith(`\\nPasscode: ${code}`));
 });
 
 test('email invite: schedule warnings (ignored when invalid, noted when the meeting outlasts the invite)', async () => {
@@ -1120,9 +1122,12 @@ test('email invite: schedule warnings (ignored when invalid, noted when the meet
   assert.deepEqual(late.out.sent, ['late@example.com']);
   assert.deepEqual(late.out.warnings, ['meeting-ends-after-invite-expires']);
   const ics = Buffer.from(late.calls[0].body.attachments[0].content, 'base64').toString('utf8').replace(/\r\n /g, '');
-  // No passcode: the description doesn't mention one.
+  // No passcode: the description doesn't mention one, and no code is anywhere in the email or file.
   assert.match(ics, /\r\nDESCRIPTION:Join: https:\/\/call\.example\.com\/room\/[^\r]+\r\n/);
-  assert.ok(!ics.includes('passcode'));
+  assert.ok(!/passcode/i.test(ics));
+  const description = ics.split('\r\n').find((l) => l.startsWith('DESCRIPTION:'))!;
+  assert.ok(!/\b\d{6}\b/.test(description.replace(/https:\S+/g, '')));
+  assert.ok(!/\b\d{6}\b/.test(late.calls[0].body.text.replace(/https:\S+/g, '')), 'no code in the email');
 });
 
 test('email invite: schedule validation bounds', async () => {
@@ -1146,6 +1151,102 @@ test('email invite: schedule validation bounds', async () => {
     [],
   ]) {
     assert.equal(isValidSchedule(bad, t), false, JSON.stringify(bad));
+  }
+});
+
+test('invite message: cleaned (invisible characters, blank lines), trimmed and cut to 500 code points', () => {
+  assert.equal(cleanInviteMessage(undefined), '');
+  assert.equal(cleanInviteMessage(42), '');
+  assert.equal(cleanInviteMessage('   \n\n  '), '');
+  // Control, bidi-override and zero-width characters go; newlines stay (CRLF/CR become LF).
+  assert.equal(cleanInviteMessage('  Hi‮ there​!\u0007\r\nLine\ttwo  \rthree '), 'Hi there!\nLine two\nthree');
+  // Runs of blank lines collapse to one (whitespace-only lines count as blank).
+  assert.equal(cleanInviteMessage('a\n\n\n\nb\n \n\t\n\nc\n\nd'), 'a\n\nb\n\nc\n\nd');
+  // 500 code points, never splitting an emoji; longer messages are cut, not refused.
+  const cut = cleanInviteMessage('😀'.repeat(600));
+  assert.equal(cut, '😀'.repeat(500));
+  assert.equal(cleanInviteMessage('x'.repeat(499) + ' ' + 'y'.repeat(10)), 'x'.repeat(499));
+  assert.equal(cleanInviteMessage('é'.repeat(500)), 'é'.repeat(500));
+});
+
+test('email invite: the host message is in the email (escaped) and the calendar invite (RFC 5545), never logged', async () => {
+  const cookie = await ownerCookie('25.0.0.6');
+  const room = await newRoom(cookie, { label: 'Sync', expiresInHours: 24 * 7 });
+  const startsAt = Math.ceil((Date.now() + 2 * 24 * 3600_000) / 3600_000) * 3600_000;
+  const message = `  Agenda <b>&amp; "notes"</b>; budget, Q3 \\ café‮\n\n\n\nBring 'ideas' ☕  `;
+  const logged: string[] = [];
+  const saved = { log: console.log, error: console.error, warn: console.warn, info: console.info };
+  for (const k of ['log', 'error', 'warn', 'info'] as const) {
+    console[k] = (...args: unknown[]) => void logged.push(args.map(String).join(' '));
+  }
+  let result: Awaited<ReturnType<typeof sendInvites>>;
+  let failing: Response;
+  try {
+    result = await sendInvites(cookie, {
+      roomId: room.roomId,
+      inviteToken: room.inviteToken,
+      emails: ['msg@example.com'],
+      message,
+      schedule: { startsAt, durationMinutes: 30 },
+    });
+    // A failed send logs an error: the message is not in it.
+    const resend = stubResend(true);
+    try {
+      const body = { roomId: room.roomId, inviteToken: room.inviteToken, emails: ['f@example.com'], message };
+      failing = (await handleApi(post('/api/admin/rooms/email-invite', body, cookie), inviteEnv))!;
+    } finally {
+      resend.restore();
+    }
+  } finally {
+    Object.assign(console, saved);
+  }
+  assert.equal(result.status, 200);
+  assert.equal(((await failing.json()) as InviteResult).failed[0].reason, 'send-failed');
+  assert.ok(logged.length > 0);
+  for (const line of logged) assert.ok(!line.includes('Agenda') && !line.includes('ideas'), line);
+
+  const clean = `Agenda <b>&amp; "notes"</b>; budget, Q3 \\ café\n\nBring 'ideas' ☕`;
+  const mail = result.calls[0].body;
+  // Plain text: under the "You're invited" line, labelled, as written.
+  assert.ok(mail.text.startsWith(`You're invited to Sync.\n\nMessage from the host:\n${clean}\n\nWhen: `), mail.text);
+  // HTML: escaped, newlines as <br>, between the invite line and the join button.
+  const html = `Agenda &lt;b&gt;&amp;amp; &quot;notes&quot;&lt;/b&gt;; budget, Q3 \\ café<br><br>Bring &#39;ideas&#39; ☕`;
+  assert.ok(mail.html.includes(html), mail.html);
+  assert.ok(!mail.html.includes('<b>') && !mail.html.includes('‮'));
+  assert.ok(mail.html.indexOf('Message from the host:') > mail.html.indexOf("You're invited to"));
+  assert.ok(mail.html.indexOf('Message from the host:') < mail.html.indexOf('Join the call'));
+
+  // Calendar: above the Join line, RFC 5545 escaped and folded, then the passcode.
+  const code = codeIn(mail.text.split('Your code:')[1]);
+  const link = linkIn(mail.text);
+  const ics = Buffer.from(mail.attachments[0].content, 'base64').toString('utf8');
+  for (const line of ics.slice(0, -2).split('\r\n')) assert.ok(Buffer.byteLength(line, 'utf8') <= 75);
+  const description = ics.replace(/\r\n /g, '').split('\r\n').find((l) => l.startsWith('DESCRIPTION:'));
+  assert.equal(
+    description,
+    `DESCRIPTION:Agenda <b>&amp\\; "notes"</b>\\; budget\\, Q3 \\\\ café\\n\\nBring 'ideas' ☕\\n\\nJoin: ${link}\\nPasscode: ${code}`
+  );
+});
+
+test('email invite: no message given, or only whitespace, means no message anywhere', async () => {
+  const cookie = await ownerCookie('25.0.0.7');
+  const room = await newRoom(cookie, { label: 'Plain', expiresInHours: 24 * 7 });
+  const schedule = { startsAt: Date.now() + 2 * 24 * 3600_000, durationMinutes: 30 };
+  for (const extra of [{}, { message: ' \n​\n ' }, { message: 42 }]) {
+    const { status, calls } = await sendInvites(cookie, {
+      roomId: room.roomId,
+      inviteToken: room.inviteToken,
+      emails: ['n@example.com'],
+      passcode: false,
+      schedule,
+      ...extra,
+    });
+    assert.equal(status, 200);
+    const mail = calls[0].body;
+    assert.ok(!mail.text.includes('Message from the host') && !mail.html.includes('Message from the host'), JSON.stringify(extra));
+    assert.ok(mail.text.startsWith("You're invited to Plain.\n\nWhen: "));
+    const ics = Buffer.from(mail.attachments[0].content, 'base64').toString('utf8').replace(/\r\n /g, '');
+    assert.match(ics, /\r\nDESCRIPTION:Join: https:\/\/call\.example\.com\/room\/[^\r\\]+\r\n/);
   }
 });
 

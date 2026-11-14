@@ -1,6 +1,8 @@
 // Email sign-in codes and invite emails, sent through Resend (https://resend.com).
 // Works on Node 20+ and Cloudflare Workers (fetch + WebCrypto only). Nothing is stored, and no
-// address, code or token is ever logged.
+// address, code, token or invite message is ever logged.
+
+import { sliceCodePoints, stripInvisible } from './protocol.js';
 
 const EMAIL_RE = /^[^\s@<>()[\]\\,;:"]+@[^\s@<>()[\]\\,;:"]+\.[^\s@<>()[\]\\,;:"]+$/;
 const RESEND_URL = 'https://api.resend.com/emails';
@@ -30,6 +32,24 @@ export function randomCode(): string {
     crypto.getRandomValues(buf);
     if (buf[0] < limit) return String(buf[0] % 1_000_000).padStart(6, '0');
   }
+}
+
+/** Longest invite message, in code points (longer ones are cut, not refused). */
+export const MAX_INVITE_MESSAGE = 500;
+
+/**
+ * The host's optional note for an invite: control, bidi and zero-width characters removed (tabs
+ * become spaces), newlines kept but at most one blank line in a row, trimmed, and cut to
+ * MAX_INVITE_MESSAGE code points. Returns '' for anything that isn't a string.
+ */
+export function cleanInviteMessage(value: unknown): string {
+  if (typeof value !== 'string') return '';
+  const lines = value
+    .replace(/\r\n?/g, '\n')
+    .split('\n')
+    .map((line) => stripInvisible(line.replace(/\t/g, ' ')).trimEnd());
+  const joined = lines.join('\n').replace(/\n{3,}/g, '\n\n').trim();
+  return sliceCodePoints(joined, MAX_INVITE_MESSAGE).trim();
 }
 
 export function isCode(value: unknown): value is string {
@@ -115,8 +135,15 @@ export interface InviteEmailOptions {
   exp: number;
   /** Scheduled meeting: shown as a "When:" line. */
   schedule?: { startsAt: number; durationMinutes: number };
-  /** Calendar file to attach as invite.ics (scheduled invites). Must never contain the code. */
+  /** Calendar file to attach as invite.ics (scheduled invites). */
   ics?: string;
+  /** A short note from the host, already cleaned (see cleanInviteMessage). May hold newlines. */
+  message?: string;
+}
+
+/** Escaped HTML with line breaks kept as <br>. */
+function htmlLines(value: string): string {
+  return value.split('\n').map(escapeHtml).join('<br>');
 }
 
 export function inviteEmail(to: string, opts: InviteEmailOptions): EmailMessage {
@@ -127,9 +154,11 @@ export function inviteEmail(to: string, opts: InviteEmailOptions): EmailMessage 
     ? 'Open the link, enter the code, and the host will let you in.'
     : 'Open the link, enter your name, and the host will let you in.';
   const attached = opts.ics ? 'A calendar invite is attached.' : null;
+  const message = opts.message?.trim() || null;
   const text = [
     `You're invited to ${what}.`,
     '',
+    ...(message ? ['Message from the host:', message, ''] : []),
     ...(when ? [`When: ${when}`, ''] : []),
     `Join the call: ${opts.link}`,
     '',
@@ -142,6 +171,10 @@ export function inviteEmail(to: string, opts: InviteEmailOptions): EmailMessage 
   ].join('\n');
   const html = layout(
     `<p>You're invited to <strong>${escapeHtml(what)}</strong>.</p>` +
+      (message
+        ? `<p style="margin:0 0 4px;color:#666;font-size:14px">Message from the host:</p>` +
+          `<p style="margin:0 0 16px;padding:12px 14px;background:#f3f3f3;border-radius:8px">${htmlLines(message)}</p>`
+        : '') +
       (when ? `<p><strong>When:</strong> ${escapeHtml(when)}</p>` : '') +
       `<p><a href="${escapeHtml(opts.link)}" style="display:inline-block;background:#111;color:#fff;text-decoration:none;padding:12px 20px;border-radius:8px;font-weight:600">Join the call</a></p>` +
       (opts.code ? `<p>Your code:</p>${codeBlock(opts.code)}` : '') +
@@ -223,15 +256,21 @@ export interface CalendarInvite {
   durationMinutes: number;
   summary: string;
   link: string;
-  /** The guest has a passcode. It is never put in the calendar file: calendars sync widely. */
-  passcode: boolean;
+  /**
+   * The guest's 6-digit code, if the invite has one. It goes in the description: the owner accepts
+   * that calendar apps sync the event to their providers.
+   */
+  passcode?: string;
+  /** A short note from the host, already cleaned. Shown above the join line. */
+  message?: string;
   organizer: { name?: string; address: string };
   attendee: string;
 }
 
-/** A METHOD:REQUEST calendar invite for one attendee. Holds the link, never the code. */
+/** A METHOD:REQUEST calendar invite for one attendee: the link, and the passcode if there is one. */
 export function buildInviteIcs(inv: CalendarInvite): string {
-  const description = `Join: ${inv.link}` + (inv.passcode ? '\nYour passcode is in the invitation email.' : '');
+  const message = inv.message?.trim();
+  const description = [...(message ? [message, ''] : []), `Join: ${inv.link}`, ...(inv.passcode ? [`Passcode: ${inv.passcode}`] : [])].join('\n');
   const organizerCn = inv.organizer.name ? `;CN=${icsParam(inv.organizer.name)}` : '';
   const lines = [
     'BEGIN:VCALENDAR',
