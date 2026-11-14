@@ -1,25 +1,30 @@
-// Calls the host just ended, remembered briefly so a participant who was offline at that moment
-// (and reconnects automatically) is told the call is over, instead of silently re-opening it.
+// Short-lived memory of who was in a room, kept after the room's own state is gone:
 //
-// Only the identities that were in the ended call are remembered: peer id + truncated hash of
-// their tab secret, never names or addresses. Anyone else entering is treated as if the room
-// never existed. Memory only (per process, or per isolate on Cloudflare), forgotten after
-// ENDED_GRACE_MS, and capped: when full, the oldest entries are dropped first.
+//  - `endedCalls`: calls the host just ended, so a participant who was offline at that moment (and
+//    reconnects automatically) is told the call is over instead of silently re-opening it.
+//  - `lockedRooms`: rooms that emptied while locked (an owner alone whose connection blipped), so
+//    the room comes back locked: only the people who were in it get back in meanwhile.
+//
+// Only identities are remembered: peer id + truncated hash of their tab secret, never names or
+// addresses. Memory only (per process, or per isolate on Cloudflare), forgotten after the grace
+// period, and capped: when full, the oldest entries are dropped first.
 
 /** How long an ended call's identities are remembered. */
 export const ENDED_GRACE_MS = 60 * 1000;
-const MAX_ENDED_CALLS = 5_000;
+/** How long a room that emptied while locked stays locked. */
+export const LOCK_GRACE_MS = 60 * 1000;
+const MAX_CALLS = 5_000;
 /** Bound on identities across all entries (an entry holds at most ~65: admitted + waiting). */
-const MAX_ENDED_IDENTITIES = 50_000;
+const MAX_IDENTITIES = 50_000;
 
-interface EndedCall {
+interface Remembered {
   at: number;
   ids: Set<string>;
 }
 
 export interface EndedIdentity {
   peerId: string;
-  /** Truncated sha256 of the tab secret, as stored by Room. */
+  /** Truncated sha256 of the tab secret, as stored by Room ('' if the peer sent none: skipped). */
   secretHash: string;
 }
 
@@ -27,32 +32,36 @@ const key = (peerId: string, secretHash: string) => `${peerId}\n${secretHash}`;
 
 export class EndedCalls {
   /** Insertion order is age order (oldest first). */
-  private readonly calls = new Map<string, EndedCall>();
+  private readonly calls = new Map<string, Remembered>();
   private identities = 0;
 
   constructor(
-    private readonly maxCalls = MAX_ENDED_CALLS,
-    private readonly maxIdentities = MAX_ENDED_IDENTITIES,
+    private readonly maxCalls = MAX_CALLS,
+    private readonly maxIdentities = MAX_IDENTITIES,
     private readonly ttlMs = ENDED_GRACE_MS
   ) {}
 
-  /** Remember who was in a call that just ended (replacing anything remembered for that room). */
+  /**
+   * Remember these identities for `roomId`. Anything still remembered for the room is kept too (a
+   * second call ended a moment later doesn't erase the first one's), and the clock restarts.
+   */
   mark(roomId: string, who: Iterable<EndedIdentity>, now = Date.now()): void {
+    const previous = this.calls.get(roomId);
+    const ids = previous && now - previous.at < this.ttlMs ? new Set(previous.ids) : new Set<string>();
     this.forget(roomId);
-    const ids = new Set<string>();
     for (const { peerId, secretHash } of who) if (secretHash) ids.add(key(peerId, secretHash));
     if (ids.size === 0) return;
     this.calls.set(roomId, { at: now, ids });
     this.identities += ids.size;
     this.sweep(now);
-    // Full: drop the oldest first, so a burst of new entries never stops new calls being remembered.
+    // Full: drop the oldest first, so a burst of new entries never stops new ones being remembered.
     for (const [id] of this.calls) {
       if (this.calls.size <= this.maxCalls && this.identities <= this.maxIdentities) break;
       this.forget(id);
     }
   }
 
-  /** Was this identity (peer id + secret hash) in `roomId`'s call when it ended, recently? */
+  /** Is this identity (peer id + secret hash) remembered for `roomId`? */
   wasIn(roomId: string, peerId: string, secretHash: string, now = Date.now()): boolean {
     const call = this.calls.get(roomId);
     if (!call) return false;
@@ -81,7 +90,7 @@ export class EndedCalls {
     return this.calls.size;
   }
 
-  private forget(roomId: string): void {
+  forget(roomId: string): void {
     const call = this.calls.get(roomId);
     if (!call) return;
     this.identities -= call.ids.size;
@@ -91,3 +100,5 @@ export class EndedCalls {
 
 /** Shared by every Room in this process (or Cloudflare isolate). */
 export const endedCalls = new EndedCalls();
+/** Rooms that emptied while locked (same process/isolate scope). */
+export const lockedRooms = new EndedCalls(MAX_CALLS, MAX_IDENTITIES, LOCK_GRACE_MS);

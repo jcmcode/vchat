@@ -35,6 +35,9 @@
     roomLocked,
     callEnded,
     roomJoined,
+    reconnectPrompt,
+    resumeConnection,
+    clearRoomError,
     isTransientRoomError,
     type PeerConnection,
   } from '$lib/webrtc/mesh';
@@ -410,6 +413,8 @@
 
   onMount(async () => {
     if (!browser) return;
+    // Nothing from a previous room in this tab (an error or "call ended") may cover this one.
+    clearRoomError();
 
     // An invite link carries its token after "#invite=". Keep it for this tab only and take it out
     // of the address bar so it isn't shown, bookmarked or kept in history.
@@ -583,6 +588,19 @@
     leaveRoom();
     stopMedia();
     forgetRoom(roomId); // pressing Leave forgets this call's chat, password and invite in this tab
+    goto('/');
+  }
+
+  // The room an error on screen belongs to: its "Back to home" only ever forgets that room.
+  let erroredRoomId = '';
+  $: if (!$roomError) erroredRoomId = '';
+  else if (!erroredRoomId) erroredRoomId = roomId;
+
+  function handleErrorBack() {
+    const errored = erroredRoomId;
+    leaveRoom();
+    stopMedia();
+    if (errored && errored === roomId) forgetRoom(errored);
     goto('/');
   }
 
@@ -833,7 +851,7 @@
       <h2 id="error-title">{$callEnded ? 'Call ended' : "Couldn't join"}</h2>
       <p class="dialog-sub">{$roomError}</p>
       <div class="dialog-actions">
-        <button class="btn primary" on:click={handleLeave}>Back to home</button>
+        <button class="btn primary" on:click={handleErrorBack}>Back to home</button>
       </div>
     </div>
   </div>
@@ -974,6 +992,14 @@
       <div class="banner warning" role="status">
         <span class="reconnect-spinner"></span>
         Connection lost. Reconnecting...
+      </div>
+    {/if}
+
+    {#if $reconnectPrompt}
+      <div class="banner warning" role="alert">
+        <span>You were offline for over a minute, so you weren't put back in the call automatically. It may have ended or changed.</span>
+        <button class="banner-btn" on:click={resumeConnection}>Reconnect</button>
+        <button class="banner-btn" on:click={handleLeave}>Leave</button>
       </div>
     {/if}
 

@@ -16,7 +16,10 @@ import {
   Room,
   WS_PROTOCOL,
   authorizeJoin,
+  CLOSE_UNAVAILABLE,
   endedCalls,
+  lockedRooms,
+  roomCreations,
   socketRole,
   handleApi,
   ipKey,
@@ -297,11 +300,12 @@ function reapIfEmpty(roomId: string): void {
 
 /**
  * The host ended the call: members were told and closed by the Room. Close the room's other
- * sockets too (never entered, at the password prompt, denied…), without saying why.
+ * sockets too (never entered, at the password prompt, denied…) with a generic "no longer
+ * available" code that clients don't retry after.
  */
 function closeRoomSockets(roomId: string): void {
   for (const client of wss.clients) {
-    if (sockets.get(client)?.roomId === roomId && client.readyState === client.OPEN) client.close(1000, 'Closing');
+    if (sockets.get(client)?.roomId === roomId && client.readyState === client.OPEN) client.close(CLOSE_UNAVAILABLE, 'Unavailable');
   }
 }
 
@@ -446,6 +450,8 @@ const housekeeping = setInterval(() => {
     peers += room.peers().length;
   }
   endedCalls.sweep();
+  lockedRooms.sweep();
+  roomCreations.sweep();
   sweepApiState();
   if (DEBUG_LOGS && ++ticks % 12 === 0 && rooms.size > 0) {
     console.log(`[stats] ${rooms.size} room(s), ${peers} peer(s)`);

@@ -2,7 +2,7 @@
   // The host's menu: lock/unlock the call, opt in to "someone's waiting" notifications, and end the
   // call for everyone (with a confirm step). The server enforces who may do this; this is only UI.
   import { onDestroy } from 'svelte';
-  import { setRoomLocked, endCallForEveryone, hostActionError } from '$lib/webrtc/mesh';
+  import { setRoomLocked, endCallForEveryone, hostActionError, HOST_ACTION_TIMEOUT_MS } from '$lib/webrtc/mesh';
   import {
     waitingAlertsEnabled,
     enableWaitingAlerts,
@@ -18,7 +18,7 @@
   export let connected = true;
 
   /** How long to wait for the server to confirm a lock change or end the call. */
-  const CONFIRM_TIMEOUT_MS = 6000;
+  const CONFIRM_TIMEOUT_MS = HOST_ACTION_TIMEOUT_MS;
   const NOT_CONNECTED = "You're not connected right now. Try again once you're back in the call.";
   const NO_ANSWER = "The server didn't confirm. Check your connection and try again.";
 

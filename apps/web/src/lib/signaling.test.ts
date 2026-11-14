@@ -2,7 +2,7 @@
 // trigger a reconnect, a re-entry, or the "room emptied, re-create it" path.
 import { test, mock, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
-import { SignalingClient, type SignalingEvent } from './signaling/client.js';
+import { LONG_OFFLINE_MS, SignalingClient, type SignalingEvent } from './signaling/client.js';
 
 class FakeSocket {
   static readonly OPEN = 1;
@@ -65,20 +65,61 @@ function start(extra: Record<string, unknown> = {}) {
 beforeEach(() => {
   FakeSocket.instances = [];
   (globalThis as unknown as { WebSocket: unknown }).WebSocket = FakeSocket;
-  mock.timers.enable({ apis: ['setTimeout', 'setInterval'] });
+  mock.timers.enable({ apis: ['setTimeout', 'setInterval', 'Date'], now: 1_000_000 });
 });
 afterEach(() => {
   mock.timers.reset();
 });
 
-test('client: an ordinary drop reconnects and re-enters (baseline)', () => {
+test('client: a short drop reconnects and re-enters on its own', () => {
   const { ws } = start();
   assert.deepEqual(ws.types(), ['join']);
+  ws.receive({ type: 'room-peers', peers: [], roomId: 'abc' });
+  mock.timers.tick(30_000);
   ws.drop(1006);
   mock.timers.tick(1000);
   assert.equal(FakeSocket.instances.length, 2);
   FakeSocket.instances[1].accept();
   assert.deepEqual(FakeSocket.instances[1].types(), ['join']);
+});
+
+test('client: after more than a minute out of touch it asks before going back in (camera and mic are live)', () => {
+  const { client, ws, of } = start();
+  ws.receive({ type: 'room-peers', peers: [], roomId: 'abc' });
+  // The laptop sleeps: nothing from the server for over a minute, then the socket is found dead.
+  mock.timers.tick(LONG_OFFLINE_MS + 5_000);
+  ws.drop(1006);
+  mock.timers.tick(1000);
+  const ws2 = FakeSocket.instances[1];
+  ws2.accept();
+  assert.deepEqual(ws2.types(), [], 'not re-entered automatically');
+  assert.equal(of('reconnect-needed').length, 1);
+
+  // Still waiting for the user across another reconnect (e.g. the idle socket is closed).
+  ws2.receive({ type: 'pong' });
+  ws2.drop(4001);
+  mock.timers.tick(1000);
+  const ws3 = FakeSocket.instances[2];
+  ws3.accept();
+  assert.deepEqual(ws3.types(), []);
+  assert.equal(of('reconnect-needed').length, 2);
+
+  client.resumeAfterLongOffline();
+  assert.deepEqual(ws3.types(), ['join']);
+  // Back to normal afterwards: a short drop re-enters on its own again.
+  ws3.receive({ type: 'room-peers', peers: [], roomId: 'abc' });
+  ws3.drop(1006);
+  mock.timers.tick(1000);
+  FakeSocket.instances[3].accept();
+  assert.deepEqual(FakeSocket.instances[3].types(), ['join']);
+});
+
+test('client: 4006 (call no longer available) is reported and never retried', () => {
+  const { ws, of } = start({ token: 't' });
+  ws.drop(4006);
+  mock.timers.tick(60_000);
+  assert.equal(FakeSocket.instances.length, 1);
+  assert.deepEqual(of('error').map((e) => e.message), ['Call no longer available']);
 });
 
 test('client: room-ended stops everything — no reconnect, re-entry or re-creation, whatever close follows', () => {

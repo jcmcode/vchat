@@ -435,6 +435,8 @@ export interface JoinGrant {
   label?: string;
   /** Emailed invites: the address it was sent to (shown to the host in admission-request). */
   email?: string;
+  /** Keyed hash of `email`: what room metadata keeps instead of the address. */
+  emailKey?: string;
 }
 
 export type JoinDecision =
@@ -476,9 +478,10 @@ export async function authorizeJoin(
     passwordAttempts.refund(msg.roomId, opts.clientId);
   }
   const email = p.role === 'guest' ? normalizeEmail(p.to) : null;
+  const emailKey = email ? (await hmacBase64Url(env.SECRET_KEY!, `room-email:${email}`)).slice(0, 22) : null;
   return {
     ok: true,
-    grant: { role: p.role, approval: p.role === 'guest' && !!p.approval, label: p.label, ...(email ? { email } : {}) },
+    grant: { role: p.role, approval: p.role === 'guest' && !!p.approval, label: p.label, ...(email && emailKey ? { email, emailKey } : {}) },
   };
 }
 

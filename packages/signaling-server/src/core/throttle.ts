@@ -233,3 +233,8 @@ export const PASSWORD_MAX_PER_ROOM = 200;
 
 /** Shared room-password throttle (private-mode invites and open-mode room passwords). */
 export const passwordAttempts = new PasswordThrottle(PASSWORD_WINDOW_MS, PASSWORD_MAX_PER_CLIENT, PASSWORD_MAX_PER_ROOM);
+
+/** Open mode: rooms one client (keyed hash of its address) may create per window. */
+export const ROOM_CREATE_WINDOW_MS = 10 * 60 * 1000;
+export const ROOM_CREATE_MAX_PER_CLIENT = 30;
+export const roomCreations = new AttemptCounter(ROOM_CREATE_WINDOW_MS);
