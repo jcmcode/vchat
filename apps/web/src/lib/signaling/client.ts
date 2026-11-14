@@ -29,14 +29,25 @@ interface RoomIntent {
   displayName: string;
   secret: string;
   password?: string;
+  /** Private instances: signed invite or host token. */
+  token?: string;
   isCreator: boolean;
   /** Set once the server has let us into the room. */
   admitted?: boolean;
 }
 
 const PING_INTERVAL_MS = 25_000;
+/** Must match the server (core/api.ts). The token rides as a subprotocol so it never lands in URLs/logs. */
+const WS_PROTOCOL = 'vchat.v1';
+const WS_TOKEN_PREFIX = 'vchat.t.';
+/** After this many failed connection attempts in a row, tell the user (we keep retrying). */
+const FAILED_OPENS_BEFORE_ERROR = 4;
 /** Close code the server uses when a newer connection with the same peer id takes over. */
 const REPLACED_CLOSE_CODE = 4000;
+/** The host removed us from the room. */
+const REMOVED_CLOSE_CODE = 4002;
+/** The invite was refused (invalid, expired, or the server is misconfigured): retrying won't help. */
+const REFUSED_CLOSE_CODE = 4003;
 const PONG_TIMEOUT_MS = 10_000;
 
 export class SignalingClient {
@@ -46,6 +57,8 @@ export class SignalingClient {
   private pingTimer: ReturnType<typeof setInterval> | null = null;
   private pongTimer: ReturnType<typeof setTimeout> | null = null;
   private reconnectAttempts = 0;
+  private failedOpens = 0;
+  private opened = false;
   private shouldReconnect = true;
   private intent: RoomIntent | null = null;
 
@@ -53,10 +66,14 @@ export class SignalingClient {
 
   connect(): void {
     this.shouldReconnect = true;
-    const ws = new WebSocket(this.url);
+    const token = this.intent?.token;
+    const ws = new WebSocket(this.url, token ? [WS_PROTOCOL, WS_TOKEN_PREFIX + token] : [WS_PROTOCOL]);
     this.ws = ws;
+    this.opened = false;
 
     ws.onopen = () => {
+      this.opened = true;
+      this.failedOpens = 0;
       this.reconnectAttempts = 0;
       this.startKeepalive();
       this.emit({ type: 'connected' });
@@ -77,8 +94,8 @@ export class SignalingClient {
         return;
       }
       if (msg.type === 'room-peers' && this.intent) this.intent.admitted = true;
-      // We were in this room but everyone left while we were disconnected — reopen it.
-      if (msg.type === 'error' && msg.message === 'Room does not exist' && this.intent?.admitted) {
+      // We were in this room but everyone left while we were disconnected — reopen it (open mode).
+      if (msg.type === 'error' && msg.message === 'Room does not exist' && this.intent?.admitted && !this.intent.token) {
         this.intent.isCreator = true;
         this.sendEnter(true);
         return;
@@ -97,10 +114,20 @@ export class SignalingClient {
       this.stopKeepalive();
       this.ws = null;
       this.emit({ type: 'disconnected' });
+      if (!this.opened && ++this.failedOpens === FAILED_OPENS_BEFORE_ERROR) {
+        this.emit({ type: 'error', message: 'Cannot connect' });
+      }
       if (event.code === REPLACED_CLOSE_CODE) {
         // The same identity connected from somewhere else; reconnecting would just kick it off.
         this.shouldReconnect = false;
         this.emit({ type: 'replaced' });
+        return;
+      }
+      if (event.code === REMOVED_CLOSE_CODE || event.code === REFUSED_CLOSE_CODE) {
+        // The server has already said why ('removed' or an error message); don't knock again.
+        this.shouldReconnect = false;
+        this.intent = null;
+        if (event.code === REMOVED_CLOSE_CODE) this.emit({ type: 'removed' });
         return;
       }
       this.scheduleReconnect();
@@ -155,14 +182,15 @@ export class SignalingClient {
 
   private sendEnter(asCreator: boolean): void {
     if (!this.intent) return;
-    const { roomId, peerId, displayName, secret, password } = this.intent;
+    const { roomId, peerId, displayName, secret, password, token } = this.intent;
     this.send({
-      type: asCreator ? 'create-room' : 'join',
+      type: asCreator && !token ? 'create-room' : 'join',
       roomId,
       peerId,
       displayName,
       secret,
       ...(password ? { password } : {}),
+      ...(token ? { token } : {}),
     });
   }
 
@@ -185,6 +213,11 @@ export class SignalingClient {
 
   denyPeer(peerId: string): void {
     this.send({ type: 'deny-peer', peerId });
+  }
+
+  /** Host only: remove someone from the call (they can't rejoin with the same identity). */
+  removePeer(peerId: string): void {
+    this.send({ type: 'remove-peer', peerId });
   }
 
   leaveRoom(): void {

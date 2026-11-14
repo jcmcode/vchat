@@ -1,0 +1,14 @@
+# Keep secrets and local build output out of the Docker build context (at any depth)
+**/.env
+**/.env.*
+!**/.env.example
+**/.dev.vars*
+**/turnserver.conf
+.git
+**/.wrangler
+**/node_modules
+**/.svelte-kit
+**/build
+**/dist
+**/.DS_Store
+apps/desktop/src-tauri/target

@@ -1,9 +1,13 @@
 // Wire protocol shared by every signaling backend (Node server, Cloudflare Durable Object).
 
 export const MAX_MESSAGE_SIZE = 64 * 1024; // 64KB
+/** Largest `signal` payload (serialized) the server relays. SDP for a 6-person call is far smaller. */
+export const MAX_SIGNAL_SIZE = 32 * 1024;
+/** Display names: at most this many code points. */
+export const MAX_NAME_LENGTH = 30;
 export const MAX_PEERS_PER_ROOM = 6;
 export const MAX_WAITING_PER_ROOM = 10;
-export const WAITING_TIMEOUT_MS = 2 * 60 * 1000; // 2 minutes
+export const WAITING_TIMEOUT_MS = 10 * 60 * 1000; // 10 minutes (guests may arrive before the host)
 
 /** Application-level keepalive. Backends must answer PING_MESSAGE with PONG_MESSAGE. */
 export const PING_MESSAGE = '{"type":"ping"}';
@@ -17,6 +21,8 @@ interface EnterRoomFields {
   password?: string;
   /** Per-tab secret that lets a peer rejoin after a dropped connection without re-admission. */
   secret?: string;
+  /** Private mode: signed invite (guest) or host token. */
+  token?: string;
 }
 
 export type ClientMessage =
@@ -26,7 +32,9 @@ export type ClientMessage =
   | { type: 'ping' }
   | { type: 'signal'; targetPeerId: string; signal: unknown }
   | { type: 'admit-peer'; peerId: string }
-  | { type: 'deny-peer'; peerId: string };
+  | { type: 'deny-peer'; peerId: string }
+  /** Host only: remove a participant (or waiting guest) for the rest of the room's life. */
+  | { type: 'remove-peer'; peerId: string };
 
 export type ParseResult = { ok: true; msg: ClientMessage } | { ok: false; error: string };
 
@@ -41,12 +49,59 @@ export function isValidPeerId(peerId: unknown): peerId is string {
   return typeof peerId === 'string' && PEER_ID_RE.test(peerId);
 }
 
+/** Remove control, zero-width, bidi-override and other invisible characters (used to fake or hide names). */
+export function stripInvisible(value: string): string {
+  return value.replace(
+    // eslint-disable-next-line no-control-regex, no-misleading-character-class
+    /[\u0000-\u001f\u007f-\u009f\u00ad\u034f\u061c\u115f\u1160\u17b4\u17b5\u180b-\u180e\u200b-\u200f\u2028-\u202e\u2060-\u206f\u3164\ufe00-\ufe0f\ufeff\uffa0\u{e0000}-\u{e007f}\u{e0100}-\u{e01ef}]/gu,
+    ''
+  );
+}
+
+/** Slice a string by code points (never splits a surrogate pair). */
+export function sliceCodePoints(value: string, end: number): string {
+  return Array.from(value).slice(0, end).join('');
+}
+
+export function codePointLength(value: string): number {
+  let n = 0;
+  for (const _ of value) n++;
+  return n;
+}
+
+// A small fold for look-alike letters from other scripts (not the full Unicode confusables table).
+const CONFUSABLES: Record<string, string> = {
+  а: 'a', в: 'b', е: 'e', ё: 'e', к: 'k', м: 'm', н: 'h', о: 'o', р: 'p', с: 'c', т: 't', у: 'y', х: 'x',
+  і: 'i', ї: 'i', ј: 'j', ѕ: 's', ԁ: 'd', ӏ: 'l', ԛ: 'q', ԝ: 'w', һ: 'h', ɡ: 'g',
+  α: 'a', β: 'b', ε: 'e', η: 'n', ι: 'i', κ: 'k', ν: 'v', ο: 'o', ρ: 'p', τ: 't', υ: 'u', χ: 'x', ω: 'w',
+  '0': 'o', '1': 'l', '|': 'l', '!': 'l', $: 's', '@': 'a',
+};
+
+/**
+ * Comparison key for display names: compatibility-normalized, accents and case folded, look-alike
+ * letters mapped to Latin and whitespace collapsed. "Ałex", "ALEX" and "Аlex" (Cyrillic А) all
+ * compare equal to "alex", so nobody can pose as someone else in the participant list.
+ */
+export function nameKey(name: string): string {
+  const folded = name
+    .normalize('NFKD')
+    .replace(/\p{M}/gu, '')
+    .toLowerCase()
+    .replace(/ł/g, 'l')
+    .replace(/ø/g, 'o')
+    .replace(/ß/g, 'ss');
+  let out = '';
+  for (const ch of folded) out += CONFUSABLES[ch] ?? ch;
+  // Capital I and small l look the same in many fonts.
+  return out.replace(/i/g, 'l').replace(/\s+/g, ' ').trim();
+}
+
 function cleanDisplayName(raw: unknown): string | null {
-  if (typeof raw !== 'string') return null;
-  // Strip control characters, then trim.
-  // eslint-disable-next-line no-control-regex
-  const name = raw.replace(/[\u0000-\u001f\u007f]/g, '').trim();
-  if (name.length === 0 || name.length > 30) return null;
+  if (typeof raw !== 'string' || raw.length > 4 * MAX_NAME_LENGTH * 2) return null;
+  // Strip invisible characters, then trim.
+  const name = stripInvisible(raw).trim();
+  const length = codePointLength(name);
+  if (length === 0 || length > MAX_NAME_LENGTH) return null;
   return name;
 }
 
@@ -85,19 +140,25 @@ export function parseClientMessage(raw: string): ParseResult {
       if (password === null) return { ok: false, error: 'Invalid password' };
       const secret = optionalString(m.secret, 128);
       if (secret === null) return { ok: false, error: 'Invalid secret' };
+      const token = optionalString(m.token, 2048);
+      if (token === null) return { ok: false, error: 'Invalid token' };
       return {
         ok: true,
-        msg: { type: m.type, roomId: m.roomId, peerId: m.peerId, displayName, password, secret },
+        msg: { type: m.type, roomId: m.roomId, peerId: m.peerId, displayName, password, secret, token },
       };
     }
     case 'leave':
     case 'ping':
       return { ok: true, msg: { type: m.type } };
-    case 'signal':
+    case 'signal': {
       if (!isValidPeerId(m.targetPeerId)) return { ok: false, error: 'Invalid targetPeerId' };
+      const size = JSON.stringify(m.signal ?? null).length;
+      if (size > MAX_SIGNAL_SIZE) return { ok: false, error: 'Signal too large' };
       return { ok: true, msg: { type: 'signal', targetPeerId: m.targetPeerId, signal: m.signal } };
+    }
     case 'admit-peer':
     case 'deny-peer':
+    case 'remove-peer':
       if (!isValidPeerId(m.peerId)) return { ok: false, error: 'Invalid peerId' };
       return { ok: true, msg: { type: m.type, peerId: m.peerId } };
     default:

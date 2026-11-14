@@ -1,0 +1,32 @@
+import { test } from 'node:test';
+import assert from 'node:assert/strict';
+import { buildIcs, inviteText, mailtoLink } from './invites.js';
+
+const invite = {
+  title: 'Family call; with, commas',
+  link: 'https://call.example.com/room/abc#invite=TOKEN&k=KEY',
+  startsAt: Date.UTC(2026, 11, 24, 18, 30),
+  durationMinutes: 45,
+  hasPassword: true,
+};
+
+test('calendar file is valid iCalendar with escaping and folding', () => {
+  const ics = buildIcs(invite, Date.UTC(2026, 10, 14));
+  assert.ok(ics.startsWith('BEGIN:VCALENDAR\r\n'));
+  assert.ok(ics.endsWith('END:VCALENDAR\r\n'));
+  assert.match(ics, /DTSTART:20261224T183000Z/);
+  assert.match(ics, /DTEND:20261224T191500Z/);
+  assert.ok(ics.includes('SUMMARY:Family call\\; with\\, commas'));
+  for (const line of ics.split('\r\n')) assert.ok(new TextEncoder().encode(line).length <= 75, `line too long: ${line}`);
+  // Unfolded, the link survives intact
+  assert.ok(ics.replace(/\r\n /g, '').includes(invite.link));
+});
+
+test('invite text and email draft include the link (with its key) and mention the password', () => {
+  const text = inviteText(invite);
+  assert.ok(text.includes(invite.link));
+  assert.ok(text.includes('password'));
+  const mail = mailtoLink(invite);
+  assert.ok(mail.startsWith('mailto:?subject='));
+  assert.ok(decodeURIComponent(mail).includes(invite.link));
+});

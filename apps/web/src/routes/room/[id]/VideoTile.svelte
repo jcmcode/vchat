@@ -1,11 +1,35 @@
 <script lang="ts">
-  import type { PeerConnection } from '$lib/webrtc/mesh';
+  import { createEventDispatcher } from 'svelte';
+  import { peerMediaState, type PeerConnection } from '$lib/webrtc/mesh';
+  import type { Verification } from '$lib/webrtc/e2e';
   import { selectedAudioOutput } from '$lib/media/manager';
+  import Icon from '$lib/ui/Icon.svelte';
 
   export let peerConnection: PeerConnection;
   export let speaking = false;
+  /** Fit the whole picture (for shared screens) instead of filling the tile. */
+  export let contain = false;
+  /** This person is presenting their screen. */
+  export let presenting = false;
+  /** Exposed so overlays (screen annotations) can read the video's size. */
+  export let videoEl: HTMLVideoElement | null = null;
+  /** End-to-end verification state of this connection. */
+  export let verification: Verification | undefined = undefined;
+  /** Tapping the tile opens actions (message privately, send a file). */
+  export let selectable = false;
 
-  let videoEl: HTMLVideoElement;
+  const dispatch = createEventDispatcher<{ select: void }>();
+
+  function onKey(e: KeyboardEvent) {
+    if (selectable && (e.key === 'Enter' || e.key === ' ')) {
+      e.preventDefault();
+      dispatch('select');
+    }
+  }
+
+  // What the peer told us about their mic/camera (over the data channel).
+  $: media = $peerMediaState.get(peerConnection.id);
+  $: showVideo = !!peerConnection.stream && (presenting || media?.video !== false);
 
   $: if (videoEl && peerConnection.stream && videoEl.srcObject !== peerConnection.stream) {
     videoEl.srcObject = peerConnection.stream;
@@ -19,44 +43,101 @@
   }
 </script>
 
-<div class="tile" class:speaking>
+<!-- svelte-ignore a11y-no-noninteractive-tabindex -->
+<div
+  class="tile"
+  class:speaking
+  class:contain
+  class:selectable
+  role={selectable ? 'button' : undefined}
+  tabindex={selectable ? 0 : undefined}
+  aria-label={selectable ? `${peerConnection.displayName}: message privately or send a file` : undefined}
+  on:click={() => selectable && dispatch('select')}
+  on:keydown={onKey}
+>
   {#if peerConnection.stream}
+    <!-- The video element stays mounted (it also plays the person's audio); it's hidden when their camera is off. -->
     <!-- svelte-ignore a11y-media-has-caption -->
-    <video
-      bind:this={videoEl}
-      autoplay
-      playsinline
-    ></video>
-  {:else}
+    <video bind:this={videoEl} autoplay playsinline class:hidden={!showVideo}></video>
+  {/if}
+  {#if !showVideo}
     <div class="no-video">
       <span class="avatar">{peerConnection.displayName.charAt(0).toUpperCase()}</span>
     </div>
   {/if}
-  <span class="tile-name">{peerConnection.displayName}</span>
+  <slot />
+  <span class="tile-name">
+    {#if verification === 'verified'}
+      <span class="ver verified" title="Verified end-to-end"><Icon name="shield-check" size={13} /><span class="sr-only">verified</span></span>
+    {:else if verification === 'unverified' || verification === 'failed' || verification === 'allowed' || verification === 'nokey'}
+      <span class="ver unverified" title="Not verified end to end"><Icon name="shield-alert" size={13} /><span class="sr-only">not verified</span></span>
+    {/if}
+    <span class="name-text">{peerConnection.displayName}{presenting ? ' · presenting' : ''}</span>
+    {#if media?.audio === false}
+      <span class="muted-dot" title="Muted"><Icon name="mic-off" size={13} /><span class="sr-only">muted</span></span>
+    {/if}
+  </span>
 </div>
 
 <style>
+  .tile.selectable {
+    cursor: pointer;
+  }
+
+  .tile.selectable:hover {
+    border-color: var(--border-strong);
+  }
+
+  .ver {
+    display: inline-flex;
+    flex-shrink: 0;
+  }
+
+  .ver.verified {
+    color: var(--success);
+  }
+
+  .ver.unverified {
+    color: var(--warning);
+  }
+
   .tile {
     position: relative;
+    min-width: 0;
+    min-height: 0;
     background: var(--bg-surface);
-    border-radius: var(--radius);
+    border-radius: var(--radius-lg);
+    border: 1px solid var(--border-subtle);
     overflow: hidden;
     display: flex;
     align-items: center;
     justify-content: center;
-    border: 2px solid transparent;
-    transition: border-color 0.2s, box-shadow 0.2s;
+    transition: border-color var(--dur) var(--ease), box-shadow var(--dur) var(--ease);
   }
 
   .tile.speaking {
     border-color: var(--success);
-    box-shadow: 0 0 12px rgba(34, 197, 94, 0.3);
+    box-shadow: 0 0 0 2px var(--success), 0 0 20px var(--success-soft);
   }
 
   video {
     width: 100%;
     height: 100%;
     object-fit: cover;
+    display: block;
+  }
+
+  .tile.contain video {
+    object-fit: contain;
+    background: #000;
+  }
+
+  video.hidden {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    opacity: 0;
+    pointer-events: none;
   }
 
   .no-video {
@@ -65,30 +146,57 @@
     justify-content: center;
     width: 100%;
     height: 100%;
-    background: var(--bg-elevated);
+    background: linear-gradient(160deg, var(--bg-elevated), var(--bg-surface));
   }
 
   .avatar {
-    font-size: 3rem;
-    font-weight: 600;
-    color: var(--text-muted);
-    background: var(--border);
-    width: 80px;
-    height: 80px;
-    border-radius: 50%;
     display: flex;
     align-items: center;
     justify-content: center;
+    width: 72px;
+    height: 72px;
+    border-radius: 50%;
+    font-size: 2rem;
+    font-weight: 600;
+    color: var(--accent);
+    background: var(--accent-soft);
+    border: 1px solid var(--border);
+  }
+
+  :global(.tile-strip) .avatar {
+    width: 44px;
+    height: 44px;
+    font-size: 1.25rem;
   }
 
   .tile-name {
     position: absolute;
-    bottom: 8px;
-    left: 8px;
-    background: rgba(0, 0, 0, 0.6);
-    color: white;
-    padding: 2px 8px;
-    border-radius: 4px;
-    font-size: 0.8rem;
+    left: var(--space-2);
+    bottom: var(--space-2);
+    max-width: calc(100% - 16px);
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 3px 10px;
+    border-radius: var(--radius-pill);
+    background: rgba(11, 13, 18, 0.62);
+    -webkit-backdrop-filter: blur(6px);
+    backdrop-filter: blur(6px);
+    color: #fff;
+    font-size: var(--text-xs);
+    font-weight: 500;
+  }
+
+  .name-text {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .muted-dot {
+    display: inline-flex;
+    flex-shrink: 0;
+    color: #f87171;
   }
 </style>

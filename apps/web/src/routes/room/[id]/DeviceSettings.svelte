@@ -11,24 +11,36 @@
     enumerateDevices,
     isScreenSharing,
   } from '$lib/media/manager';
-  import { replaceTrackOnAllPeers } from '$lib/webrtc/mesh';
+  import { replaceTrackOnAllPeers, useNewMicTrack } from '$lib/webrtc/mesh';
   import { onMount } from 'svelte';
 
   onMount(() => {
     enumerateDevices();
   });
 
+  let deviceError = '';
+
   async function handleAudioChange(e: Event) {
     const deviceId = (e.target as HTMLSelectElement).value;
-    const track = await switchAudioDevice(deviceId);
-    if (track) replaceTrackOnAllPeers(track, 'audio');
+    deviceError = '';
+    try {
+      const track = await switchAudioDevice(deviceId);
+      if (track) useNewMicTrack(track); // keeps shared-screen audio mixed in while presenting
+    } catch {
+      deviceError = "Couldn't switch microphone — it may be in use by another app.";
+    }
   }
 
   async function handleVideoChange(e: Event) {
     const deviceId = (e.target as HTMLSelectElement).value;
-    const track = await switchVideoDevice(deviceId);
-    // While screen sharing, peers keep seeing the screen; the new camera is used when sharing stops.
-    if (track && !$isScreenSharing) replaceTrackOnAllPeers(track, 'video');
+    deviceError = '';
+    try {
+      const track = await switchVideoDevice(deviceId);
+      // While screen sharing, peers keep seeing the screen; the new camera is used when sharing stops.
+      if (track && !$isScreenSharing) replaceTrackOnAllPeers(track, 'video');
+    } catch {
+      deviceError = "Couldn't switch camera — it may be in use by another app.";
+    }
   }
 
   function handleOutputChange(e: Event) {
@@ -38,84 +50,74 @@
   }
 </script>
 
-<div class="device-settings">
-  <div class="settings-header">Device Settings</div>
+<div class="device-settings card fade-in" role="dialog" aria-label="Device settings">
+  <div class="settings-header">Device settings</div>
+  {#if deviceError}<p class="device-error" role="alert">{deviceError}</p>{/if}
 
-  <label>
-    <span>Microphone</span>
-    <select value={$selectedAudioDevice} on:change={handleAudioChange}>
+  <div class="field">
+    <label class="field-label" for="dev-mic">Microphone</label>
+    <select id="dev-mic" class="input" value={$selectedAudioDevice} on:change={handleAudioChange}>
       {#each $audioDevices as device}
         <option value={device.deviceId}>{device.label || 'Microphone'}</option>
       {/each}
     </select>
-  </label>
+  </div>
 
-  <label>
-    <span>Camera</span>
-    <select value={$selectedVideoDevice} on:change={handleVideoChange}>
+  <div class="field">
+    <label class="field-label" for="dev-cam">Camera</label>
+    <select id="dev-cam" class="input" value={$selectedVideoDevice} on:change={handleVideoChange}>
       {#each $videoDevices as device}
         <option value={device.deviceId}>{device.label || 'Camera'}</option>
       {/each}
     </select>
-  </label>
+  </div>
 
   {#if $audioOutputDevices.length > 0}
-    <label>
-      <span>Speaker</span>
-      <select value={$selectedAudioOutput} on:change={handleOutputChange}>
+    <div class="field">
+      <label class="field-label" for="dev-spk">Speaker</label>
+      <select id="dev-spk" class="input" value={$selectedAudioOutput} on:change={handleOutputChange}>
         {#each $audioOutputDevices as device}
           <option value={device.deviceId}>{device.label || 'Speaker'}</option>
         {/each}
       </select>
-    </label>
+    </div>
   {/if}
 </div>
 
 <style>
   .device-settings {
-    position: fixed;
-    bottom: 70px;
-    left: 50%;
-    transform: translateX(-50%);
-    background: var(--bg-surface);
-    border: 1px solid var(--border);
-    border-radius: var(--radius);
-    padding: 1rem;
+    position: absolute;
+    bottom: 92px;
+    left: 0;
+    right: 0;
+    margin-inline: auto;
     z-index: 50;
-    min-width: 280px;
-    max-width: 360px;
+    width: min(360px, calc(100% - 24px));
+    padding: var(--space-4);
+    background: var(--bg-overlay);
+    box-shadow: var(--shadow-lg);
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-3);
   }
 
   .settings-header {
     font-weight: 600;
-    font-size: 0.9rem;
-    margin-bottom: 0.75rem;
+    font-size: var(--text-base);
   }
 
-  label {
-    display: flex;
-    flex-direction: column;
-    gap: 0.25rem;
-    margin-bottom: 0.6rem;
+  select.input {
+    text-overflow: ellipsis;
   }
 
-  label span {
-    font-size: 0.8rem;
-    color: var(--text-muted);
+  @media (max-width: 640px) {
+    .device-settings {
+      bottom: 68px;
+    }
   }
-
-  select {
-    background: var(--bg-elevated);
-    border: 1px solid var(--border);
-    border-radius: 4px;
-    padding: 0.4rem 0.5rem;
-    color: var(--text);
-    font-size: 0.85rem;
-    font-family: inherit;
-  }
-
-  select:focus {
-    border-color: var(--accent);
-    outline: none;
+  .device-error {
+    margin: 0;
+    font-size: var(--text-xs);
+    color: var(--danger);
   }
 </style>

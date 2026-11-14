@@ -1,9 +1,16 @@
+{
+	# No logs at all. Caddy writes no access logs unless a `log` directive is added, but its default
+	# logger would still print errors, and those include client IPs and request headers (such as the
+	# invite token sent in Sec-WebSocket-Protocol). See DOCS.md for enabling logs while debugging.
+	log default {
+		output discard
+	}
+}
+
 {$DOMAIN} {
 	tls {$ACME_EMAIL}
 
-	basic_auth * {
-		vchat {$BASIC_AUTH_HASH}
-	}
+	# Access control is done by the app: the owner signs in at /admin, guests use invite links.
 
 	header {
 		X-Frame-Options DENY
@@ -11,7 +18,10 @@
 		Referrer-Policy strict-origin-when-cross-origin
 		Permissions-Policy "camera=(self), microphone=(self), display-capture=(self)"
 		Strict-Transport-Security "max-age=31536000"
-		# Content-Security-Policy is set by the app itself (see apps/web/svelte.config.js).
+		# The full Content-Security-Policy is set by the app itself (apps/web/svelte.config.js);
+		# frame-ancestors only works as a header, so it's added here.
+		Content-Security-Policy "frame-ancestors 'none'"
+		Cross-Origin-Opener-Policy same-origin
 	}
 
 	handle /ws {
@@ -20,6 +30,11 @@
 
 	handle /api/* {
 		reverse_proxy signaling:3001
+	}
+
+	# Header rules for static hosts like Cloudflare; not a page.
+	handle /_headers {
+		respond 404
 	}
 
 	handle {

@@ -107,11 +107,8 @@ export async function switchAudioDevice(deviceId: string): Promise<MediaStreamTr
   const stream = get(localStream);
   if (!stream) return null;
 
-  // Stop old audio track
+  // Get the new microphone first: if it fails (busy, unplugged) the current one keeps working.
   const oldTrack = stream.getAudioTracks()[0];
-  if (oldTrack) oldTrack.stop();
-
-  // Get new audio
   const newStream = await navigator.mediaDevices.getUserMedia({
     audio: {
       deviceId: { exact: deviceId },
@@ -123,6 +120,7 @@ export async function switchAudioDevice(deviceId: string): Promise<MediaStreamTr
 
   const newTrack = newStream.getAudioTracks()[0];
   newTrack.enabled = get(audioEnabled); // stay muted if we were muted
+  oldTrack?.stop();
   if (oldTrack) stream.removeTrack(oldTrack);
   stream.addTrack(newTrack);
   selectedAudioDevice.set(deviceId);
@@ -136,11 +134,8 @@ export async function switchVideoDevice(deviceId: string): Promise<MediaStreamTr
   const stream = get(localStream);
   if (!stream) return null;
 
-  // Stop old video track
+  // Get the new camera first: if it fails (busy, unplugged) the current one keeps working.
   const oldTrack = stream.getVideoTracks()[0];
-  if (oldTrack) oldTrack.stop();
-
-  // Get new video
   const newStream = await navigator.mediaDevices.getUserMedia({
     video: {
       deviceId: { exact: deviceId },
@@ -152,6 +147,7 @@ export async function switchVideoDevice(deviceId: string): Promise<MediaStreamTr
 
   const newTrack = newStream.getVideoTracks()[0];
   newTrack.enabled = get(videoEnabled);
+  oldTrack?.stop();
   if (oldTrack) stream.removeTrack(oldTrack);
   stream.addTrack(newTrack);
   selectedVideoDevice.set(deviceId);

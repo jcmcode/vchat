@@ -7,7 +7,8 @@
     "dev": "vite dev",
     "build": "vite build",
     "preview": "vite preview",
-    "check": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json"
+    "check": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json",
+    "test": "tsx --test src/lib/collab/*.test.ts src/lib/webrtc/*.test.ts src/lib/*.test.ts"
   },
   "dependencies": {
     "nanoid": "^5.0.4",
@@ -19,8 +20,9 @@
     "@sveltejs/vite-plugin-svelte": "^3.0.1",
     "@types/simple-peer": "^9.11.8",
     "svelte": "^4.2.9",
+    "svelte-check": "^3.6.0",
+    "tsx": "^4.21.0",
     "typescript": "^5.3.3",
-    "vite": "^5.0.12",
-    "svelte-check": "^3.6.0"
+    "vite": "^5.0.12"
   }
 }

@@ -30,8 +30,11 @@ export interface IceResponse {
   ttl?: number;
 }
 
-const DEFAULT_STUN = 'stun:stun.cloudflare.com:3478,stun:stun.l.google.com:19302';
-const DEFAULT_TTL = 12 * 60 * 60; // 12h — longer than any realistic call
+/** Used when STUN_URLS isn't set. Docker deployments point STUN_URLS at their own coturn instead. */
+export const DEFAULT_STUN = 'stun:stun.cloudflare.com:3478';
+/** TURN credential lifetime (seconds) unless TURN_TTL_SECONDS says otherwise; capped by the invite. */
+export const DEFAULT_TURN_TTL = 4 * 60 * 60;
+const MIN_TURN_TTL = 60;
 
 function splitList(value: string | undefined): string[] {
   return (value ?? '')
@@ -79,8 +82,30 @@ async function cloudflareTurn(env: IceEnv, ttl: number): Promise<IceServer[]> {
     .filter((s) => s.urls.length > 0);
 }
 
-export async function getIceServers(env: IceEnv): Promise<IceResponse> {
-  const ttl = Number(env.TURN_TTL_SECONDS) > 0 ? Number(env.TURN_TTL_SECONDS) : DEFAULT_TTL;
+export interface IceOptions {
+  /** Unix seconds: TURN credentials never outlive the invite/host token they were issued for. */
+  expiresAt?: number;
+  now?: number;
+}
+
+/** Credential lifetime in seconds: TURN_TTL_SECONDS (default 4h), capped at the token's expiry. */
+export function turnTtl(env: IceEnv, opts: IceOptions = {}): number {
+  const configured = Number(env.TURN_TTL_SECONDS) > 0 ? Math.floor(Number(env.TURN_TTL_SECONDS)) : DEFAULT_TURN_TTL;
+  if (opts.expiresAt === undefined) return configured;
+  const left = Math.floor(opts.expiresAt - (opts.now ?? Date.now()) / 1000);
+  return Math.max(MIN_TURN_TTL, Math.min(configured, left));
+}
+
+function randomId(): string {
+  const bytes = crypto.getRandomValues(new Uint8Array(9));
+  let binary = '';
+  for (const b of bytes) binary += String.fromCharCode(b);
+  return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_');
+}
+
+export async function getIceServers(env: IceEnv, opts: IceOptions = {}): Promise<IceResponse> {
+  const ttl = turnTtl(env, opts);
+  const nowSec = Math.floor((opts.now ?? Date.now()) / 1000);
 
   if (env.CF_TURN_KEY_ID && env.CF_TURN_API_TOKEN) {
     // Cloudflare's response already includes its own STUN server.
@@ -93,8 +118,9 @@ export async function getIceServers(env: IceEnv): Promise<IceResponse> {
 
   const turnUrls = splitList(env.TURN_URLS);
   if (turnUrls.length && env.TURN_SECRET) {
-    // coturn "TURN REST API" credentials: username = expiry timestamp, password = HMAC(secret, username)
-    const username = `${Math.floor(Date.now() / 1000) + ttl}:vchat`;
+    // coturn "TURN REST API" credentials: username = "<expiry>:<id>", password = HMAC(secret, username).
+    // A random id per response, so coturn's per-user quota applies per client rather than to everyone.
+    const username = `${nowSec + ttl}:${randomId()}`;
     const credential = await hmacSha1Base64(env.TURN_SECRET, username);
     iceServers.push({ urls: turnUrls, username, credential });
     return { iceServers, ttl };

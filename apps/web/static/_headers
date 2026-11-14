@@ -1,0 +1,10 @@
+# Security headers for static files (read by Cloudflare Workers Static Assets and similar hosts).
+# Content-Security-Policy is emitted by the app itself (apps/web/svelte.config.js).
+/*
+  X-Frame-Options: DENY
+  X-Content-Type-Options: nosniff
+  Referrer-Policy: strict-origin-when-cross-origin
+  Permissions-Policy: camera=(self), microphone=(self), display-capture=(self)
+  Strict-Transport-Security: max-age=31536000
+  Content-Security-Policy: frame-ancestors 'none'
+  Cross-Origin-Opener-Policy: same-origin

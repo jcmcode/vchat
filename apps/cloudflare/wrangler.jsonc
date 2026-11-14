@@ -9,22 +9,28 @@
   "name": "vchat",
   "main": "src/worker.ts",
   "compatibility_date": "2025-09-01",
+  // The free *.workers.dev address. Once your custom domain is attached, set this to false so the
+  // app is only reachable on your own domain (and behind your Cloudflare Access policy).
   "workers_dev": true,
 
   "assets": {
     "directory": "../web/build",
     "binding": "ASSETS",
     "not_found_handling": "single-page-application",
-    // The Worker runs first so it can enforce the optional site password and route /ws and /api.
-    "run_worker_first": true
+    // Static files are served for free without running the Worker; security headers for them
+    // come from apps/web/static/_headers.
+    "run_worker_first": ["/ws", "/api/*", "/healthz"]
   },
 
   "durable_objects": {
     "bindings": [{ "name": "ROOMS", "class_name": "SignalingRoom" }]
   },
+  // SQLite-backed Durable Objects. vchat writes nothing to their storage (room state lives in
+  // WebSocket attachments only); alarms are used for timeouts.
   "migrations": [{ "tag": "v1", "new_sqlite_classes": ["SignalingRoom"] }],
 
-  "observability": { "enabled": true }
+  // Workers Logs would keep request logs on Cloudflare for days; vchat keeps no logs by default.
+  "observability": { "enabled": false }
 
   // Optional plain-text settings (uncomment to use):
   // "vars": {
@@ -32,7 +38,14 @@
   // }
   //
   // Secrets (set with `npx wrangler secret put NAME`, never committed):
-  //   SITE_PASSWORD       password for the whole site (username: vchat). Strongly recommended.
-  //   CF_TURN_KEY_ID      Cloudflare Realtime TURN key ID       } enables TURN relay for
-  //   CF_TURN_API_TOKEN   Cloudflare Realtime TURN API token    } strict NATs / mobile networks
+  //   SECRET_KEY             random string, 32+ chars (openssl rand -hex 32). Signs invite links.
+  //   Owner sign-in — pick one:
+  //     CF_ACCESS_TEAM_DOMAIN  e.g. yourteam.cloudflareaccess.com   } Cloudflare Access
+  //     CF_ACCESS_AUD          Access application audience tag      } (recommended)
+  //     ADMIN_PASSWORD         built-in owner password
+  //   With nothing set, the app runs in open mode (anyone can create rooms). SECRET_KEY without an
+  //   owner sign-in is a configuration error; set OPEN_MODE=1 to run an open server on purpose.
+  //
+  //   CF_TURN_KEY_ID         Cloudflare Realtime TURN key ID      } optional relay for strict
+  //   CF_TURN_API_TOKEN      Cloudflare Realtime TURN API token   } NATs / mobile networks
 }

@@ -1,3 +1,6 @@
+# vchat on one server: Caddy (HTTPS + static app), the signaling server, and a coturn relay.
+# No container keeps logs (logging driver "none"); see DOCS.md → "Debugging with logs" to turn them
+# on temporarily.
 services:
   web:
     build:
@@ -9,19 +12,19 @@ services:
     environment:
       - DOMAIN=${DOMAIN}
       - ACME_EMAIL=${ACME_EMAIL}
-      - BASIC_AUTH_HASH=${BASIC_AUTH_HASH}
     volumes:
       - caddy_data:/data
       - caddy_config:/config
     depends_on:
       - signaling
     restart: unless-stopped
-    healthcheck:
-      test: ["CMD", "wget", "--spider", "--quiet", "http://localhost:80"]
-      interval: 10s
-      timeout: 5s
-      retries: 12
-      start_period: 30s
+    cap_drop: [ALL]
+    cap_add: [NET_BIND_SERVICE]
+    security_opt: ["no-new-privileges:true"]
+    mem_limit: 256m
+    pids_limit: 200
+    logging:
+      driver: none
 
   signaling:
     build:
@@ -32,21 +35,47 @@ services:
     environment:
       - PORT=3001
       - ALLOWED_ORIGIN=https://${DOMAIN}
+      # STUN from our own coturn, so browsers contact no third party.
+      - STUN_URLS=stun:${DOMAIN}:3478
       # Short-lived TURN credentials for coturn (TURN REST API / use-auth-secret)
-      - TURN_URLS=turn:${DOMAIN}:3478?transport=udp,turn:${DOMAIN}:3478?transport=tcp,turns:${DOMAIN}:5349?transport=tcp
+      - TURN_URLS=turn:${DOMAIN}:3478?transport=udp,turn:${DOMAIN}:3478?transport=tcp
       - TURN_SECRET=${TURN_SECRET}
+      # Private mode: the owner signs in at /admin and sends invite links. If ADMIN_PASSWORD is
+      # missing, empty or short, the server reports a configuration error instead of running open
+      # (SECRET_KEY is always set here, and that alone rules out open mode).
+      - SECRET_KEY=${SECRET_KEY}
+      - ADMIN_PASSWORD=${ADMIN_PASSWORD:-}
+      # Optional: Cloudflare Access instead of the password (run behind a Cloudflare Tunnel).
+      # Empty means unset.
+      - CF_ACCESS_TEAM_DOMAIN=${CF_ACCESS_TEAM_DOMAIN:-}
+      - CF_ACCESS_AUD=${CF_ACCESS_AUD:-}
     restart: unless-stopped
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    mem_limit: 256m
+    pids_limit: 100
+    logging:
+      driver: none
 
   coturn:
-    image: coturn/coturn:4.6
+    image: coturn/coturn:4.19
     network_mode: host
     volumes:
       - ./turnserver.conf:/etc/coturn/turnserver.conf:ro
-      - caddy_data:/caddy-data:ro
-    depends_on:
-      web:
-        condition: service_healthy
     restart: unless-stopped
+    read_only: true
+    tmpfs:
+      - /var/run
+      - /tmp
+      - /var/tmp
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    mem_limit: 512m
+    pids_limit: 200
+    # No logs: coturn's own logging is off, and Docker keeps nothing either.
+    logging:
+      driver: none
 
 volumes:
   caddy_data:

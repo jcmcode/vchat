@@ -9,7 +9,7 @@
     "build": "pnpm --filter @vchat/signaling-server --filter @vchat/web build",
     "build:web": "pnpm --filter @vchat/web build",
     "build:signal": "pnpm --filter @vchat/signaling-server build",
-    "test": "pnpm --filter @vchat/signaling-server test",
+    "test": "pnpm --filter @vchat/signaling-server --filter @vchat/web test",
     "check": "pnpm --filter @vchat/signaling-server typecheck && pnpm --filter @vchat/web check && pnpm --filter @vchat/cloudflare typecheck",
     "cf:dev": "pnpm --filter @vchat/cloudflare dev",
     "cf:deploy": "pnpm --filter @vchat/cloudflare deploy",

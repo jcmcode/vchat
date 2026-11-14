@@ -2,3 +2,7 @@ export * from './protocol.js';
 export * from './room.js';
 export * from './ice.js';
 export * from './rate-limit.js';
+export * from './tokens.js';
+export * from './access.js';
+export * from './api.js';
+export * from './throttle.js';

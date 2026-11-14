@@ -1,112 +1,127 @@
 # vchat
 
-Self-hosted P2P encrypted video chat. No accounts, no tracking, no media servers. Spin it up, share the link, talk, tear it down when you're done.
+Your own private, end-to-end encrypted video calls. Deploy it on your domain, sign in as the owner, and send invite links to whoever you want to talk to. Guests don't need accounts. Nothing is stored and nothing is logged.
 
-- **Peer-to-peer**: video, audio, chat and files flow directly between browsers, never through the server
-- **End-to-end encrypted**: WebRTC's built-in DTLS-SRTP encryption, always on
-- **Ephemeral**: no database, no message history; chat lives only in your browser tab
-- **2–6 people** per room (mesh topology)
-- **Features**: screen sharing (with audio), file transfer, text chat, reactions, room passwords, host admission control, automatic reconnection
+- **Peer-to-peer**: video, audio, screen sharing, chat and files flow directly between browsers, never through the server
+- **End-to-end encrypted and verified**: WebRTC's DTLS-SRTP encryption, plus a secret room key that lives only in the invite link (after `#`, never sent to a server). Every connection proves it knows the key over its own encryption fingerprints before any audio, video or chat flows, so a compromised signaling server can't sit in the middle unnoticed. Optional 6-digit safety codes let you double-check out loud (see [DOCS.md](DOCS.md#end-to-end-verification) for what this does and doesn't cover)
+- **Invite-only**: only the owner can create rooms; guests get in with an invite link (plus an optional password and your approval)
+- **No data, no logs**: no database, no accounts, no message history, and no server or container logs. Invite links are self-contained signed tokens
+- **2–6 people** per room
+- **Features**:
+  - Video, audio-only, or **chat-only** participation
+  - **Screen sharing** (with audio), plus a **laser pointer and drawing** over the shared screen that everyone sees
+  - A **shared whiteboard** (pen, highlighter, text, eraser) you can export as **PDF** or PNG
+  - Group chat, **private direct messages** and **files sent straight to one person** (tap them), and reactions
+  - **Calendar and email invites**: download an `.ics` event or draft an email in your own mail app. Nothing is sent by vchat
+  - Named rooms (the host can rename during a call), host approval, and automatic reconnection
 
-The server only helps peers find each other (signaling) and hands out TURN relay credentials. Once connected, it's out of the loop.
+## How it works for you
 
-## Choose how to run it
+1. **You sign in** at `https://your-domain/admin`, with Cloudflare Access or an owner password.
+2. **Create a room**: give it a name, optionally a password, choose whether guests wait for your approval, and pick how long the invite lasts.
+3. **Send the invite link** (or the ready-made invite message). Send the password separately if you set one.
+4. **Guests open the link**, type their name, and join. No sign-up, no app.
 
-| | Cost | Needs | Best for |
+Anyone visiting your site without an invite link sees a "private server" page and can't create rooms, join calls or use your relay server.
+
+## Choose where to run it
+
+| | Cost | Needs | Owner sign-in |
 |---|---|---|---|
-| [**Cloudflare**](#deploy-on-cloudflare) | Free tier is plenty for personal use | Cloudflare account | Easiest, nothing to maintain |
-| [**Docker on a VPS**](#deploy-with-docker-on-a-vps) | ~$5/mo | Linux server + domain | Full control, your own TURN server |
-| [**Local**](#local-development) | Free | Node.js 20+ | Development |
+| [**Cloudflare**](#deploy-on-cloudflare) | Free for personal use | Cloudflare account + a domain | Cloudflare Access (recommended) or password |
+| [**Docker on any server**](#deploy-with-docker) | ~$5/mo VPS | Linux server + a domain | Password (or Cloudflare Access via Tunnel) |
+| [**Local**](#local-development) | Free | Node.js 20+ | None (open mode) |
 
 ---
 
 ## Deploy on Cloudflare
 
-Runs entirely on Cloudflare: the web app is served as static assets, and signaling runs in a [Durable Object](https://developers.cloudflare.com/durable-objects/) per room (it sleeps between messages, so idle calls cost nothing). Optional TURN relay comes from [Cloudflare Realtime TURN](https://developers.cloudflare.com/realtime/turn/).
+Runs entirely on Cloudflare: static files are served for free, signaling runs in a [Durable Object](https://developers.cloudflare.com/durable-objects/) per room (it sleeps between messages, so idle calls cost nothing, and writes nothing to Durable Object storage), and optional relay comes from [Cloudflare Realtime TURN](https://developers.cloudflare.com/realtime/turn/). Nothing account-specific is stored in this repo.
 
-Nothing account-specific is stored in this repo. Your account comes from `wrangler login`, secrets live in Cloudflare, and your domain is attached in the dashboard.
+Cloudflare terminates TLS for your site, so it can see what passes through the Worker: signaling messages (room ids, display names, network addresses in ICE candidates, room passwords as they're checked) and visitors' IP addresses. It never sees call content, which is encrypted between browsers. If that's not acceptable, use the Docker deployment on a server you control.
 
-**1. Install and log in**
+### 1. Deploy
 
 ```bash
 git clone https://github.com/jcmcode/vchat.git
 cd vchat
-corepack enable    # or: npm install -g pnpm
+corepack enable          # or: npm install -g pnpm
 pnpm install
 pnpm --filter @vchat/cloudflare exec wrangler login
+
+# The key that signs invite links (paste the output of `openssl rand -hex 32` when asked)
+pnpm --filter @vchat/cloudflare exec wrangler secret put SECRET_KEY
+
+pnpm cf:deploy
 ```
 
-**2. Set a site password** (recommended: otherwise anyone who finds the URL can use your TURN quota)
+### 2. Put it on your domain
 
-```bash
-pnpm --filter @vchat/cloudflare exec wrangler secret put SITE_PASSWORD
-```
+Dashboard → **Workers & Pages** → **vchat** → **Settings** → **Domains & Routes** → **Add** → **Custom domain**, e.g. `call.yourdomain.com`. The domain must already be on your Cloudflare account. Then set `"workers_dev": false` in `apps/cloudflare/wrangler.jsonc` and redeploy, so the app is only reachable on your domain.
 
-Visitors will be asked to log in with username `vchat` and this password.
+### 3. Set up owner sign-in with Cloudflare Access (recommended)
 
-**3. (Optional) Enable TURN relay**
+Access means there's no owner password to leak: you sign in with your email (a one-time code) or Google/GitHub. It's free for up to 50 users.
 
-Without TURN, calls connect for most home networks but can fail on strict corporate or mobile networks. To enable it, go to Cloudflare dashboard → **Realtime** → **TURN Server** → **Create**, then:
+1. Dashboard → **Zero Trust** → **Access** → **Applications** → **Add an application** → **Self-hosted**.
+2. Add **two** public hostnames, both on `call.yourdomain.com`: one with path `admin`, one with path `api/admin`. Everything under those paths is covered too. Only these are protected; guests reach invite links without signing in.
+3. Add a policy: **Action: Allow**, **Include → Emails →** your email address.
+4. Save. Then open the application's overview and copy its **Application Audience (AUD) Tag**. Your team domain is shown in **Zero Trust → Settings** and looks like `yourteam.cloudflareaccess.com`.
+5. Give both to the Worker, then redeploy:
+
+   ```bash
+   pnpm --filter @vchat/cloudflare exec wrangler secret put CF_ACCESS_TEAM_DOMAIN
+   pnpm --filter @vchat/cloudflare exec wrangler secret put CF_ACCESS_AUD
+   pnpm cf:deploy
+   ```
+
+Open `https://call.yourdomain.com/admin`. Cloudflare asks you to sign in, then you're on your dashboard. To check that it's protected, open `https://call.yourdomain.com/api/admin/session` in a private window: you should see Cloudflare's sign-in page, not data. The Worker also verifies Access's signed token itself, so `/api/admin` stays locked even when reached another way (e.g. the `workers.dev` address).
+
+**Simpler alternative:** skip Access and set an owner password with `wrangler secret put ADMIN_PASSWORD`.
+
+### 4. (Optional) Enable TURN relay
+
+Without a relay, calls connect on most home networks but can fail on strict corporate or mobile networks. Go to Dashboard → **Realtime** → **TURN Server** → **Create**, then:
 
 ```bash
 pnpm --filter @vchat/cloudflare exec wrangler secret put CF_TURN_KEY_ID
 pnpm --filter @vchat/cloudflare exec wrangler secret put CF_TURN_API_TOKEN
 ```
 
-**4. Deploy**
+Only invited guests and you can get relay credentials, so strangers can't run up your bill. The first 1,000 GB per month is free, then $0.05/GB.
 
-```bash
-pnpm cf:deploy
-```
-
-Your app is live at `https://vchat.<your-subdomain>.workers.dev`.
-
-**5. (Optional) Use your own domain**
-
-Dashboard → **Workers & Pages** → **vchat** → **Settings** → **Domains & Routes** → **Add** → **Custom domain**. If you serve the app from more than one hostname, list them in `ALLOWED_ORIGIN` (see `apps/cloudflare/wrangler.jsonc`).
-
-To test locally with the real Workers runtime: `pnpm cf:dev` (opens on http://localhost:8787). Put local-only secrets in `apps/cloudflare/.dev.vars` (see `.dev.vars.example`; this file is gitignored).
-
-To remove everything: `pnpm --filter @vchat/cloudflare exec wrangler delete`.
+To test locally with the real Workers runtime: `pnpm cf:dev` (http://localhost:8787). Put local-only secrets in `apps/cloudflare/.dev.vars` (see `.dev.vars.example`; it's gitignored). To remove everything: `pnpm --filter @vchat/cloudflare exec wrangler delete`.
 
 ---
 
-## Deploy with Docker on a VPS
+## Deploy with Docker
 
-You need a Linux VPS (1GB RAM is enough; Ubuntu 22.04+ recommended) and a domain name.
+Works on any Linux server with Docker (1GB RAM is plenty; Ubuntu 22.04+ recommended) and a domain pointing at it.
 
-1. **Point your domain**: add a DNS `A` record for your domain pointing at the server's IP.
-2. **Install Docker**: `curl -fsSL https://get.docker.com | sh`
-3. **Clone and deploy**:
+```bash
+curl -fsSL https://get.docker.com | sh      # if Docker isn't installed
+git clone https://github.com/jcmcode/vchat.git
+cd vchat
+sudo bash deploy.sh
+```
 
-   ```bash
-   git clone https://github.com/jcmcode/vchat.git
-   cd vchat
-   bash deploy.sh
-   ```
+The script asks for your domain, an email for HTTPS certificates, the server's public IP (it suggests the one your domain points at) and an **owner password**. It then generates the signing and relay secrets, configures the firewall (it shows the SSH port(s) it will keep open and asks you to confirm), builds and starts everything, and checks that `https://your-domain/api/config` answers. Re-running it is safe, and existing invite links keep working.
 
-   The script asks for your domain, an email for TLS certificates and a site password. It then generates a TURN secret, configures the firewall, gets HTTPS certificates and starts everything. Re-running it is safe.
+Then sign in at `https://your-domain/admin`.
 
-4. Share `https://your-domain.com` and the password (username `vchat`) with whoever you want to talk to.
+**What runs:**
 
-**Tear down:** `docker compose down -v`. The server retains nothing, so you can destroy the VPS whenever you're done.
+- **web**: Caddy serving the app with automatic HTTPS, with all logging discarded
+- **signaling**: a small Node.js server for room signaling, owner sign-in, invites and short-lived relay credentials
+- **coturn**: your own STUN and TURN relay, with logging off. Browsers use it for STUN too, so a Docker deployment contacts no third-party servers. It refuses to relay to private or internal addresses or to the server itself, and has bandwidth quotas. It doesn't use TLS itself: the media it relays is already end-to-end encrypted
 
-**Ports.** If your provider has an external firewall (e.g. DigitalOcean Cloud Firewall), open these:
+Docker keeps no container logs (`logging: driver: none`). To debug, see [DOCS.md → Debugging with logs](DOCS.md#debugging-with-logs).
 
-| Port | Protocol | Purpose |
-|------|----------|---------|
-| 22 | TCP | SSH |
-| 80 | TCP | HTTP (certificate issuance) |
-| 443 | TCP | HTTPS |
-| 3478 | TCP/UDP | TURN |
-| 5349 | TCP/UDP | TURNS (TLS) |
-| 49152–65535 | UDP | TURN relay |
+**Tear down:** `docker compose down -v`.
 
-What runs:
+**Ports** (if your provider has an external firewall): your SSH port, 80/tcp + 443/tcp (HTTPS), 3478 tcp/udp (STUN/TURN), 61000–65535/udp (relay). The script must run as root (`sudo bash deploy.sh`).
 
-- **web**: Caddy serving the static app, reverse-proxying `/ws` and `/api` to signaling, automatic HTTPS
-- **signaling**: Node.js WebSocket server that also mints short-lived TURN credentials
-- **coturn**: TURN/TURNS relay using Caddy's certificates and a shared secret (no static TURN passwords)
+**Prefer Cloudflare Access?** Run the containers behind a [Cloudflare Tunnel](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/), add `CF_ACCESS_TEAM_DOMAIN` + `CF_ACCESS_AUD` to `.env` (docker-compose passes them to the signaling service), and protect `/admin` and `/api/admin` exactly as described above.
 
 ---
 
@@ -119,49 +134,68 @@ pnpm install
 pnpm dev
 ```
 
-Open http://localhost:5173. Vite proxies `/ws` and `/api` to the signaling server on port 3001, the same way production does. To try a call, open the room link in a second browser window.
+Open http://localhost:5173. With nothing configured, the app runs in **open mode**: anyone can create rooms from the home page. To try private mode locally:
+
+```bash
+SECRET_KEY=$(openssl rand -hex 32) ADMIN_PASSWORD=devpassword pnpm dev
+```
 
 | Command | What it does |
 |---|---|
 | `pnpm dev` | Web app + Node signaling server with hot reload |
-| `pnpm test` | Signaling logic unit tests |
+| `pnpm test` | Unit tests (rooms, invites, sign-in, relay credentials) |
 | `pnpm check` | Type-check everything |
 | `pnpm build` | Production build of web app and Node server |
 | `pnpm cf:dev` | Run the Cloudflare version locally (port 8787) |
 
 ### Configuration reference
 
-The signaling server (Node or Cloudflare) reads these environment variables / secrets:
+The same settings work on every backend (Node environment variables or Cloudflare secrets):
 
-| Variable | Purpose |
+| Setting | Purpose |
 |---|---|
-| `ALLOWED_ORIGIN` | Comma-separated allowed origins for WebSocket connections. Node: any origin if unset. Cloudflare: same-origin if unset |
-| `CF_TURN_KEY_ID`, `CF_TURN_API_TOKEN` | Use Cloudflare Realtime TURN |
-| `TURN_URLS` + `TURN_SECRET` | Use coturn with `use-auth-secret` (short-lived credentials) |
-| `TURN_URLS` + `TURN_USERNAME` + `TURN_CREDENTIAL` | Use a TURN server with static credentials |
-| `STUN_URLS` | Override the default STUN servers |
-| `SITE_PASSWORD` | Cloudflare only: password-protect the whole site (Docker uses Caddy basic auth instead) |
+| `SECRET_KEY` | Signs invite links and owner sessions. 32+ random characters; keep it stable. **Required for private mode** (and setting it means you want private mode) |
+| `CF_ACCESS_TEAM_DOMAIN` + `CF_ACCESS_AUD` | Owner signs in with Cloudflare Access |
+| `ADMIN_PASSWORD` | Owner signs in with a password (used if Access isn't configured) |
+| `CF_TURN_KEY_ID` + `CF_TURN_API_TOKEN` | Relay via Cloudflare Realtime TURN |
+| `TURN_URLS` + `TURN_SECRET` | Relay via your own coturn (`use-auth-secret`) |
+| `TURN_URLS` + `TURN_USERNAME` + `TURN_CREDENTIAL` | Relay with static credentials |
+| `TURN_TTL_SECONDS` | Lifetime of TURN credentials (default 4 hours, never longer than the invite they were issued for) |
+| `STUN_URLS` | STUN servers for browsers. Default: `stun:stun.cloudflare.com:3478` only. The Docker setup uses your own coturn instead |
+| `OPEN_MODE` | Set to `1` to run an open server on purpose (anyone can create rooms) even though other settings are present |
+| `OPEN_MODE_TURN` | Open mode only: set to `1` to give TURN relay credentials to anyone. Off by default, so a public open-mode server can't be used as a free relay |
+| `ALLOWED_ORIGIN` | Comma-separated origins allowed to connect and call the API cross-origin (default: same origin only, on every backend) |
+| `DEBUG_LOGS` | Set to `1` to log room activity. Off by default |
 | `PORT` | Node only: listen port (default 3001) |
 
-Users can also point the app at a different signaling server or TURN server under **Settings** on the home page.
+Open mode needs either **nothing** configured (no `SECRET_KEY`, `ADMIN_PASSWORD` or `CF_ACCESS_*`, as in local development) or an explicit `OPEN_MODE=1`. Anything in between, such as `SECRET_KEY` without an owner sign-in, an empty or short (<10 characters) password, or only one Access value, is a configuration error: the server refuses to run open, logs the problem at startup, and only tells browsers `misconfigured: true`. A typo can't make a private server public. Empty values count as unset.
+
+## Privacy and security
+
+- Call content (audio, video, screen, chat, files) is encrypted between browsers. Servers and relays only ever see encrypted packets.
+- Nothing is stored: rooms live in memory only while someone's in them (on Cloudflare, in the open WebSockets' attachments, not in Durable Object storage), and invite links are self-contained signed tokens with an expiry.
+- No logs by default: the app doesn't log room codes, names or IP addresses, Workers Logs are off, coturn logging is off, Caddy discards all its logs, and Docker keeps no container logs.
+- The signaling server does see some things while a call is set up: room ids, display names, IP addresses and network candidates, and the **room password in plain text** (over TLS) when a guest types it, because that's how it checks it. It keeps none of this after the room empties.
+- Whoever runs the server (you, and Cloudflare if you use it, since it terminates TLS) can see that connection metadata, but never call content.
+- Browsers contact a STUN server to learn their public address: `stun.cloudflare.com` by default, your own coturn with Docker, or whatever `STUN_URLS` says.
+
+See [DOCS.md](DOCS.md) for the full security model and how it works under the hood.
 
 ## Project structure
 
 ```
 vchat/
-├── apps/web/                    SvelteKit frontend (static SPA)
-├── apps/cloudflare/             Cloudflare Worker + Durable Object (signaling + static hosting)
+├── apps/web/                    SvelteKit frontend (static SPA; owner dashboard at /admin)
+├── apps/cloudflare/             Cloudflare Worker + Durable Object
 ├── apps/desktop/                Experimental Tauri desktop shell
 ├── packages/signaling-server/
-│   ├── src/core/                Shared room logic, protocol, TURN credentials (used by both backends)
+│   ├── src/core/                Shared logic: rooms, invites, sign-in, relay credentials, HTTP API
 │   └── src/index.ts             Node.js server (local dev + Docker)
-├── deploy.sh                    Interactive VPS deployment
-├── docker-compose.yml           Production containers (Caddy, signaling, coturn)
+├── deploy.sh                    Interactive server deployment
+├── docker-compose.yml           Containers (Caddy, signaling, coturn)
 ├── Caddyfile                    Reverse proxy + TLS
 └── turnserver.conf.template     coturn config template
 ```
-
-See [DOCS.md](DOCS.md) for how it works under the hood.
 
 ## License
 

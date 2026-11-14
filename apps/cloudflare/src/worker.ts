@@ -1,51 +1,23 @@
-// Cloudflare Worker entry point: serves the static web app and routes signaling to Durable Objects.
+// Cloudflare Worker entry point: routes signaling to Durable Objects and serves the shared API.
+// Static files (apps/web/build) are served directly by Workers Static Assets — security headers for
+// them come from apps/web/static/_headers — so the Worker only runs for /ws, /api/* and /healthz.
 //
-//   GET /api/ice-servers  -> STUN/TURN config (Cloudflare Realtime TURN if configured)
-//   WS  /ws?room=<id>     -> SignalingRoom Durable Object for that room
-//   *                     -> static assets from apps/web/build (SPA fallback to index.html)
+//   WS  /ws?room=<id>  -> SignalingRoom Durable Object for that room
+//   /api/*             -> shared API (core/api.ts): config, ICE servers, owner sign-in, invites
+//
+// Owner sign-in: Cloudflare Access (CF_ACCESS_TEAM_DOMAIN + CF_ACCESS_AUD) or ADMIN_PASSWORD.
+// Either one also requires SECRET_KEY. With nothing configured (or OPEN_MODE=1), the app runs in
+// open mode; anything in between is reported as a configuration error.
 
-import { getIceServers, isValidRoomId } from '@vchat/signaling-server/core';
-import type { Env } from './env.ts';
+import { authorizeSocket, handleApi, hmacBase64Url, ipKey, isValidRoomId, resolveConfig } from '@vchat/signaling-server/core';
+import { CLIENT_HEADER, type Env } from './env.ts';
 
 export { SignalingRoom } from './room.ts';
-
-const SECURITY_HEADERS: Record<string, string> = {
-  'X-Frame-Options': 'DENY',
-  'X-Content-Type-Options': 'nosniff',
-  'Referrer-Policy': 'strict-origin-when-cross-origin',
-  'Permissions-Policy': 'camera=(self), microphone=(self), display-capture=(self)',
-  'Strict-Transport-Security': 'max-age=31536000',
-};
-
-function timingSafeEqual(a: string, b: string): boolean {
-  const enc = new TextEncoder();
-  const ab = enc.encode(a);
-  const bb = enc.encode(b);
-  if (ab.byteLength !== bb.byteLength) return false;
-  return crypto.subtle.timingSafeEqual(ab, bb);
-}
-
-function isAuthorized(request: Request, env: Env): boolean {
-  if (!env.SITE_PASSWORD) return true;
-  const header = request.headers.get('Authorization') ?? '';
-  const [scheme, encoded] = header.split(' ');
-  if (scheme !== 'Basic' || !encoded) return false;
-  let decoded: string;
-  try {
-    // Browsers send UTF-8 credentials (we advertise charset="UTF-8"); atob alone yields Latin-1.
-    decoded = new TextDecoder().decode(Uint8Array.from(atob(encoded), (c) => c.charCodeAt(0)));
-  } catch {
-    return false;
-  }
-  const sep = decoded.indexOf(':');
-  const password = sep >= 0 ? decoded.slice(sep + 1) : '';
-  return timingSafeEqual(password, env.SITE_PASSWORD);
-}
 
 function allowedOrigins(env: Env): string[] {
   return (env.ALLOWED_ORIGIN ?? '')
     .split(',')
-    .map((s) => s.trim())
+    .map((s) => s.trim().toLowerCase().replace(/\/+$/, ''))
     .filter(Boolean);
 }
 
@@ -53,7 +25,7 @@ function originAllowed(request: Request, env: Env): boolean {
   const origin = request.headers.get('Origin');
   if (!origin) return false;
   const allowed = allowedOrigins(env);
-  if (allowed.length > 0) return allowed.includes(origin);
+  if (allowed.length > 0) return allowed.includes(origin.toLowerCase());
   try {
     return new URL(origin).host === new URL(request.url).host;
   } catch {
@@ -61,60 +33,100 @@ function originAllowed(request: Request, env: Env): boolean {
   }
 }
 
-function withHeaders(response: Response, headers: Record<string, string>): Response {
-  // Responses from fetch()/ASSETS are immutable; copy before adding headers.
+/** Cross-origin clients (e.g. the desktop app) may call the API only if listed in ALLOWED_ORIGIN. */
+function corsHeaders(request: Request, env: Env): Record<string, string> {
+  const origin = request.headers.get('Origin');
+  return origin && allowedOrigins(env).includes(origin.toLowerCase()) ? { 'Access-Control-Allow-Origin': origin, Vary: 'Origin' } : {};
+}
+
+const SECURITY_HEADERS: Record<string, string> = {
+  'X-Content-Type-Options': 'nosniff',
+  'Strict-Transport-Security': 'max-age=31536000',
+  'Content-Security-Policy': "frame-ancestors 'none'",
+  'Referrer-Policy': 'no-referrer',
+};
+
+/** Add security headers to a response the Worker generated itself. */
+function secure(response: Response): Response {
   const res = new Response(response.body, response);
-  for (const [k, v] of Object.entries(headers)) res.headers.set(k, v);
+  for (const [k, v] of Object.entries(SECURITY_HEADERS)) res.headers.set(k, v);
   return res;
 }
+
+function text(body: string, status: number): Response {
+  return secure(new Response(body, { status, headers: { 'Content-Type': 'text/plain; charset=utf-8', 'Cache-Control': 'no-store' } }));
+}
+
+/**
+ * Opaque per-client id for the Durable Object's password-guess throttle: an HMAC of the client's
+ * address (IPv6 grouped by /64), keyed by SECRET_KEY. The raw IP never reaches the Durable Object.
+ * (Open mode has no secret; the fixed key there only keeps the id consistent across isolates.)
+ */
+async function clientId(request: Request, env: Env): Promise<string> {
+  const ip = request.headers.get('CF-Connecting-IP');
+  return (await hmacBase64Url(env.SECRET_KEY || 'vchat-open-mode', `client:${ipKey(ip)}`)).slice(0, 22);
+}
+
+let loggedConfigError = false;
 
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
 
-    if (!isAuthorized(request, env)) {
-      return new Response('Authentication required', {
-        status: 401,
-        headers: { 'WWW-Authenticate': 'Basic realm="vchat", charset="UTF-8"' },
-      });
+    if (!loggedConfigError) {
+      const config = resolveConfig(env);
+      if (config.error) {
+        loggedConfigError = true;
+        console.error(`CONFIG ERROR: ${config.error}`); // once per isolate; clients only see { misconfigured: true }
+      }
     }
 
     if (url.pathname === '/ws') {
       if (request.headers.get('Upgrade')?.toLowerCase() !== 'websocket') {
-        return new Response('Expected WebSocket upgrade', { status: 426 });
+        return text('Expected WebSocket upgrade', 426);
       }
       if (!originAllowed(request, env)) {
-        return new Response('Origin not allowed', { status: 403 });
+        return text('Origin not allowed', 403);
       }
       const roomId = url.searchParams.get('room') ?? '';
       if (!isValidRoomId(roomId)) {
-        return new Response('Invalid room', { status: 400 });
+        return text('Invalid room', 400);
       }
+      // Private mode: no valid invite/host token for this room, no Durable Object.
+      if (!(await authorizeSocket(env, roomId, request.headers.get('Sec-WebSocket-Protocol')))) {
+        return text('Invite required', 401);
+      }
+      // Overwrite whatever the client may have sent in our internal header.
+      const headers = new Headers(request.headers);
+      headers.set(CLIENT_HEADER, await clientId(request, env));
       const stub = env.ROOMS.get(env.ROOMS.idFromName(roomId));
-      return stub.fetch(request);
-    }
-
-    if (url.pathname === '/api/ice-servers') {
-      // Cross-origin clients (e.g. the desktop app) are allowed only if listed in ALLOWED_ORIGIN.
-      const origin = request.headers.get('Origin');
-      const cors: Record<string, string> =
-        origin && allowedOrigins(env).includes(origin)
-          ? { 'Access-Control-Allow-Origin': origin, Vary: 'Origin' }
-          : {};
-      try {
-        const body = await getIceServers(env);
-        return Response.json(body, { headers: { 'Cache-Control': 'no-store', ...cors } });
-      } catch (err) {
-        console.error('Failed to build ICE servers:', err);
-        return Response.json({ error: 'TURN unavailable' }, { status: 502, headers: cors });
-      }
+      const response = await stub.fetch(new Request(request, { headers }));
+      return response.status === 101 ? response : secure(response);
     }
 
     if (url.pathname === '/healthz') {
-      return new Response('ok');
+      return text('ok', 200);
     }
 
-    const asset = await env.ASSETS.fetch(request);
-    return withHeaders(asset, SECURITY_HEADERS);
+    if (url.pathname.startsWith('/api/')) {
+      const cors = corsHeaders(request, env);
+      if (request.method === 'OPTIONS') {
+        return secure(
+          new Response(null, {
+            status: 204,
+            headers: { ...cors, 'Access-Control-Allow-Methods': 'GET', 'Access-Control-Allow-Headers': 'X-Vchat-Token' },
+          })
+        );
+      }
+      const response = await handleApi(request, env, { clientIp: request.headers.get('CF-Connecting-IP') ?? undefined });
+      if (response) {
+        const res = secure(response);
+        for (const [k, v] of Object.entries(cors)) res.headers.set(k, v);
+        return res;
+      }
+    }
+
+    // Only reached if run_worker_first is widened; normally assets never hit the Worker.
+    return env.ASSETS.fetch(request);
   },
 } satisfies ExportedHandler<Env>;

@@ -1,8 +1,10 @@
 # Copy to .dev.vars for `pnpm dev` (wrangler dev). .dev.vars is gitignored.
 # In production, set these with: npx wrangler secret put <NAME>
 
-# Optional: password-protect the site (username "vchat")
-# SITE_PASSWORD=change-me
+# Private mode (owner signs in, guests use invite links). SECRET_KEY without an owner sign-in is
+# a configuration error; leave everything unset (or set OPEN_MODE=1) for open mode.
+# SECRET_KEY=generate-with-openssl-rand-hex-32
+# ADMIN_PASSWORD=change-me-10-chars-min
 
 # Optional: Cloudflare Realtime TURN (dashboard → Realtime → TURN Server → Create)
 # CF_TURN_KEY_ID=

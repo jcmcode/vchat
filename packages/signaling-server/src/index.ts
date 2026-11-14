@@ -1,46 +1,117 @@
 // Node.js signaling server (used by local dev and the Docker/VPS deployment).
 //
-//   GET  /api/ice-servers   -> STUN/TURN config for browsers
+//   /api/*                  -> shared HTTP API (see core/api.ts): config, ICE servers, owner sign-in, invites
 //   GET  /healthz           -> "ok"
 //   WS   /ws?room=<id>      -> signaling (any path is accepted for WebSocket upgrades)
 
+import { createHmac, randomBytes } from 'node:crypto';
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import { WebSocketServer, type WebSocket } from 'ws';
 import {
+  CLOSE_INVALID_INVITE,
   MAX_MESSAGE_SIZE,
   PONG_MESSAGE,
   RateLimiter,
   Room,
-  getIceServers,
+  WS_PROTOCOL,
+  authorizeJoin,
+  authorizeSocket,
+  handleApi,
+  ipKey,
+  isValidRoomId,
   parseClientMessage,
+  resolveConfig,
+  sweepApiState,
   type ClientMessage,
-  type IceEnv,
+  type ServerEnv,
   type Transport,
 } from './core/index.js';
+
+const env = process.env as ServerEnv;
+const DEBUG_LOGS = process.env.DEBUG_LOGS === '1';
+const config = resolveConfig(env);
 
 // --port=NNNN (used by `pnpm dev`) wins over $PORT so a PORT meant for another process can't hijack it.
 const portArg = process.argv.find((a) => a.startsWith('--port='))?.slice('--port='.length);
 const PORT = parseInt(portArg ?? process.env.PORT ?? '3001', 10);
 const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGIN ?? '')
   .split(',')
-  .map((s) => s.trim())
+  .map((s) => s.trim().toLowerCase().replace(/\/+$/, ''))
   .filter(Boolean);
 
+/** Sockets that have this much queued (a client not reading) are dropped. */
+const MAX_BUFFERED_BYTES = 1024 * 1024;
+
 const transport: Transport<WebSocket> = {
-  send: (ws, data) => ws.send(data),
+  send: (ws, data) => safeSend(ws, data),
   isOpen: (ws) => ws.readyState === ws.OPEN,
   close: (ws, code, reason) => ws.close(code, reason),
 };
 
+/** Send, unless the client has stopped reading: then drop it rather than buffer without limit. */
+function safeSend(ws: WebSocket, data: string): void {
+  if (ws.readyState !== ws.OPEN) return;
+  if (ws.bufferedAmount > MAX_BUFFERED_BYTES) {
+    ws.terminate();
+    return;
+  }
+  ws.send(data);
+}
+
+interface SocketInfo {
+  /** The room this socket was authorized for at the upgrade; it can't join any other. */
+  roomId: string;
+  /** Keyed hash of the client address (for room-password throttling); never the raw IP. */
+  clientId: string;
+}
+
 const rooms = new Map<string, Room<WebSocket>>();
-const connRoom = new Map<WebSocket, string>();
+const sockets = new WeakMap<WebSocket, SocketInfo>();
 /** create/join calls still awaiting their password hash, per room — such rooms must not be reaped. */
 const pendingEnters = new Map<string, number>();
 const limiter = new RateLimiter<WebSocket>();
-const alive = new WeakMap<WebSocket, boolean>();
+/** Sockets we've pinged and not yet heard a pong from. */
+const awaitingPong = new WeakSet<WebSocket>();
+const missedPong = new WeakSet<WebSocket>();
+/** Each socket's messages are handled one at a time (joins await hashing; no interleaving). */
+const queues = new WeakMap<WebSocket, Promise<void>>();
+/** Sockets that aren't in a room (never entered, or left) are closed after this long. */
+const IDLE_SOCKET_MS = 5 * 60 * 1000;
+const idleTimers = new WeakMap<WebSocket, ReturnType<typeof setTimeout>>();
+/** Keys client hashes; random per process if there's no SECRET_KEY (open mode). */
+const CLIENT_KEY = env.SECRET_KEY || randomBytes(32).toString('hex');
 
-function originAllowed(origin: string | undefined): boolean {
-  return ALLOWED_ORIGINS.length === 0 || (!!origin && ALLOWED_ORIGINS.includes(origin));
+function clientIdFor(ip: string): string {
+  return createHmac('sha256', CLIENT_KEY).update(`client:${ipKey(ip)}`).digest('base64url').slice(0, 22);
+}
+
+function armIdle(ws: WebSocket): void {
+  clearIdle(ws);
+  idleTimers.set(
+    ws,
+    setTimeout(() => {
+      const info = sockets.get(ws);
+      if (!info || !rooms.get(info.roomId)?.has(ws)) ws.close(4001, 'Idle');
+    }, IDLE_SOCKET_MS)
+  );
+}
+
+function clearIdle(ws: WebSocket): void {
+  const timer = idleTimers.get(ws);
+  if (timer) clearTimeout(timer);
+  idleTimers.delete(ws);
+}
+
+/** ALLOWED_ORIGIN if set; otherwise only the site's own origin (like the Cloudflare Worker). */
+function originAllowed(origin: string | undefined, req: IncomingMessage): boolean {
+  if (!origin) return false;
+  if (ALLOWED_ORIGINS.length > 0) return ALLOWED_ORIGINS.includes(origin.toLowerCase());
+  try {
+    const host = String(req.headers['x-forwarded-host'] ?? req.headers.host ?? '').split(',')[0].trim().toLowerCase();
+    return new URL(origin).host === host;
+  } catch {
+    return false;
+  }
 }
 
 // ── HTTP ──────────────────────────────────────────────────────────────────
@@ -48,7 +119,7 @@ function originAllowed(origin: string | undefined): boolean {
 /** Lets clients on another origin (desktop app, custom server setting) read /api responses. */
 function setCors(req: IncomingMessage, res: ServerResponse): void {
   const origin = req.headers.origin;
-  if (origin && originAllowed(origin)) {
+  if (origin && ALLOWED_ORIGINS.includes(origin.toLowerCase())) {
     res.setHeader('Access-Control-Allow-Origin', origin);
     res.setHeader('Vary', 'Origin');
   }
@@ -59,7 +130,13 @@ async function handleHttp(req: IncomingMessage, res: ServerResponse): Promise<vo
   setCors(req, res);
 
   if (req.method === 'OPTIONS') {
-    res.writeHead(204, { 'Access-Control-Allow-Methods': 'GET', 'Access-Control-Max-Age': '86400' }).end();
+    res
+      .writeHead(204, {
+        'Access-Control-Allow-Methods': 'GET',
+        'Access-Control-Allow-Headers': 'X-Vchat-Token',
+        'Access-Control-Max-Age': '86400',
+      })
+      .end();
     return;
   }
 
@@ -68,19 +145,45 @@ async function handleHttp(req: IncomingMessage, res: ServerResponse): Promise<vo
     return;
   }
 
-  if (req.method === 'GET' && url.pathname === '/api/ice-servers') {
-    try {
-      const body = await getIceServers(process.env as IceEnv);
-      res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
-      res.end(JSON.stringify(body));
-    } catch (err) {
-      console.error('Failed to build ICE servers:', err);
-      res.writeHead(502, { 'Content-Type': 'application/json' }).end('{"error":"TURN unavailable"}');
-    }
+  const response = await handleApi(await toFetchRequest(req), env, { clientIp: clientIp(req) });
+  if (!response) {
+    res.writeHead(404, { 'Content-Type': 'text/plain' }).end('Not found');
     return;
   }
+  response.headers.forEach((value, key) => res.setHeader(key, value));
+  res.writeHead(response.status).end(Buffer.from(await response.arrayBuffer()));
+}
 
-  res.writeHead(404, { 'Content-Type': 'text/plain' }).end('Not found');
+/** Adapt Node's request to a Fetch Request for the shared API handler. */
+async function toFetchRequest(req: IncomingMessage): Promise<Request> {
+  const proto = String(req.headers['x-forwarded-proto'] ?? 'http').split(',')[0].trim();
+  const url = new URL(req.url ?? '/', `${proto}://${req.headers.host ?? 'localhost'}`);
+  const headers = new Headers();
+  for (const [key, value] of Object.entries(req.headers)) {
+    if (Array.isArray(value)) value.forEach((v) => headers.append(key, v));
+    else if (value !== undefined) headers.set(key, value);
+  }
+  let body: Buffer | undefined;
+  if (req.method !== 'GET' && req.method !== 'HEAD') {
+    const chunks: Buffer[] = [];
+    let size = 0;
+    for await (const chunk of req) {
+      size += (chunk as Buffer).length;
+      if (size > 16 * 1024) break; // API bodies are tiny; ignore anything larger
+      chunks.push(chunk as Buffer);
+    }
+    body = Buffer.concat(chunks);
+  }
+  return new Request(url, { method: req.method, headers, body: body ? new Uint8Array(body) : undefined });
+}
+
+/** The last X-Forwarded-For hop is the one added by our own reverse proxy (Caddy). */
+function clientIp(req: IncomingMessage): string {
+  const forwarded = String(req.headers['x-forwarded-for'] ?? '')
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean);
+  return forwarded.at(-1) ?? req.socket.remoteAddress ?? 'unknown';
 }
 
 const server = createServer((req, res) => {
@@ -94,17 +197,27 @@ const server = createServer((req, res) => {
 const wss = new WebSocketServer({
   server,
   maxPayload: MAX_MESSAGE_SIZE,
-  verifyClient: ({ origin }, done) => {
-    if (originAllowed(origin)) return done(true);
-    console.warn(`Rejected connection from origin: ${origin || 'unknown'}`);
-    done(false, 403, 'Origin not allowed');
+  handleProtocols: (protocols) => (protocols.has(WS_PROTOCOL) ? WS_PROTOCOL : false),
+  verifyClient: ({ origin, req }, done) => {
+    if (!originAllowed(origin, req)) return done(false, 403, 'Origin not allowed');
+    const roomId = new URL(req.url ?? '/', 'http://localhost').searchParams.get('room') ?? '';
+    if (!isValidRoomId(roomId)) return done(false, 400, 'Invalid room');
+    // Private mode: no valid invite/host token for this room, no socket.
+    authorizeSocket(env, roomId, req.headers['sec-websocket-protocol'])
+      .then((ok) => (ok ? done(true) : done(false, 401, 'Invite required')))
+      .catch(() => done(false, 500));
   },
 });
 
 function getOrCreateRoom(roomId: string): Room<WebSocket> {
   let room = rooms.get(roomId);
   if (!room) {
-    room = new Room(roomId, transport, { log: console.log });
+    room = new Room(roomId, transport, {
+      // Re-arm the idle timer whenever a socket stops being in the room (left, denied, timed out…).
+      onMemberChange: (ws, state) => (state ? clearIdle(ws) : ws.readyState === ws.OPEN && armIdle(ws)),
+      // No logs by default: room codes and names are only printed with DEBUG_LOGS=1.
+      log: DEBUG_LOGS ? console.log : undefined,
+    });
     rooms.set(roomId, room);
   }
   return room;
@@ -116,59 +229,94 @@ function reapIfEmpty(roomId: string): void {
   if (room && room.isEmpty() && !pendingEnters.get(roomId)) rooms.delete(roomId);
 }
 
-function leaveCurrentRoom(ws: WebSocket): void {
-  const roomId = connRoom.get(ws);
-  if (!roomId) return;
-  connRoom.delete(ws);
-  rooms.get(roomId)?.leave(ws);
-  reapIfEmpty(roomId);
+function leaveRoom(ws: WebSocket): void {
+  const info = sockets.get(ws);
+  if (!info) return;
+  rooms.get(info.roomId)?.leave(ws);
+  reapIfEmpty(info.roomId);
 }
 
 function sendError(ws: WebSocket, message: string): void {
-  if (ws.readyState === ws.OPEN) ws.send(JSON.stringify({ type: 'error', message }));
+  safeSend(ws, JSON.stringify({ type: 'error', message }));
 }
 
 async function handleMessage(ws: WebSocket, msg: ClientMessage): Promise<void> {
+  const info = sockets.get(ws);
+  if (!info) return;
   switch (msg.type) {
     case 'ping':
-      ws.send(PONG_MESSAGE);
+      safeSend(ws, PONG_MESSAGE);
       return;
     case 'create-room':
     case 'join': {
-      if (connRoom.get(ws) !== msg.roomId) leaveCurrentRoom(ws);
+      // A socket is authorized for one room at the upgrade and can't be used for another.
+      if (msg.roomId !== info.roomId) return sendError(ws, 'Room ID does not match connection');
+      // Private mode: every entry needs a valid invite or host token (checked before touching rooms).
+      let grant: { role: 'host' | 'guest'; approval: boolean } | null = null;
+      if (config.mode === 'private') {
+        if (msg.type === 'create-room') return sendError(ws, 'Invite required');
+        const decision = await authorizeJoin(env, msg, { clientId: info.clientId });
+        if (!decision.ok) {
+          if ('passwordRequired' in decision) {
+            safeSend(ws, JSON.stringify({ type: 'password-required', roomId: msg.roomId, invalid: decision.invalid }));
+          } else {
+            sendError(ws, decision.error);
+            // An invalid or expired invite won't get better: hang up.
+            if (decision.fatal) ws.close(CLOSE_INVALID_INVITE, decision.error);
+          }
+          return;
+        }
+        grant = decision.grant;
+      }
+
       const room = getOrCreateRoom(msg.roomId);
-      connRoom.set(ws, msg.roomId);
+      const args = { ...msg, clientId: info.clientId };
       pendingEnters.set(msg.roomId, (pendingEnters.get(msg.roomId) ?? 0) + 1);
       try {
-        if (msg.type === 'create-room') await room.create(ws, msg);
-        else await room.join(ws, msg);
+        if (grant) await room.enter(ws, args, grant);
+        else if (msg.type === 'create-room') await room.create(ws, args);
+        else await room.join(ws, args);
       } finally {
         const left = (pendingEnters.get(msg.roomId) ?? 1) - 1;
         if (left > 0) pendingEnters.set(msg.roomId, left);
         else pendingEnters.delete(msg.roomId);
       }
-      // The socket may have closed while we were hashing, or been rejected.
+      // The socket may have closed while we were hashing.
       if (ws.readyState !== ws.OPEN) room.leave(ws);
-      if (!room.has(ws) && connRoom.get(ws) === msg.roomId) connRoom.delete(ws);
       reapIfEmpty(msg.roomId);
       return;
     }
     case 'leave':
-      leaveCurrentRoom(ws);
+      leaveRoom(ws);
       return;
     default: {
-      const room = rooms.get(connRoom.get(ws) ?? '');
+      const room = rooms.get(info.roomId);
       if (!room) return;
       if (msg.type === 'signal') room.signal(ws, msg.targetPeerId, msg.signal);
       else if (msg.type === 'admit-peer') room.admitPeer(ws, msg.peerId);
       else if (msg.type === 'deny-peer') room.denyPeer(ws, msg.peerId);
+      else if (msg.type === 'remove-peer') room.removePeer(ws, msg.peerId);
+      reapIfEmpty(info.roomId);
     }
   }
 }
 
-wss.on('connection', (ws) => {
-  alive.set(ws, true);
-  ws.on('pong', () => alive.set(ws, true));
+wss.on('connection', (ws, req) => {
+  const roomId = new URL(req.url ?? '/', 'http://localhost').searchParams.get('room') ?? '';
+  if (!isValidRoomId(roomId)) {
+    ws.close(1008, 'Invalid room');
+    return;
+  }
+  sockets.set(ws, { roomId, clientId: clientIdFor(clientIp(req)) });
+
+  // A pong only counts if we actually asked (unsolicited pongs can't keep a socket alive).
+  ws.on('pong', () => {
+    if (awaitingPong.has(ws)) {
+      awaitingPong.delete(ws);
+      missedPong.delete(ws);
+    }
+  });
+  armIdle(ws);
 
   ws.on('message', (raw) => {
     if (!limiter.allow(ws)) {
@@ -180,21 +328,32 @@ wss.on('connection', (ws) => {
       sendError(ws, parsed.error);
       return;
     }
-    handleMessage(ws, parsed.msg).catch((err) => console.error('Handler error:', err));
+    const msg = parsed.msg;
+    const next = (queues.get(ws) ?? Promise.resolve())
+      .then(() => handleMessage(ws, msg))
+      .catch((err) => console.error('Handler error:', err instanceof Error ? err.message : 'unknown error'));
+    queues.set(ws, next);
   });
 
-  ws.on('close', () => leaveCurrentRoom(ws));
-  ws.on('error', () => leaveCurrentRoom(ws));
+  ws.on('close', () => {
+    clearIdle(ws);
+    leaveRoom(ws);
+  });
+  ws.on('error', () => leaveRoom(ws));
 });
 
 // Heartbeat: terminate sockets that miss a protocol-level ping.
 const heartbeat = setInterval(() => {
   for (const ws of wss.clients) {
-    if (alive.get(ws) === false) {
-      ws.terminate();
-      continue;
+    if (awaitingPong.has(ws)) {
+      // No answer to the last ping: one more chance, then drop it.
+      if (missedPong.has(ws)) {
+        ws.terminate();
+        continue;
+      }
+      missedPong.add(ws);
     }
-    alive.set(ws, false);
+    awaitingPong.add(ws);
     ws.ping();
   }
 }, 30_000);
@@ -208,14 +367,19 @@ const housekeeping = setInterval(() => {
     reapIfEmpty(id);
     peers += room.peers().length;
   }
-  if (++ticks % 12 === 0 && rooms.size > 0) {
+  sweepApiState();
+  if (DEBUG_LOGS && ++ticks % 12 === 0 && rooms.size > 0) {
     console.log(`[stats] ${rooms.size} room(s), ${peers} peer(s)`);
   }
 }, 5_000);
 
 server.listen(PORT, () => {
   console.log(`Signaling server listening on http://localhost:${PORT} (WebSocket on any path)`);
-  if (ALLOWED_ORIGINS.length === 0) console.log('ALLOWED_ORIGIN not set — accepting any origin');
+  if (ALLOWED_ORIGINS.length === 0) console.log('ALLOWED_ORIGIN not set — accepting same-origin connections only');
+  // Logged once here; clients only ever see { misconfigured: true }.
+  if (config.error) console.error(`CONFIG ERROR: ${config.error}`);
+  else if (config.mode === 'private') console.log(`Private mode: owner signs in via ${config.auth}; guests need invites`);
+  else console.log('Open mode: anyone can create rooms (set ADMIN_PASSWORD + SECRET_KEY for private mode)');
 });
 
 function shutdown(): void {

@@ -1,6 +1,6 @@
 <script lang="ts">
   import { page } from '$app/stores';
-  import { onMount, onDestroy } from 'svelte';
+  import { onMount, onDestroy, tick } from 'svelte';
   import { goto, replaceState } from '$app/navigation';
   import { browser } from '$app/environment';
   import {
@@ -9,6 +9,7 @@
     connectionState,
     admissionState,
     admissionDeniedReason,
+    hostPresent,
     passwordInvalid,
     roomError,
     submitRoomPassword,
@@ -16,12 +17,16 @@
     hostStatus,
     reactions as reactionsStore,
     speakingPeers,
+    sharingPeers,
+    localPeerIdStore,
     joinRoom,
     leaveRoom,
     sendChatMessage,
+    sendFileToRoom,
     sendReaction,
     admitPeer,
     denyPeer,
+    removePeer,
     startSharingScreen,
     stopSharingScreen,
     type PeerConnection,
@@ -45,21 +50,45 @@
     getSavedDisplayName,
     saveDisplayName,
     takePendingPassword,
+    takePendingRoomName,
+    takePendingJoin,
+    forgetRoom,
     markRoomCreated,
     wasRoomCreated,
     rememberRoomPassword,
     recallRoomPassword,
     peerId,
     getPeerSecret,
+    useRoomIdentity,
+    getRelayOnly,
+    setRelayOnly,
     ensureUniqueTabIdentity,
+    fetchServerConfig,
+    setRoomToken,
+    getRoomToken,
+    readToken,
+    inviteUrl,
+    getSavedRooms,
+    setRoomKey,
+    getRoomKey,
+    roomUrl,
   } from '$lib/stores/room';
+  import { whiteboardOpen, whiteboardNotice, openWhiteboard, closeWhiteboard } from '$lib/collab/whiteboard';
+  import { clearScreen, annotationTool } from '$lib/collab/annotations';
+  import { roomName, initRoomName, renameRoom, MAX_ROOM_NAME } from '$lib/collab/room-meta';
+  import Icon from '$lib/ui/Icon.svelte';
   import VideoTile from './VideoTile.svelte';
+  import { setE2EKey, verification, blockedConnections, hasRoomKey, isValidRoomKey, allowUnverified } from '$lib/webrtc/e2e';
   import ChatPanel from './ChatPanel.svelte';
   import WaitingScreen from './WaitingScreen.svelte';
   import AdmissionPanel from './AdmissionPanel.svelte';
   import DeviceSettings from './DeviceSettings.svelte';
   import ReactionOverlay from './ReactionOverlay.svelte';
   import ReactionPicker from './ReactionPicker.svelte';
+  import Whiteboard from './Whiteboard.svelte';
+  import AnnotationLayer from './AnnotationLayer.svelte';
+
+  type JoinMode = 'video' | 'audio' | 'chat';
 
   let roomId = '';
   let displayName = '';
@@ -69,6 +98,8 @@
   let showReactionPicker = false;
   let peerList: PeerConnection[] = [];
   let localVideoEl: HTMLVideoElement;
+  let localScreenEl: HTMLVideoElement;
+  let stageVideoEl: HTMLVideoElement | null = null;
   let copied = false;
   let wasScreenSharing = false;
   let mediaError = '';
@@ -76,17 +107,28 @@
   let unreadCount = 0;
   let lastSeenMessageCount = 0;
   let passwordAttempt = '';
-  let needsName = false;
-  let nameInput = '';
-  let resolveName: (() => void) | null = null;
+  /** Chat-only: joined without camera or microphone. */
+  let chatOnly = false;
 
-  function handleSubmitName() {
-    const trimmed = nameInput.trim();
+  // Pre-join screen: name + how to join (video / audio / chat only)
+  let showPrejoin = false;
+  let prejoinName = '';
+  let prejoinMode: JoinMode = 'video';
+  /** Connect only through the relay server, so other participants never learn your IP address. */
+  let hideIp = getRelayOnly();
+  let resolvePrejoin: (() => void) | null = null;
+
+  // Renaming the room (host only)
+  let editingName = false;
+  let nameDraft = '';
+
+  function handleSubmitPrejoin() {
+    const trimmed = prejoinName.trim();
     if (!trimmed) return;
     displayName = trimmed.slice(0, 30);
     saveDisplayName(displayName);
-    needsName = false;
-    resolveName?.();
+    showPrejoin = false;
+    resolvePrejoin?.();
   }
 
   function handleSubmitPassword() {
@@ -106,8 +148,20 @@
     }
   }
 
-  $: roomId = ($page.params.id ?? "").toLowerCase();
+  $: roomId = ($page.params.id ?? '').toLowerCase();
   $: peerList = Array.from($peers.values());
+
+  // ── Stage: whiteboard or a shared screen takes the main area; tiles move to a strip ──
+  $: remoteSharer = [...$sharingPeers].find((id) => $peers.has(id)) ?? null;
+  $: stage = $whiteboardOpen
+    ? 'whiteboard'
+    : $isScreenSharing
+      ? 'local-screen'
+      : remoteSharer
+        ? 'remote-screen'
+        : null;
+  $: stagePeer = stage === 'remote-screen' && remoteSharer ? $peers.get(remoteSharer) ?? null : null;
+  $: stripPeers = stagePeer ? peerList.filter((p) => p.id !== stagePeer?.id) : peerList;
   $: gridCols = getGridCols(peerList.length + 1);
 
   function getGridCols(count: number): number {
@@ -116,58 +170,202 @@
     return 3;
   }
 
+  // Annotations belong to one share: clear them when that share ends.
+  let prevSharers = new Set<string>();
+  $: {
+    for (const id of prevSharers) if (!$sharingPeers.has(id)) clearScreen(id);
+    prevSharers = new Set($sharingPeers);
+  }
+  $: if (!stage || stage === 'whiteboard') annotationTool.set('none');
+
   // onMount is async: the user can leave (or the page can unmount) while we await a prompt.
   let destroyed = false;
+
+  let shareUrl = '';
+
+  // ── End-to-end verification summary (header badge) ──
+  // Every peer counts (a connection that hasn't opened yet is still being checked).
+  $: verStates = peerList.map((p) => $verification.get(p.id)?.state ?? 'pending');
+  $: unverifiedPeers = peerList.filter((p) => $verification.get(p.id)?.state === 'unverified');
+  $: e2eStatus = !$hasRoomKey
+    ? 'nokey'
+    : verStates.some((v) => v === 'unverified' || v === 'failed' || v === 'allowed')
+      ? 'partial'
+      : verStates.length === 0
+        ? 'ready'
+        : verStates.every((v) => v === 'verified')
+          ? 'verified'
+          : 'checking';
+  $: e2eLabel = {
+    verified: 'Verified end-to-end',
+    checking: 'Verifying…',
+    ready: 'End-to-end encrypted',
+    partial: 'Not everyone is verified',
+    nokey: 'Not verified',
+  }[e2eStatus];
+  $: e2eTitle = {
+    verified: "Every connection in this call was checked with this room's secret key: it's encrypted end to end, directly between participants, and nobody in between (including the server) can listen in. For extra certainty, compare safety codes (tap a person).",
+    checking: "Checking each connection with the room's secret key. Nobody can see or hear you until their connection is verified.",
+    ready: "Calls are encrypted end to end. Each person who joins is checked with the room's secret key before you can see or hear each other.",
+    partial: "At least one connection couldn't be verified. Unverified people can't see or hear you unless you choose “Allow anyway”.",
+    nokey: "You joined without the room's secret key (it's the part of the invite link after “#”), so connections can't be verified. Calls are still encrypted, but you can't rule out someone intercepting them.",
+  }[e2eStatus];
+
+  // ── Tap a person: private message / send a file ──
+  let selectedPeerId: string | null = null;
+  let chatRecipient = '';
+  let personFileInput: HTMLInputElement;
+  let personNotice = '';
+  /** Two-step "Remove from call" (host only), so it can't happen by accident. */
+  let confirmRemove = false;
+  $: if (selectedPeerId !== undefined) confirmRemove = false;
+
+  function removeSelected() {
+    if (!selectedPeer) return;
+    if (!confirmRemove) {
+      confirmRemove = true;
+      return;
+    }
+    removePeer(selectedPeer.id);
+    selectedPeerId = null;
+  }
+  // (If the person leaves, the lookup returns null and the menu closes.)
+  $: selectedPeer = selectedPeerId ? $peers.get(selectedPeerId) ?? null : null;
+
+  function messagePerson(peerId: string) {
+    chatRecipient = peerId;
+    showChat = true;
+    selectedPeerId = null;
+  }
+
+  function sendFileToPerson(e: Event) {
+    const input = e.target as HTMLInputElement;
+    const file = input.files?.[0];
+    input.value = '';
+    if (!file || !selectedPeer) return;
+    const name = selectedPeer.displayName;
+    if (file.size > 50 * 1024 * 1024) personNotice = 'That file is over the 50MB limit.';
+    else if (!sendFileToRoom(file, selectedPeer.id)) personNotice = `${name} can't receive files right now.`;
+    else {
+      personNotice = '';
+      chatRecipient = selectedPeer.id;
+      showChat = true; // the transfer shows up in chat
+      selectedPeerId = null;
+    }
+  }
+
+  function verificationText(v: string | undefined): string {
+    switch (v) {
+      case 'verified':
+        return 'Verified: encrypted end to end, directly between you';
+      case 'allowed':
+        return 'Not verified: you allowed this connection anyway';
+      case 'unverified':
+        return "Couldn't verify: blocked unless you allow it";
+      case 'failed':
+        return 'Blocked: failed verification';
+      case 'nokey':
+        return "Not verified: you don't have the room key";
+      default:
+        return 'Verifying…';
+    }
+  }
 
   onMount(async () => {
     if (!browser) return;
 
-    const urlName = $page.url.searchParams.get('name');
-    displayName = urlName || getSavedDisplayName();
-    if (!displayName) {
-      // Opened a shared link directly: ask for a name before joining.
-      needsName = true;
-      await new Promise<void>((resolve) => (resolveName = resolve));
-    }
+    // An invite link carries its token after "#invite=". Keep it for this tab only and take it out
+    // of the address bar so it isn't shown, bookmarked or kept in history.
+    const fragment = new URLSearchParams(window.location.hash.slice(1));
+    const inviteParam = fragment.get('invite');
+    if (inviteParam) setRoomToken(roomId, inviteParam);
+    // The room's end-to-end key (only ever in the "#" part of links, never sent to a server).
+    const keyParam = fragment.get('k');
+    if (isValidRoomKey(keyParam)) setRoomKey(roomId, keyParam);
+    // Choices made on the home page (tab storage — URL parameters are deliberately ignored, so a
+    // crafted link can't join someone to a call with their camera on).
+    const pendingJoin = takePendingJoin(roomId);
+    // Mark the room as ours right away, so a refresh during the pre-join screen still reopens it.
+    if (pendingJoin?.creator) markRoomCreated(roomId);
 
-    const isCreator = $page.url.searchParams.get('creator') === '1' || wasRoomCreated(roomId);
-    if (isCreator) markRoomCreated(roomId);
+    // The router must finish starting before shallow-routing calls work on a fresh page load.
+    // Strip the token and key from the address bar before anything else happens.
+    await tick();
+    if (destroyed) return;
+    replaceState(`/room/${roomId}`, {});
+    const config = await fetchServerConfig();
+    if (destroyed) return;
+    const token = getRoomToken(roomId);
+    const tokenInfo = readToken(token);
+    initRoomName(takePendingRoomName(roomId) ?? tokenInfo.label);
+    const roomKey = getRoomKey(roomId);
+    // Load the end-to-end key now, so the status shown before joining is already right.
+    await setE2EKey(roomId, roomKey);
+    if (destroyed) return;
+    if (tokenInfo.role === 'guest' && token) shareUrl = inviteUrl(roomId, token, roomKey);
+    else if (tokenInfo.role === 'host') {
+      const saved = getSavedRooms().find((r) => r.roomId === roomId);
+      if (saved) shareUrl = inviteUrl(roomId, saved.inviteToken, saved.key ?? roomKey);
+    } else if (config.mode === 'open') shareUrl = roomUrl(roomId, roomKey);
+
+    if (config.mode === 'private' && !token) {
+      roomError.set(
+        config.misconfigured
+          ? "The server isn't set up correctly. Tell the owner."
+          : 'This is a private server. You need an invite link from the owner to join.'
+      );
+      return;
+    }
+    if (destroyed) return;
+
+    // Pre-join: confirm your name and choose video, audio only or chat only.
+    // Skipped when coming from the home page, where those choices were just made.
+    displayName = pendingJoin?.name || getSavedDisplayName();
+    prejoinName = displayName;
+    prejoinMode = pendingJoin?.mode ?? 'video';
+    if (!pendingJoin || !displayName) {
+      showPrejoin = true;
+      await new Promise<void>((resolve) => (resolvePrejoin = resolve));
+    }
+    if (destroyed) return;
+    chatOnly = prejoinMode === 'chat';
+
+    // Open mode only: the creator makes the room. In private mode the token decides everything.
+    const isCreator = config.mode === 'open' && wasRoomCreated(roomId);
     const password = takePendingPassword() ?? recallRoomPassword(roomId);
     if (password) rememberRoomPassword(roomId, password);
-    const voiceOnly = $page.url.searchParams.get('voiceOnly') === '1';
 
-    if (destroyed) return;
-
-    try {
-      await startMedia({ voiceOnly });
-      if (destroyed) {
-        stopMedia(); // left during the camera prompt — release the camera again
-        return;
-      }
-      mediaReady = true;
-    } catch (err) {
-      console.error('Failed to get media:', err);
-      if (err instanceof DOMException) {
-        if (err.name === 'NotAllowedError') {
-          mediaError = 'Camera/microphone access was denied. Check your browser permissions.';
-        } else if (err.name === 'NotFoundError') {
-          mediaError = 'No camera or microphone found on this device.';
-        } else {
-          mediaError = `Media error: ${err.message}`;
+    if (!chatOnly) {
+      try {
+        await startMedia({ voiceOnly: prejoinMode === 'audio' });
+        if (destroyed) {
+          stopMedia(); // left during the camera prompt — release the camera again
+          return;
         }
-      } else {
-        mediaError = 'Could not access camera or microphone.';
+        mediaReady = true;
+      } catch (err) {
+        console.error('Failed to get media:', err);
+        if (err instanceof DOMException) {
+          if (err.name === 'NotAllowedError') {
+            mediaError = 'Camera/microphone access was denied. You can still chat — check your browser permissions to talk.';
+          } else if (err.name === 'NotFoundError') {
+            mediaError = 'No camera or microphone found on this device. You can still chat.';
+          } else {
+            mediaError = `Media error: ${err.message}`;
+          }
+        } else {
+          mediaError = 'Could not access camera or microphone.';
+        }
+        mediaReady = true;
       }
-      mediaReady = true;
     }
 
     if (destroyed) return;
 
-    // Drop one-time flags from the address bar so a shared or refreshed URL is just the room.
-    replaceState(`/room/${roomId}`, {});
-
-    await ensureUniqueTabIdentity();
+    useRoomIdentity(roomId);
+    await ensureUniqueTabIdentity(roomId);
     if (destroyed) return;
+
 
     await joinRoom({
       serverUrl: signalUrlForRoom(roomId),
@@ -177,7 +375,12 @@
       displayName,
       isCreator,
       password,
+      token,
+      relayOnly: hideIp,
     });
+    // Messages restored from this tab's history aren't "unread".
+    lastSeenMessageCount = $chatMessages.length;
+    if (chatOnly) showChat = true;
   });
 
   onDestroy(() => {
@@ -185,18 +388,22 @@
     if (browser) {
       leaveRoom();
       stopMedia();
+      // Leaving the page (any way except a reload) forgets this call's chat, password and keys.
+      if (roomId) forgetRoom(roomId);
     }
   });
 
   function handleLeave() {
     leaveRoom();
     stopMedia();
+    forgetRoom(roomId); // pressing Leave forgets this call's chat, password and invite in this tab
     goto('/');
   }
 
   function handleCancelWaiting() {
     leaveRoom();
     stopMedia();
+    forgetRoom(roomId);
     goto('/');
   }
 
@@ -224,11 +431,37 @@
     }
   }
 
+  function toggleWhiteboard() {
+    if ($whiteboardOpen) closeWhiteboard();
+    else openWhiteboard();
+  }
+
   function copyLink() {
-    const url = `${window.location.origin}/room/${roomId}`;
-    navigator.clipboard.writeText(url).catch(() => {});
+    if (!shareUrl) return;
+    navigator.clipboard.writeText(shareUrl).catch(() => {});
     copied = true;
     setTimeout(() => { copied = false; }, 2000);
+  }
+
+  function startRename() {
+    if (!$hostStatus) return;
+    nameDraft = $roomName;
+    editingName = true;
+  }
+
+  function commitRename() {
+    if (editingName) renameRoom(nameDraft);
+    editingName = false;
+  }
+
+  function onRenameKey(e: KeyboardEvent) {
+    if (e.key === 'Enter') commitRename();
+    else if (e.key === 'Escape') editingName = false;
+  }
+
+  function focusOnMount(node: HTMLInputElement) {
+    node.focus();
+    node.select();
   }
 
   $: {
@@ -237,28 +470,34 @@
     }
     if (!$isScreenSharing) {
       meshStopCalled = false;
+      if (wasScreenSharing && $localPeerIdStore) clearScreen($localPeerIdStore);
     }
     wasScreenSharing = $isScreenSharing;
   }
 
-  $: if (localVideoEl) {
-    if ($isScreenSharing && $screenStream) {
-      localVideoEl.srcObject = $screenStream;
-    } else if ($localStream) {
-      localVideoEl.srcObject = $localStream;
-    }
+  // Your own tile always shows your camera; your shared screen appears on the stage.
+  $: if (localVideoEl && $localStream && localVideoEl.srcObject !== $localStream) {
+    localVideoEl.srcObject = $localStream;
+  }
+  $: if (localScreenEl && $screenStream && localScreenEl.srcObject !== $screenStream) {
+    localScreenEl.srcObject = $screenStream;
   }
 
-  // Redirect on denied admission
-  $: if ($admissionState === 'denied') {
-    setTimeout(() => {
+  // Redirect on denied admission (cancelled if the page goes away first)
+  let deniedTimer: ReturnType<typeof setTimeout> | null = null;
+  $: if ($admissionState === 'denied' && !deniedTimer) {
+    deniedTimer = setTimeout(() => {
       leaveRoom();
       stopMedia();
       goto('/');
     }, 3000);
   }
+  onDestroy(() => {
+    if (deniedTimer) clearTimeout(deniedTimer);
+  });
 
   $: localSpeaking = $speakingPeers.has('local');
+  $: localHasVideo = !chatOnly && !$voiceOnlyMode && $videoEnabled && !!$localStream?.getVideoTracks().length;
 
   // Track unread messages when chat is closed
   $: {
@@ -276,57 +515,108 @@
   $: showReconnecting = wasConnected && $connectionState === 'disconnected';
 </script>
 
-{#if needsName}
-  <div class="denied-overlay">
-    <form class="denied-card neutral" on:submit|preventDefault={handleSubmitName}>
-      <h2>Join room {roomId}</h2>
-      <p>What should others call you?</p>
-      <!-- svelte-ignore a11y-autofocus -->
-      <input class="overlay-input" type="text" bind:value={nameInput} placeholder="Your name" maxlength="30" autofocus />
-      <div class="overlay-actions">
-        <button type="button" class="overlay-btn" on:click={() => goto('/')}>Cancel</button>
-        <button type="submit" class="overlay-btn primary" disabled={!nameInput.trim()}>Join</button>
+{#if showPrejoin}
+  <div class="overlay">
+    <form
+      class="dialog card fade-in prejoin"
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="prejoin-title"
+      on:submit|preventDefault={handleSubmitPrejoin}
+    >
+      <h2 id="prejoin-title">{$roomName || 'Join the call'}</h2>
+      <p class="dialog-sub">Choose your name and how you'd like to join.</p>
+      <div class="field">
+        <label class="field-label" for="prejoin-name">Your name</label>
+        <!-- svelte-ignore a11y-autofocus -->
+        <input id="prejoin-name" class="input" type="text" bind:value={prejoinName} placeholder="Your name" maxlength="30" autofocus />
+      </div>
+      <fieldset class="join-modes">
+        <legend class="field-label">Join with</legend>
+        <label class="mode" class:selected={prejoinMode === 'video'}>
+          <input type="radio" bind:group={prejoinMode} value="video" />
+          <span class="mode-icon"><Icon name="video" size={18} /></span>
+          <span class="mode-text"><strong>Camera &amp; mic</strong><small>Video and voice</small></span>
+          <span class="mode-check" aria-hidden="true"><Icon name="check" size={14} /></span>
+        </label>
+        <label class="mode" class:selected={prejoinMode === 'audio'}>
+          <input type="radio" bind:group={prejoinMode} value="audio" />
+          <span class="mode-icon"><Icon name="mic" size={18} /></span>
+          <span class="mode-text"><strong>Audio only</strong><small>Voice, no camera</small></span>
+          <span class="mode-check" aria-hidden="true"><Icon name="check" size={14} /></span>
+        </label>
+        <label class="mode" class:selected={prejoinMode === 'chat'}>
+          <input type="radio" bind:group={prejoinMode} value="chat" />
+          <span class="mode-icon"><Icon name="message" size={18} /></span>
+          <span class="mode-text"><strong>Chat only</strong><small>No camera or mic · you still see and hear everyone</small></span>
+          <span class="mode-check" aria-hidden="true"><Icon name="check" size={14} /></span>
+        </label>
+      </fieldset>
+      <label class="hide-ip">
+        <input type="checkbox" bind:checked={hideIp} on:change={() => setRelayOnly(hideIp)} />
+        <span>
+          <strong>Hide my IP address</strong>
+          <small>Route through the server's relay instead of connecting directly. Still end-to-end encrypted; may add a little delay. Needs a TURN relay on this server.</small>
+        </span>
+      </label>
+      <div class="dialog-actions">
+        <button type="button" class="btn ghost" on:click={() => goto('/')}>Cancel</button>
+        <button type="submit" class="btn primary" disabled={!prejoinName.trim()}>Join</button>
       </div>
     </form>
   </div>
 {/if}
 
 {#if $admissionState === 'waiting'}
-  <WaitingScreen on:cancel={handleCancelWaiting} />
+  <WaitingScreen hostPresent={$hostPresent} on:cancel={handleCancelWaiting} />
 {/if}
 
 {#if $admissionState === 'denied'}
-  <div class="denied-overlay">
-    <div class="denied-card">
-      <h2>Couldn't join</h2>
-      <p>{$admissionDeniedReason || 'You were not admitted to this room.'} Redirecting...</p>
+  <div class="overlay">
+    <div class="dialog card fade-in center" role="alertdialog" aria-modal="true" aria-labelledby="denied-title">
+      <div class="dialog-icon danger"><Icon name="x" size={22} /></div>
+      <h2 id="denied-title">Couldn't join</h2>
+      <p class="dialog-sub">{$admissionDeniedReason || 'You were not admitted to this room.'} Redirecting...</p>
     </div>
   </div>
 {:else if $roomError}
-  <div class="denied-overlay">
-    <div class="denied-card">
-      <h2>Couldn't join</h2>
-      <p>{$roomError}</p>
-      <button class="overlay-btn" on:click={handleLeave}>Back to home</button>
+  <div class="overlay">
+    <div class="dialog card fade-in center" role="alertdialog" aria-modal="true" aria-labelledby="error-title">
+      <div class="dialog-icon danger"><Icon name="x" size={22} /></div>
+      <h2 id="error-title">Couldn't join</h2>
+      <p class="dialog-sub">{$roomError}</p>
+      <div class="dialog-actions">
+        <button class="btn primary" on:click={handleLeave}>Back to home</button>
+      </div>
     </div>
   </div>
 {:else if $admissionState === 'password'}
-  <div class="denied-overlay">
-    <form class="denied-card" on:submit|preventDefault={handleSubmitPassword}>
-      <h2>Password required</h2>
-      <p>{$passwordInvalid ? 'That password was wrong. Try again.' : 'This room is password protected.'}</p>
+  <div class="overlay">
+    <form
+      class="dialog card fade-in center"
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="password-title"
+      on:submit|preventDefault={handleSubmitPassword}
+    >
+      <div class="dialog-icon"><Icon name="lock" size={22} /></div>
+      <h2 id="password-title">Password required</h2>
+      <p class="dialog-sub" class:invalid={$passwordInvalid} role={$passwordInvalid ? 'alert' : undefined}>
+        {$passwordInvalid ? 'That password was wrong. Try again.' : 'This room is password protected.'}
+      </p>
       <!-- svelte-ignore a11y-autofocus -->
       <input
-        class="overlay-input"
+        class="input"
         type="password"
         bind:value={passwordAttempt}
         placeholder="Room password"
+        aria-label="Room password"
         autocomplete="off"
         autofocus
       />
-      <div class="overlay-actions">
-        <button type="button" class="overlay-btn" on:click={handleLeave}>Cancel</button>
-        <button type="submit" class="overlay-btn primary" disabled={!passwordAttempt}>Join</button>
+      <div class="dialog-actions">
+        <button type="button" class="btn ghost" on:click={handleLeave}>Cancel</button>
+        <button type="submit" class="btn primary" disabled={!passwordAttempt}>Join</button>
       </div>
     </form>
   </div>
@@ -337,312 +627,536 @@
 <div class="room" on:click={handleWindowClick}>
   <header>
     <div class="room-info">
-      <span class="room-id">{roomId}</span>
-      <button class="copy-btn" on:click={copyLink}>
-        {copied ? 'Copied!' : 'Copy link'}
-      </button>
-      <span class="conn-status" class:connected={$connectionState === 'connected'}>
-        {$connectionState}
+      <span
+        class="status-dot"
+        class:connected={$connectionState === 'connected'}
+        class:disconnected={$connectionState === 'disconnected'}
+        title={$connectionState}
+        role="status"
+      >
+        <span class="sr-only">{$connectionState}</span>
       </span>
+      {#if editingName}
+        <input
+          class="rename-input input"
+          bind:value={nameDraft}
+          maxlength={MAX_ROOM_NAME}
+          placeholder="Room name"
+          aria-label="Room name"
+          on:keydown={onRenameKey}
+          on:blur={commitRename}
+          use:focusOnMount
+        />
+      {:else if $hostStatus}
+        <button class="room-id renamable" title="Rename this room for everyone" on:click={startRename}>
+          <span class="room-id-text">{$roomName || roomId}</span>
+          <span class="pen"><Icon name="pen" size={14} /></span>
+          <span class="sr-only">Rename room</span>
+        </button>
+      {:else}
+        <h1 class="room-id" title={roomId}>{$roomName || roomId}</h1>
+      {/if}
       {#if $hostStatus}
-        <span class="host-badge">Host</span>
+        <span class="chip accent">Host</span>
       {/if}
     </div>
-    <div class="peer-count">
-      {peerList.length + 1} in call
+    <div class="header-end">
+      <span class="e2e-badge {e2eStatus}" title={e2eTitle} role="status">
+        <Icon name={e2eStatus === 'partial' || e2eStatus === 'nokey' ? 'shield-alert' : e2eStatus === 'verified' ? 'shield-check' : 'shield'} size={15} />
+        <span class="e2e-label">{e2eLabel}</span>
+      </span>
+      {#if shareUrl}
+        <button class="btn small copy-btn" class:copied on:click={copyLink} title="Copy a link others can use to join">
+          <Icon name={copied ? 'check' : 'link'} size={15} />
+          <span class="copy-label">{copied ? 'Copied!' : 'Copy invite link'}</span>
+        </button>
+      {/if}
+      <div class="peer-count" title="Participants">
+        <Icon name="users" size={16} />
+        <span aria-hidden="true">{peerList.length + 1}</span>
+        <span class="sr-only">{peerList.length + 1} in call</span>
+      </div>
     </div>
   </header>
 
+  {#each $blockedConnections as blocked (blocked.peerId)}
+    <div class="banner danger" role="alert">
+      <Icon name="shield-alert" size={16} />
+      Blocked the connection to {blocked.name}: {blocked.reason}. Someone may be trying to intercept the call. Share a fresh invite link through a channel you trust.
+    </div>
+  {/each}
+
+  {#each unverifiedPeers as up (up.id)}
+    <div class="banner warning" role="alert">
+      <Icon name="shield-alert" size={16} />
+      <span>
+        Couldn't verify <strong>{up.displayName}</strong> ({$verification.get(up.id)?.reason ?? 'no proof'}). You can't see or hear each other
+        until they're verified. If you trust them (e.g. they typed the room code), you can allow it, but it may be intercepted.
+      </span>
+      <button class="btn small secondary" on:click={() => allowUnverified(up.id)}>Allow anyway</button>
+    </div>
+  {/each}
+
   {#if showReconnecting}
-    <div class="reconnecting-banner">
+    <div class="banner warning" role="status">
       <span class="reconnect-spinner"></span>
       Connection lost. Reconnecting...
     </div>
   {/if}
 
   {#if mediaError}
-    <div class="media-error-banner">
+    <div class="banner danger" role="alert">
       {mediaError}
     </div>
   {/if}
 
-  {#if $hostStatus && $admissionRequests.length > 0}
-    <AdmissionPanel
-      requests={$admissionRequests}
-      on:admit={(e) => admitPeer(e.detail)}
-      on:deny={(e) => denyPeer(e.detail)}
-    />
-  {/if}
-
-  <ReactionOverlay reactions={$reactionsStore} />
-
-  <main class="video-grid" style="--cols: {gridCols}">
-    <div class="tile self" class:screen-sharing={$isScreenSharing} class:speaking={localSpeaking}>
-      {#if ($voiceOnlyMode || !$videoEnabled) && !$isScreenSharing}
-        <div class="no-video">
-          <span class="avatar">{displayName.charAt(0).toUpperCase()}</span>
-        </div>
-      {:else}
-        <video
-          bind:this={localVideoEl}
-          autoplay
-          muted
-          playsinline
-        ></video>
-      {/if}
-      <span class="tile-name">{displayName} (you)</span>
-      {#if !$audioEnabled}
-        <span class="muted-badge">Muted</span>
-      {/if}
+  {#if $whiteboardNotice && !$whiteboardOpen}
+    <div class="banner info" role="status">
+      <Icon name="whiteboard" size={16} />
+      <span>{$whiteboardNotice.name} opened the whiteboard.</span>
+      <button class="banner-btn" on:click={openWhiteboard}>Open it</button>
+      <button class="banner-dismiss" on:click={() => whiteboardNotice.set(null)} aria-label="Dismiss">
+        <Icon name="x" size={14} />
+      </button>
     </div>
-
-    {#each peerList as pc (pc.id)}
-      <VideoTile peerConnection={pc} speaking={$speakingPeers.has(pc.id)} />
-    {/each}
-  </main>
-
-  {#if showChat}
-    <ChatPanel
-      messages={$chatMessages}
-      on:send={(e) => sendChatMessage(e.detail)}
-      on:close={() => { showChat = false; }}
-    />
   {/if}
 
-  {#if showDeviceSettings}
-    <DeviceSettings />
-  {/if}
-
-  {#if showReactionPicker}
-    <ReactionPicker on:react={(e) => { sendReaction(e.detail); showReactionPicker = false; }} />
-  {/if}
-
-  <footer>
-    <div class="controls">
-      <button
-        class="ctrl-btn"
-        class:off={!$audioEnabled}
-        on:click={handleToggleAudio}
-        title={$audioEnabled ? 'Mute' : 'Unmute'}
-      >
-        <span class="ctrl-label">{$audioEnabled ? 'Mic On' : 'Mic Off'}</span>
-      </button>
-
-      <button
-        class="ctrl-btn"
-        class:off={!$videoEnabled}
-        on:click={handleToggleVideo}
-        title={$videoEnabled ? 'Camera off' : 'Camera on'}
-      >
-        <span class="ctrl-label">{$videoEnabled ? 'Cam On' : 'Cam Off'}</span>
-      </button>
-
-      <button
-        class="ctrl-btn"
-        class:active={$isScreenSharing}
-        on:click={handleScreenShare}
-        title={$isScreenSharing ? 'Stop sharing' : 'Share screen'}
-      >
-        <span class="ctrl-label">{$isScreenSharing ? 'Stop' : 'Screen'}</span>
-      </button>
-
-      <button
-        class="ctrl-btn"
-        class:active={showChat}
-        on:click={() => { showChat = !showChat; }}
-        title="Chat"
-      >
-        <span class="ctrl-label">Chat</span>
-        {#if unreadCount > 0 && !showChat}
-          <span class="unread-badge">{unreadCount > 99 ? '99+' : unreadCount}</span>
+  <div class="room-body">
+    <div class="call-col">
+      <main class="call-area" class:has-stage={!!stage}>
+        {#if stage}
+          <section class="stage" aria-label={stage === 'whiteboard' ? 'Whiteboard' : 'Shared screen'}>
+            {#if stage === 'whiteboard'}
+              <Whiteboard on:close={closeWhiteboard} />
+            {:else if stage === 'local-screen'}
+              <div class="stage-screen">
+                <!-- svelte-ignore a11y-media-has-caption -->
+                <video bind:this={localScreenEl} autoplay muted playsinline></video>
+                <span class="tile-name"><span class="name-text">You are presenting</span></span>
+                {#if $localPeerIdStore}
+                  <AnnotationLayer videoEl={localScreenEl} screen={$localPeerIdStore} />
+                {/if}
+              </div>
+            {:else if stagePeer}
+              {#key stagePeer.id}
+                <VideoTile
+                  peerConnection={stagePeer}
+                  speaking={$speakingPeers.has(stagePeer.id)}
+                  contain
+                  presenting
+                  verification={$verification.get(stagePeer.id)?.state}
+                  bind:videoEl={stageVideoEl}
+                >
+                  <AnnotationLayer videoEl={stageVideoEl} screen={stagePeer.id} />
+                </VideoTile>
+              {/key}
+            {/if}
+          </section>
         {/if}
-      </button>
 
-      <button
-        class="ctrl-btn"
-        class:active={showReactionPicker}
-        on:click={() => { showReactionPicker = !showReactionPicker; showDeviceSettings = false; }}
-        title="React"
-      >
-        <span class="ctrl-label">React</span>
-      </button>
+        <div class={stage ? 'tile-strip' : 'video-grid'} style={stage ? '' : `--cols: ${gridCols}`}>
+          <div class="tile self" class:speaking={localSpeaking}>
+            {#if localHasVideo}
+              <video bind:this={localVideoEl} autoplay muted playsinline></video>
+            {:else}
+              <div class="no-video">
+                <span class="avatar">{displayName.charAt(0).toUpperCase()}</span>
+              </div>
+            {/if}
+            <span class="tile-name">
+              <span class="name-text">{displayName} (you){chatOnly ? ' · chat only' : ''}</span>
+              {#if !chatOnly && !$audioEnabled}
+                <span class="muted-icon" title="Muted"><Icon name="mic-off" size={13} /><span class="sr-only">Muted</span></span>
+              {/if}
+            </span>
+          </div>
 
-      <button
-        class="ctrl-btn"
-        class:active={showDeviceSettings}
-        on:click={() => { showDeviceSettings = !showDeviceSettings; showReactionPicker = false; }}
-        title="Settings"
-      >
-        <span class="ctrl-label">Settings</span>
-      </button>
+          {#each stripPeers as pc (pc.id)}
+            <VideoTile
+              peerConnection={pc}
+              speaking={$speakingPeers.has(pc.id)}
+              presenting={$sharingPeers.has(pc.id)}
+              verification={$verification.get(pc.id)?.state}
+              selectable
+              on:select={() => (selectedPeerId = pc.id)}
+            />
+          {/each}
+        </div>
+      </main>
 
-      <button class="ctrl-btn leave" on:click={handleLeave} title="Leave call">
-        <span class="ctrl-label">Leave</span>
-      </button>
+      {#if $hostStatus && $admissionRequests.length > 0}
+        <AdmissionPanel
+          requests={$admissionRequests}
+          on:admit={(e) => admitPeer(e.detail)}
+          on:deny={(e) => denyPeer(e.detail)}
+        />
+      {/if}
+
+      <ReactionOverlay reactions={$reactionsStore} />
+
+      {#if showDeviceSettings}
+        <DeviceSettings />
+      {/if}
+
+      {#if showReactionPicker}
+        <ReactionPicker on:react={(e) => { sendReaction(e.detail); showReactionPicker = false; }} />
+      {/if}
+
+      <footer>
+        <div class="controls" role="group" aria-label="Call controls">
+          {#if !chatOnly && $localStream?.getAudioTracks().length}
+            <button
+              class="ctrl-btn"
+              class:off={!$audioEnabled}
+              aria-pressed={$audioEnabled}
+              on:click={handleToggleAudio}
+              title={$audioEnabled ? 'Mute' : 'Unmute'}
+            >
+              <Icon name={$audioEnabled ? 'mic' : 'mic-off'} size={22} />
+              <span class="ctrl-label">Mic</span>
+            </button>
+          {/if}
+
+          {#if !chatOnly && $localStream?.getVideoTracks().length}
+            <button
+              class="ctrl-btn"
+              class:off={!$videoEnabled}
+              aria-pressed={$videoEnabled}
+              on:click={handleToggleVideo}
+              title={$videoEnabled ? 'Camera off' : 'Camera on'}
+            >
+              <Icon name={$videoEnabled ? 'video' : 'video-off'} size={22} />
+              <span class="ctrl-label">Camera</span>
+            </button>
+          {/if}
+
+          {#if !chatOnly}
+            <button
+              class="ctrl-btn"
+              class:active={$isScreenSharing}
+              aria-pressed={$isScreenSharing}
+              on:click={handleScreenShare}
+              title={$isScreenSharing ? 'Stop sharing' : 'Share screen'}
+            >
+              <Icon name={$isScreenSharing ? 'screen-share-off' : 'screen-share'} size={22} />
+              <span class="ctrl-label">{$isScreenSharing ? 'Stop' : 'Share'}</span>
+            </button>
+          {/if}
+
+          <button
+            class="ctrl-btn"
+            class:active={$whiteboardOpen}
+            aria-pressed={$whiteboardOpen}
+            on:click={toggleWhiteboard}
+            title={$whiteboardOpen ? 'Hide whiteboard' : 'Open the shared whiteboard'}
+          >
+            <Icon name="whiteboard" size={22} />
+            <span class="ctrl-label">Board</span>
+          </button>
+
+          <button
+            class="ctrl-btn"
+            class:active={showChat}
+            aria-pressed={showChat}
+            on:click={() => { showChat = !showChat; }}
+            title="Chat"
+          >
+            <Icon name="message" size={22} />
+            <span class="ctrl-label">Chat</span>
+            {#if unreadCount > 0 && !showChat}
+              <span class="unread-badge" aria-hidden="true">{unreadCount > 99 ? '99+' : unreadCount}</span>
+              <span class="sr-only">{unreadCount} unread</span>
+            {/if}
+          </button>
+
+          <button
+            class="ctrl-btn"
+            class:active={showReactionPicker}
+            aria-pressed={showReactionPicker}
+            aria-haspopup="true"
+            on:click={() => { showReactionPicker = !showReactionPicker; showDeviceSettings = false; }}
+            title="React"
+          >
+            <Icon name="smile" size={22} />
+            <span class="ctrl-label">React</span>
+          </button>
+
+          {#if !chatOnly}
+            <button
+              class="ctrl-btn"
+              class:active={showDeviceSettings}
+              aria-pressed={showDeviceSettings}
+              aria-haspopup="true"
+              on:click={() => { showDeviceSettings = !showDeviceSettings; showReactionPicker = false; }}
+              title="Settings"
+            >
+              <Icon name="settings" size={22} />
+              <span class="ctrl-label">Settings</span>
+            </button>
+          {/if}
+
+          <span class="ctrl-sep" aria-hidden="true"></span>
+
+          <button class="ctrl-btn leave" on:click={handleLeave} title="Leave call">
+            <Icon name="phone-off" size={22} />
+            <span class="ctrl-label">Leave</span>
+          </button>
+        </div>
+      </footer>
     </div>
-  </footer>
+
+    {#if selectedPeer}
+      <!-- svelte-ignore a11y-click-events-have-key-events -->
+      <!-- svelte-ignore a11y-no-static-element-interactions -->
+      <div class="person-backdrop" on:click|self={() => (selectedPeerId = null)}>
+        <div class="person-card" role="dialog" aria-modal="true" aria-label="Actions for {selectedPeer.displayName}">
+          <div class="person-head">
+            <span class="person-avatar">{selectedPeer.displayName.charAt(0).toUpperCase()}</span>
+            <div>
+              <strong>{selectedPeer.displayName}</strong>
+              <p class="person-ver {$verification.get(selectedPeer.id)?.state ?? 'pending'}">
+                <Icon name={$verification.get(selectedPeer.id)?.state === 'verified' ? 'shield-check' : 'shield-alert'} size={13} />
+                {verificationText($verification.get(selectedPeer.id)?.state)}
+              </p>
+            </div>
+            <button class="btn ghost small icon" on:click={() => (selectedPeerId = null)} aria-label="Close"><Icon name="x" size={16} /></button>
+          </div>
+          <div class="person-actions">
+            <button class="btn secondary" on:click={() => selectedPeer && messagePerson(selectedPeer.id)}>
+              <Icon name="message" size={16} /> Message privately
+            </button>
+            <button class="btn secondary" on:click={() => personFileInput.click()} disabled={!selectedPeer.connected}>
+              <Icon name="paperclip" size={16} /> Send a file
+            </button>
+            <input type="file" bind:this={personFileInput} on:change={sendFileToPerson} hidden />
+          </div>
+          {#if $verification.get(selectedPeer.id)?.code}
+            <div class="safety-code">
+              <span class="muted">Safety code</span>
+              <strong>{$verification.get(selectedPeer.id)?.code}</strong>
+              <p>Read it to {selectedPeer.displayName} (by voice, or another app). If you both see the same code, nobody is in the middle of your connection.</p>
+            </div>
+          {/if}
+          {#if $verification.get(selectedPeer.id)?.state === 'unverified'}
+            <button class="btn secondary" on:click={() => selectedPeer && allowUnverified(selectedPeer.id)}>
+              <Icon name="shield-alert" size={16} /> Allow this unverified connection
+            </button>
+          {/if}
+          {#if $hostStatus}
+            <button class="btn danger-ghost" on:click={removeSelected}>
+              <Icon name="x" size={16} />
+              {confirmRemove ? `Tap again to remove ${selectedPeer.displayName}` : 'Remove from call'}
+            </button>
+          {/if}
+          {#if personNotice}<p class="person-notice" role="alert">{personNotice}</p>{/if}
+          <p class="person-foot">Only {selectedPeer.displayName} receives it, encrypted straight from your device.</p>
+        </div>
+      </div>
+    {/if}
+
+    {#if showChat}
+      <ChatPanel
+        messages={$chatMessages}
+        bind:recipient={chatRecipient}
+        on:close={() => { showChat = false; }}
+      />
+    {/if}
+  </div>
 </div>
 
 <style>
   .room {
     height: 100vh;
+    height: 100dvh;
     display: flex;
     flex-direction: column;
     background: var(--bg);
   }
 
+  /* ── Header ─────────────────────────────────────────────────────────── */
   header {
     display: flex;
     align-items: center;
     justify-content: space-between;
-    padding: 0.75rem 1rem;
+    gap: var(--space-3);
+    min-height: 56px;
+    padding: var(--space-2) var(--space-4);
     background: var(--bg-surface);
-    border-bottom: 1px solid var(--border);
+    border-bottom: 1px solid var(--border-subtle);
+    flex-shrink: 0;
   }
 
-  .room-info {
+  .room-info,
+  .header-end {
     display: flex;
     align-items: center;
-    gap: 0.75rem;
+    gap: var(--space-3);
+    min-width: 0;
+  }
+
+  .header-end {
+    flex-shrink: 0;
   }
 
   .room-id {
+    font-size: var(--text-lg);
     font-weight: 600;
-    font-size: 1.1rem;
-    font-family: monospace;
-  }
-
-  .copy-btn {
-    background: var(--bg-elevated);
-    color: var(--text-muted);
-    padding: 0.3rem 0.6rem;
-    border-radius: 4px;
-    font-size: 0.8rem;
-    border: 1px solid var(--border);
-  }
-
-  .copy-btn:hover {
+    letter-spacing: -0.01em;
     color: var(--text);
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
 
-  .conn-status {
-    font-size: 0.8rem;
+  .status-dot {
+    width: 9px;
+    height: 9px;
+    flex-shrink: 0;
+    border-radius: 50%;
+    background: var(--warning);
+    box-shadow: 0 0 0 3px var(--warning-soft);
+  }
+
+  .status-dot.connected {
+    background: var(--success);
+    box-shadow: 0 0 0 3px var(--success-soft);
+  }
+
+  .status-dot.disconnected {
+    background: var(--danger);
+    box-shadow: 0 0 0 3px var(--danger-soft);
+  }
+
+  .renamable {
+    display: inline-flex;
+    align-items: center;
+    gap: var(--space-2);
+    min-height: 40px;
+    background: transparent;
+    border: 1px solid transparent;
+    color: var(--text);
+    padding: 0 var(--space-2);
+    margin-left: calc(var(--space-2) * -1);
+    border-radius: var(--radius);
+    cursor: text;
+    transition: background var(--dur-fast) var(--ease), border-color var(--dur-fast) var(--ease);
+  }
+
+  .renamable:hover {
+    background: var(--bg-hover);
+    border-color: var(--border);
+  }
+
+  .renamable .pen {
+    display: inline-flex;
+    color: var(--text-subtle);
+  }
+
+  .renamable:hover .pen {
     color: var(--text-muted);
   }
 
-  .conn-status.connected {
-    color: var(--success);
+  .room-id-text {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
   }
 
-  .host-badge {
-    font-size: 0.75rem;
-    background: var(--accent);
-    color: white;
-    padding: 0.15rem 0.5rem;
-    border-radius: 4px;
+  .rename-input {
+    width: min(280px, 50vw);
     font-weight: 600;
+  }
+
+  .copy-btn.copied {
+    color: var(--success);
+    border-color: transparent;
+    background: var(--success-soft);
   }
 
   .peer-count {
-    color: var(--text-muted);
-    font-size: 0.9rem;
-  }
-
-  .video-grid {
-    flex: 1;
-    display: grid;
-    grid-template-columns: repeat(var(--cols), 1fr);
-    gap: 4px;
-    padding: 4px;
-    overflow: hidden;
-  }
-
-  .tile {
-    position: relative;
-    background: var(--bg-surface);
-    border-radius: var(--radius);
-    overflow: hidden;
-    border: 2px solid transparent;
-    transition: border-color 0.2s, box-shadow 0.2s;
-  }
-
-  .tile.speaking {
-    border-color: var(--success);
-    box-shadow: 0 0 12px rgba(34, 197, 94, 0.3);
-  }
-
-  .tile video {
-    width: 100%;
-    height: 100%;
-    object-fit: cover;
-  }
-
-  .tile.self:not(.screen-sharing) video {
-    transform: scaleX(-1);
-  }
-
-  .tile .no-video {
-    display: flex;
+    display: inline-flex;
     align-items: center;
-    justify-content: center;
-    width: 100%;
-    height: 100%;
+    gap: 6px;
+    height: 36px;
+    padding: 0 var(--space-3);
+    border-radius: var(--radius-pill);
     background: var(--bg-elevated);
-  }
-
-  .tile .avatar {
-    font-size: 3rem;
-    font-weight: 600;
+    border: 1px solid var(--border);
     color: var(--text-muted);
-    background: var(--border);
-    width: 80px;
-    height: 80px;
-    border-radius: 50%;
+    font-size: var(--text-sm);
+    font-weight: 500;
+  }
+
+  /* ── Banners ────────────────────────────────────────────────────────── */
+  .banner {
     display: flex;
     align-items: center;
     justify-content: center;
+    flex-wrap: wrap;
+    gap: var(--space-2);
+    padding: var(--space-2) var(--space-4);
+    font-size: var(--text-sm);
+    border-bottom: 1px solid transparent;
+    flex-shrink: 0;
   }
 
-  .tile-name {
-    position: absolute;
-    bottom: 8px;
-    left: 8px;
-    background: rgba(0, 0, 0, 0.6);
-    color: white;
-    padding: 2px 8px;
-    border-radius: 4px;
-    font-size: 0.8rem;
+  .banner.warning {
+    background: var(--warning-soft);
+    color: var(--warning);
   }
 
-  .muted-badge {
-    position: absolute;
-    top: 8px;
-    right: 8px;
-    background: var(--danger);
-    color: white;
-    padding: 2px 6px;
-    border-radius: 4px;
-    font-size: 0.7rem;
-  }
-
-  .reconnecting-banner {
-    background: rgba(245, 158, 11, 0.15);
-    border: 1px solid #f59e0b;
-    color: #f59e0b;
-    padding: 0.5rem 1rem;
-    font-size: 0.85rem;
+  .banner.danger {
+    background: var(--danger-soft);
+    color: var(--danger);
     text-align: center;
-    display: flex;
+  }
+
+  .banner.info {
+    background: var(--accent-soft);
+    color: var(--text);
+  }
+
+  .banner.info > :global(svg) {
+    color: var(--accent);
+  }
+
+  .banner-btn {
+    min-height: 32px;
+    padding: 0 var(--space-3);
+    border-radius: var(--radius-pill);
+    background: var(--accent);
+    color: var(--accent-text);
+    font-size: var(--text-sm);
+    font-weight: 500;
+  }
+
+  .banner-btn:hover {
+    background: var(--accent-hover);
+  }
+
+  .banner-dismiss {
+    display: inline-flex;
     align-items: center;
     justify-content: center;
-    gap: 0.5rem;
+    width: 40px;
+    height: 40px;
+    margin: -6px 0;
+    border-radius: var(--radius);
+    background: transparent;
+    color: var(--text-muted);
+  }
+
+  .banner-dismiss:hover {
+    background: var(--bg-hover);
+    color: var(--text);
   }
 
   .reconnect-spinner {
     width: 14px;
     height: 14px;
-    border: 2px solid rgba(245, 158, 11, 0.3);
-    border-top-color: #f59e0b;
+    border: 2px solid var(--warning-soft);
+    border-top-color: var(--warning);
     border-radius: 50%;
     animation: spin 0.8s linear infinite;
     flex-shrink: 0;
@@ -652,181 +1166,740 @@
     to { transform: rotate(360deg); }
   }
 
-  .media-error-banner {
-    background: rgba(239, 68, 68, 0.15);
-    border: 1px solid var(--danger);
-    color: var(--danger);
-    padding: 0.5rem 1rem;
-    font-size: 0.85rem;
-    text-align: center;
+  /* ── Layout: [call column | chat sidebar] ───────────────────────────── */
+  .room-body {
+    flex: 1;
+    min-height: 0;
+    display: flex;
+    flex-direction: row;
   }
 
-  .denied-overlay {
-    position: fixed;
-    inset: 0;
-    background: rgba(0, 0, 0, 0.85);
+  .call-col {
+    position: relative;
+    flex: 1;
+    min-width: 0;
+    min-height: 0;
+    display: flex;
+    flex-direction: column;
+  }
+
+  .call-area {
+    flex: 1;
+    min-height: 0;
+    display: flex;
+    flex-direction: column;
+  }
+
+  .video-grid {
+    flex: 1;
+    min-height: 0;
+    display: grid;
+    grid-template-columns: repeat(var(--cols), minmax(0, 1fr));
+    grid-auto-rows: minmax(0, 1fr);
+    gap: var(--space-3);
+    padding: var(--space-3);
+    overflow: hidden;
+  }
+
+  .call-area.has-stage {
+    flex-direction: row;
+    gap: var(--space-3);
+    padding: var(--space-3);
+  }
+
+  .stage {
+    flex: 1;
+    min-width: 0;
+    min-height: 0;
+    display: flex;
+    position: relative;
+  }
+
+  .stage > :global(.tile),
+  .stage-screen {
+    flex: 1;
+    min-width: 0;
+    position: relative;
+    background: #000;
+    border-radius: var(--radius-lg);
+    border: 1px solid var(--border-subtle);
+    overflow: hidden;
+  }
+
+  .stage-screen video {
+    width: 100%;
+    height: 100%;
+    object-fit: contain;
+  }
+
+  .tile-strip {
+    width: 232px;
+    flex-shrink: 0;
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-3);
+    overflow-y: auto;
+    scrollbar-width: thin;
+  }
+
+  .tile-strip > :global(.tile),
+  .tile-strip > .tile {
+    aspect-ratio: 16 / 10;
+    flex-shrink: 0;
+  }
+
+  /* ── Tiles (self tile; VideoTile mirrors this) ──────────────────────── */
+  .tile {
+    position: relative;
+    min-width: 0;
+    min-height: 0;
+    background: var(--bg-surface);
+    border-radius: var(--radius-lg);
+    border: 1px solid var(--border-subtle);
+    overflow: hidden;
+    transition: border-color var(--dur) var(--ease), box-shadow var(--dur) var(--ease);
+  }
+
+  .tile.speaking {
+    border-color: var(--success);
+    box-shadow: 0 0 0 2px var(--success), 0 0 20px var(--success-soft);
+  }
+
+  .tile video {
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+    display: block;
+  }
+
+  .tile.self video {
+    transform: scaleX(-1);
+  }
+
+  .tile .no-video {
     display: flex;
     align-items: center;
     justify-content: center;
-    z-index: 100;
-  }
-
-  .denied-card {
-    background: var(--bg-surface);
-    border: 1px solid var(--border);
-    border-radius: 12px;
-    padding: 2rem;
-    text-align: center;
-    max-width: 320px;
-  }
-
-  .denied-card h2 {
-    color: var(--danger);
-    margin-bottom: 0.5rem;
-  }
-
-  .denied-card.neutral h2 {
-    color: var(--text);
-  }
-
-  .overlay-input {
     width: 100%;
-    margin-top: 1rem;
-    padding: 0.6rem 0.75rem;
-    border-radius: 6px;
-    border: 1px solid var(--border);
-    background: var(--bg-elevated);
-    color: var(--text);
-    font-size: 0.95rem;
+    height: 100%;
+    background: linear-gradient(160deg, var(--bg-elevated), var(--bg-surface));
   }
 
-  .overlay-actions {
+  .tile .avatar {
     display: flex;
-    gap: 0.5rem;
+    align-items: center;
     justify-content: center;
-    margin-top: 1rem;
-  }
-
-  .overlay-btn {
-    margin-top: 1rem;
-    padding: 0.5rem 1rem;
-    border-radius: 6px;
+    width: 72px;
+    height: 72px;
+    border-radius: 50%;
+    font-size: 2rem;
+    font-weight: 600;
+    color: var(--accent);
+    background: var(--accent-soft);
     border: 1px solid var(--border);
-    background: var(--bg-elevated);
-    color: var(--text);
   }
 
-  .overlay-actions .overlay-btn {
-    margin-top: 0;
+  .tile-strip .avatar {
+    width: 44px;
+    height: 44px;
+    font-size: 1.25rem;
   }
 
-  .overlay-btn.primary {
-    background: var(--accent);
-    border-color: var(--accent);
-    color: white;
+  .tile-name {
+    position: absolute;
+    left: var(--space-2);
+    bottom: var(--space-2);
+    max-width: calc(100% - 16px);
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 3px 10px;
+    border-radius: var(--radius-pill);
+    background: rgba(11, 13, 18, 0.62);
+    -webkit-backdrop-filter: blur(6px);
+    backdrop-filter: blur(6px);
+    color: #fff;
+    font-size: var(--text-xs);
+    font-weight: 500;
   }
 
-  .overlay-btn:disabled {
-    opacity: 0.5;
+  .name-text {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
 
-  .denied-card p {
-    color: var(--text-muted);
-    font-size: 0.9rem;
+  .muted-icon {
+    display: inline-flex;
+    color: #f87171;
+    flex-shrink: 0;
   }
 
+  /* ── Controls ───────────────────────────────────────────────────────── */
   footer {
-    padding: 0.75rem;
+    flex-shrink: 0;
+    padding: var(--space-3) var(--space-4);
+    padding-bottom: max(var(--space-3), env(safe-area-inset-bottom));
     background: var(--bg-surface);
-    border-top: 1px solid var(--border);
+    border-top: 1px solid var(--border-subtle);
   }
 
   .controls {
     display: flex;
+    align-items: center;
     justify-content: center;
-    gap: 0.5rem;
+    gap: var(--space-2);
     flex-wrap: wrap;
   }
 
   .ctrl-btn {
     position: relative;
+    display: inline-flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 4px;
+    min-width: 64px;
+    height: 56px;
+    padding: 0 var(--space-3);
+    border-radius: var(--radius-lg);
+    border: 1px solid var(--border);
     background: var(--bg-elevated);
     color: var(--text);
-    padding: 0.6rem 1.2rem;
-    border-radius: var(--radius);
-    font-size: 0.9rem;
-    border: 1px solid var(--border);
-    transition: all 0.15s;
+    transition: background var(--dur-fast) var(--ease), border-color var(--dur-fast) var(--ease),
+      color var(--dur-fast) var(--ease), transform var(--dur-fast) var(--ease);
   }
 
   .ctrl-btn:hover {
-    background: var(--border);
+    background: var(--bg-overlay);
+    border-color: var(--border-strong);
+  }
+
+  .ctrl-btn:active {
+    transform: translateY(1px);
+  }
+
+  .ctrl-btn:focus-visible {
+    outline: 2px solid var(--accent-ring);
+    outline-offset: 2px;
+    border-radius: var(--radius-lg);
+  }
+
+  .ctrl-label {
+    font-size: 0.6875rem;
+    font-weight: 500;
+    line-height: 1;
+    letter-spacing: 0.01em;
   }
 
   .ctrl-btn.off {
-    background: var(--danger);
+    background: var(--danger-soft);
+    border-color: transparent;
+    color: var(--danger);
+  }
+
+  .ctrl-btn.off:hover {
+    background: var(--danger-soft);
     border-color: var(--danger);
-    color: white;
   }
 
   .ctrl-btn.active {
-    background: var(--accent);
-    border-color: var(--accent);
-    color: white;
+    background: var(--accent-soft);
+    border-color: transparent;
+    color: var(--accent);
   }
 
-  .unread-badge {
-    position: absolute;
-    top: -4px;
-    right: -4px;
-    background: var(--danger);
-    color: white;
-    font-size: 0.65rem;
-    font-weight: 700;
-    min-width: 18px;
-    height: 18px;
-    border-radius: 9px;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    padding: 0 4px;
-    line-height: 1;
+  .ctrl-btn.active:hover {
+    border-color: var(--accent);
+  }
+
+  .ctrl-sep {
+    width: 1px;
+    height: 28px;
+    margin: 0 var(--space-1);
+    background: var(--border);
   }
 
   .ctrl-btn.leave {
     background: var(--danger);
-    border-color: var(--danger);
-    color: white;
+    border-color: transparent;
+    color: #fff;
+    min-width: 72px;
   }
 
   .ctrl-btn.leave:hover {
-    background: #dc2626;
+    background: var(--danger);
+    border-color: transparent;
+    filter: brightness(1.1);
+  }
+
+  .unread-badge {
+    position: absolute;
+    top: -6px;
+    right: -6px;
+    min-width: 20px;
+    height: 20px;
+    padding: 0 5px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    border-radius: var(--radius-pill);
+    background: var(--accent);
+    color: var(--accent-text);
+    border: 2px solid var(--bg-surface);
+    font-size: 0.6875rem;
+    font-weight: 700;
+    line-height: 1;
+  }
+
+  /* ── Dialogs ────────────────────────────────────────────────────────── */
+  .overlay {
+    position: fixed;
+    inset: 0;
+    z-index: 100;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: var(--space-4);
+    background: rgba(8, 10, 15, 0.72);
+    -webkit-backdrop-filter: blur(6px);
+    backdrop-filter: blur(6px);
+    overflow-y: auto;
+  }
+
+  .dialog {
+    width: min(100%, 400px);
+    padding: var(--space-6);
+    box-shadow: var(--shadow-lg);
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-3);
+  }
+
+  .dialog.center {
+    align-items: stretch;
+    text-align: center;
+    width: min(100%, 360px);
+  }
+
+  .dialog h2 {
+    font-size: var(--text-xl);
+    font-weight: 600;
+    letter-spacing: -0.01em;
+    color: var(--text);
+    overflow-wrap: anywhere;
+  }
+
+  .dialog-sub {
+    color: var(--text-muted);
+    font-size: var(--text-base);
+    margin-top: calc(var(--space-2) * -1);
+    overflow-wrap: anywhere;
+  }
+
+  .dialog-sub.invalid {
+    color: var(--danger);
+  }
+
+  .dialog-icon {
+    align-self: center;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 48px;
+    height: 48px;
+    border-radius: 50%;
+    background: var(--accent-soft);
+    color: var(--accent);
+  }
+
+  .dialog-icon.danger {
+    background: var(--danger-soft);
+    color: var(--danger);
+  }
+
+  .dialog-actions {
+    display: flex;
+    justify-content: flex-end;
+    gap: var(--space-2);
+    margin-top: var(--space-2);
+  }
+
+  .dialog.center .dialog-actions {
+    justify-content: center;
+  }
+
+  .field {
+    display: flex;
+    flex-direction: column;
+  }
+
+  .join-modes {
+    border: none;
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-2);
+  }
+
+  .join-modes legend {
+    margin-bottom: var(--space-2);
+    padding: 0;
+  }
+
+  .hide-ip {
+    display: flex;
+    gap: var(--space-2);
+    align-items: flex-start;
+    margin-top: var(--space-3);
+    cursor: pointer;
+  }
+
+  .hide-ip input {
+    margin-top: 0.2rem;
+  }
+
+  .hide-ip span {
+    display: grid;
+    gap: 0.15rem;
+  }
+
+  .hide-ip small {
+    color: var(--text-muted);
+    font-size: var(--text-xs, 0.75rem);
+  }
+
+  .mode {
+    position: relative;
+    display: flex;
+    align-items: center;
+    gap: var(--space-3);
+    min-height: 56px;
+    padding: var(--space-2) var(--space-3);
+    background: var(--bg-elevated);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    cursor: pointer;
+    transition: border-color var(--dur-fast) var(--ease), background var(--dur-fast) var(--ease);
+  }
+
+  .mode:hover {
+    border-color: var(--border-strong);
+  }
+
+  .mode.selected {
+    border-color: var(--accent);
+    background: var(--accent-soft);
+  }
+
+  .mode:focus-within {
+    box-shadow: 0 0 0 3px var(--accent-ring);
+  }
+
+  .mode input {
+    position: absolute;
+    opacity: 0;
+    inset: 0;
+    width: 100%;
+    height: 100%;
+    margin: 0;
+    cursor: pointer;
+  }
+
+  .mode-icon {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 36px;
+    height: 36px;
+    border-radius: var(--radius);
+    background: var(--bg-hover);
+    color: var(--text-muted);
+    flex-shrink: 0;
+  }
+
+  .mode.selected .mode-icon {
+    background: var(--accent);
+    color: var(--accent-text);
+  }
+
+  .mode-text {
+    display: flex;
+    flex-direction: column;
+    flex: 1;
+    min-width: 0;
+    line-height: 1.3;
+  }
+
+  .mode-text strong {
+    font-size: var(--text-base);
+    font-weight: 500;
+    color: var(--text);
+  }
+
+  .mode-text small {
+    font-size: var(--text-xs);
+    color: var(--text-muted);
+  }
+
+  .mode-check {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 20px;
+    height: 20px;
+    border-radius: 50%;
+    border: 1px solid var(--border-strong);
+    color: transparent;
+    flex-shrink: 0;
+  }
+
+  .mode.selected .mode-check {
+    background: var(--accent);
+    border-color: var(--accent);
+    color: var(--accent-text);
+  }
+
+  /* ── Responsive ─────────────────────────────────────────────────────── */
+  @media (max-width: 1100px) {
+    .tile-strip {
+      width: 190px;
+    }
+  }
+
+  @media (max-width: 768px) {
+    .call-area.has-stage {
+      flex-direction: column;
+    }
+
+    .tile-strip {
+      width: 100%;
+      height: 112px;
+      flex-direction: row;
+      overflow-x: auto;
+      overflow-y: hidden;
+    }
+
+    .tile-strip > :global(.tile),
+    .tile-strip > .tile {
+      height: 100%;
+      width: auto;
+    }
   }
 
   @media (max-width: 640px) {
-    .video-grid {
-      grid-template-columns: 1fr;
-    }
-
-    .ctrl-btn {
-      padding: 0.5rem 0.8rem;
-      font-size: 0.8rem;
-    }
-
-    .room-info {
-      gap: 0.4rem;
+    header {
+      padding: var(--space-2) var(--space-3);
     }
 
     .room-id {
-      font-size: 0.9rem;
-    }
-
-    header {
-      padding: 0.5rem 0.75rem;
+      font-size: var(--text-base);
     }
 
     .copy-btn {
+      width: 36px;
+      padding: 0;
+    }
+
+    .copy-label {
       display: none;
     }
+
+    .video-grid {
+      grid-template-columns: minmax(0, 1fr);
+      gap: var(--space-2);
+      padding: var(--space-2);
+    }
+
+    .call-area.has-stage {
+      gap: var(--space-2);
+      padding: var(--space-2);
+    }
+
+    footer {
+      padding: var(--space-2);
+      padding-bottom: max(var(--space-2), env(safe-area-inset-bottom));
+    }
+
+    .controls {
+      gap: var(--space-1);
+    }
+
+    .ctrl-btn,
+    .ctrl-btn.leave {
+      min-width: 44px;
+      width: 44px;
+      height: 44px;
+      padding: 0;
+      border-radius: var(--radius);
+    }
+
+    .ctrl-label {
+      position: absolute;
+      width: 1px;
+      height: 1px;
+      overflow: hidden;
+      clip: rect(0, 0, 0, 0);
+      white-space: nowrap;
+    }
+
+    .ctrl-sep {
+      display: none;
+    }
+
+    .dialog {
+      padding: var(--space-5);
+    }
+  }
+  /* ── End-to-end badge ── */
+  .e2e-badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.35rem;
+    padding: 0.25rem 0.6rem;
+    border-radius: var(--radius-pill, 999px);
+    font-size: var(--text-xs, 0.75rem);
+    font-weight: 600;
+    border: 1px solid var(--border);
+    color: var(--text-muted);
+    cursor: help;
+    white-space: nowrap;
+  }
+
+  .e2e-badge.verified {
+    color: var(--success);
+    background: var(--success-soft);
+    border-color: transparent;
+  }
+
+  .e2e-badge.partial,
+  .e2e-badge.nokey {
+    color: var(--warning);
+    background: var(--warning-soft);
+    border-color: transparent;
+  }
+
+  @media (max-width: 640px) {
+    .e2e-label {
+      display: none;
+    }
+  }
+
+  /* ── Person menu ── */
+  .person-backdrop {
+    position: fixed;
+    inset: 0;
+    background: rgba(0, 0, 0, 0.45);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    z-index: 60;
+    padding: 1rem;
+  }
+
+  .person-card {
+    width: 100%;
+    max-width: 360px;
+    background: var(--bg-surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-lg, 14px);
+    box-shadow: var(--shadow-lg);
+    padding: var(--space-5, 1.25rem);
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-4, 1rem);
+  }
+
+  .person-head {
+    display: flex;
+    align-items: flex-start;
+    gap: var(--space-3, 0.75rem);
+  }
+
+  .person-head > div {
+    flex: 1;
+    min-width: 0;
+  }
+
+  .person-avatar {
+    width: 40px;
+    height: 40px;
+    border-radius: 50%;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: var(--accent-soft);
+    color: var(--accent-text, var(--accent));
+    font-weight: 700;
+    flex-shrink: 0;
+  }
+
+  .person-ver {
+    margin: 0.2rem 0 0;
+    display: flex;
+    align-items: center;
+    gap: 0.3rem;
+    font-size: var(--text-xs, 0.75rem);
+    color: var(--text-muted);
+  }
+
+  .person-ver.verified {
+    color: var(--success);
+  }
+
+  .person-ver.unverified,
+  .person-ver.allowed,
+  .person-ver.nokey,
+  .person-ver.failed {
+    color: var(--warning);
+  }
+
+  .danger-ghost {
+    color: var(--danger);
+    border: 1px solid color-mix(in srgb, var(--danger) 40%, transparent);
+    background: transparent;
+  }
+
+  .danger-ghost:hover {
+    background: color-mix(in srgb, var(--danger) 10%, transparent);
+  }
+
+  .safety-code {
+    border: 1px solid var(--border);
+    border-radius: var(--radius, 10px);
+    padding: var(--space-3, 0.75rem);
+    display: grid;
+    gap: 0.25rem;
+  }
+
+  .safety-code strong {
+    font-family: var(--font-mono, monospace);
+    font-size: 1.4rem;
+    letter-spacing: 0.08em;
+  }
+
+  .safety-code p {
+    margin: 0;
+    font-size: var(--text-xs, 0.75rem);
+    color: var(--text-muted);
+  }
+
+  .person-actions {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: var(--space-2, 0.5rem);
+  }
+
+  .person-notice {
+    margin: 0;
+    color: var(--warning);
+    font-size: var(--text-sm, 0.85rem);
+  }
+
+  .person-foot {
+    margin: 0;
+    font-size: var(--text-xs, 0.75rem);
+    color: var(--text-muted);
   }
 </style>
