@@ -13,6 +13,7 @@ Your own private, end-to-end encrypted video calls. Deploy it on your domain, si
   - Video quality adapts to the size of the call, so upload stays around 3.5 Mbps even with six people
   - A **shared whiteboard** (pen, highlighter, text, eraser) you can export as **PDF** or PNG
   - Group chat, **private direct messages** and **files sent straight to one person** (tap them), and reactions
+  - **Raise hand**, per-person **volume** and **mute for me**, **pin** anyone to your stage, and **keyboard shortcuts** (press `?`)
   - Clickable links in chat (shown with their real address, never previewed), and **Save chat** to download the conversation as a text file made in your browser
   - **Installable** as an app from your browser (a web app manifest, with deliberately no service worker)
   - **Calendar and email invites**: download an `.ics` event or draft an email in your own mail app. Nothing is sent by vchat

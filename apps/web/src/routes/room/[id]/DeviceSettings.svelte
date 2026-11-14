@@ -11,7 +11,10 @@
     enumerateDevices,
   } from '$lib/media/manager';
   import { replaceTrackOnAllPeers, useNewMicTrack } from '$lib/webrtc/mesh';
-  import { onMount } from 'svelte';
+  import { createEventDispatcher, onMount } from 'svelte';
+  import Icon from '$lib/ui/Icon.svelte';
+
+  const dispatch = createEventDispatcher<{ shortcuts: void }>();
 
   onMount(() => {
     enumerateDevices();
@@ -82,6 +85,10 @@
       </select>
     </div>
   {/if}
+
+  <button type="button" class="shortcuts-link" on:click={() => dispatch('shortcuts')}>
+    <Icon name="keyboard" size={15} /> Keyboard shortcuts <kbd>?</kbd>
+  </button>
 </div>
 
 <style>
@@ -115,6 +122,32 @@
       bottom: 68px;
     }
   }
+  .shortcuts-link {
+    display: inline-flex;
+    align-items: center;
+    gap: var(--space-2);
+    align-self: flex-start;
+    padding: 0;
+    border: 0;
+    background: none;
+    color: var(--accent);
+    font-size: var(--text-sm);
+    cursor: pointer;
+  }
+
+  .shortcuts-link:hover {
+    text-decoration: underline;
+  }
+
+  .shortcuts-link kbd {
+    padding: 0 5px;
+    border: 1px solid var(--border-strong);
+    border-radius: var(--radius-sm);
+    font-family: var(--font-mono);
+    font-size: var(--text-xs);
+    color: var(--text-muted);
+  }
+
   .device-error {
     margin: 0;
     font-size: var(--text-xs);

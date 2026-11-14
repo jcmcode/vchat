@@ -8,6 +8,7 @@ import { deserialize, serialize, type AnyDataMessage, type DataChannelMessage } 
 import { createSpeakingDetector } from '../media/audio-analysis.js';
 import { readSdpIdentity } from './e2e-proof.js';
 import { nameKey, stripInvisible } from './name-key.js';
+import { LatestSender } from './latest-sender.js';
 import { enableSending, isValidMid, localSlots, remoteSlots, sendingBlocked } from './media-slots.js';
 import { holdEarlyState, type EarlyState } from './early-state.js';
 import { cameraTarget, screenTarget, tuneSender } from '../media/quality.js';
@@ -704,14 +705,15 @@ export async function joinRoom(opts: JoinOptions): Promise<void> {
     else console.warn('Signaling error:', message);
   });
 
-  // Tell peers when we mute/unmute or turn the camera on/off.
-  let lastMediaState = '';
-  const publishMediaState = () => {
-    const state = JSON.stringify(localMediaState());
-    if (state === lastMediaState) return;
-    lastMediaState = state;
-    broadcastToAllPeers(serialize({ type: 'media-state', ...localMediaState() }));
-  };
+  // Tell peers when we mute/unmute or turn the camera on/off. They accept 2 of these a second, so
+  // send at most one per 500ms, always the latest state (quick hold-to-talk taps included).
+  const mediaStateSender = new LatestSender({
+    intervalMs: 500,
+    read: localMediaState,
+    send: (state) => broadcastToAllPeers(serialize({ type: 'media-state', ...state })),
+  });
+  unsubscribers.push(() => mediaStateSender.cancel());
+  const publishMediaState = () => mediaStateSender.notify();
   unsubscribers.push(audioEnabled.subscribe(publishMediaState));
   unsubscribers.push(videoEnabled.subscribe(publishMediaState));
   unsubscribers.push(localStream.subscribe(publishMediaState));
