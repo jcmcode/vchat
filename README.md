@@ -8,13 +8,19 @@ Your own private, end-to-end encrypted video calls. Deploy it on your domain, si
 - **No data, no logs**: no database, no accounts, no message history, and no server or container logs. Invite links are self-contained signed tokens
 - **2–6 people** per room
 - **Features**:
-  - Video, audio-only, or **chat-only** participation
-  - **Screen sharing** (with audio), plus a **laser pointer and drawing** over the shared screen that everyone sees
+  - Video, audio-only, or **chat-only** participation. Turning your camera off really releases it (the camera light goes off)
+  - **Screen sharing** (with audio) next to your camera, also when you joined audio-only, plus a **laser pointer and drawing** over the shared screen that everyone sees
+  - Video quality adapts to the size of the call, so upload stays around 3.5 Mbps even with six people
   - A **shared whiteboard** (pen, highlighter, text, eraser) you can export as **PDF** or PNG
   - Group chat, **private direct messages** and **files sent straight to one person** (tap them), and reactions
   - **Raise hand**, per-person **volume** and **mute for me**, **pin** anyone to your stage, and **keyboard shortcuts** (press `?`)
+  - Clickable links in chat (shown with their real address, never previewed), and **Save chat** to download the conversation as a text file made in your browser
+  - **Installable** as an app from your browser (a web app manifest, with deliberately no service worker)
   - **Calendar and email invites**: download an `.ics` event or draft an email in your own mail app. Nothing is sent by vchat
   - Named rooms (the host can rename during a call), host approval, and automatic reconnection
+  - **Picture-in-picture**: pop the call out into a small always-on-top window to keep seeing people (and mute, turn the camera off or leave) while you're in another tab or app. Chromium shows everyone; Safari shows one video
+  - **Connection quality** bars on each person, and round trip, packet loss and whether the connection is direct or relayed in their card. Measured in your browser and never sent anywhere
+  - **Host controls**: lock the call so nobody new can join (even with an invite), end it for everyone, and get a chime, a flashing tab title and, if you turn it on, a system notification when someone is waiting to join (it never shows who)
 
 ## How it works for you
 
@@ -222,6 +228,7 @@ Open mode needs either **nothing** configured (no `SECRET_KEY`, `ADMIN_PASSWORD`
 - The signaling server does see some things while a call is set up: room ids, display names, IP addresses and network candidates, and the **room password in plain text** (over TLS) when a guest types it, because that's how it checks it. It keeps none of this after the room empties.
 - Whoever runs the server (you, and Cloudflare if you use it, since it terminates TLS) can see that connection metadata, but never call content.
 - With email set up, invite emails (link, room key and code) and sign-in codes pass through your server, Resend and the mail providers on both ends. The server never logs addresses, codes or tokens.
+- Connection quality is measured in your browser from WebRTC's own statistics and only shown there. It's never sent to the server or to other participants.
 - Browsers contact a STUN server to learn their public address: `stun.cloudflare.com` by default, your own coturn with Docker, or whatever `STUN_URLS` says.
 
 See [DOCS.md](DOCS.md) for the full security model and how it works under the hood.

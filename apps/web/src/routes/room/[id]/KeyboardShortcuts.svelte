@@ -14,7 +14,7 @@
   // Call-screen keyboard shortcuts (keys and rules: lib/ui/shortcuts.ts). Renders nothing visible.
   import { createEventDispatcher, onDestroy } from 'svelte';
   import { get } from 'svelte/store';
-  import { audioEnabled, localStream, toggleAudio, toggleVideo } from '$lib/media/manager';
+  import { audioEnabled, localStream, toggleAudio, toggleVideo, videoEnabled, voiceOnlyMode } from '$lib/media/manager';
   import { toggleHand, localHandRaised } from '$lib/collab/hands';
   import {
     HoldToTalk,
@@ -32,6 +32,8 @@
   export let chatOnly = false;
   /** Space pans the whiteboard, so hold-to-talk is off while it's open. */
   export let whiteboardOpen = false;
+  /** Turn the camera on or off the way the Camera button does (it reports errors). */
+  export let onToggleVideo: () => Promise<unknown> = () => toggleVideo();
 
   const dispatch = createEventDispatcher<{ chat: void; help: void }>();
   const isMac = typeof navigator !== 'undefined' && isMacPlatform(navigator as Navigator & { userAgentData?: { platform?: string } });
@@ -40,8 +42,9 @@
     return chatOnly ? undefined : get(localStream)?.getAudioTracks()[0];
   }
 
+  /** Same rule as the Camera button: camera off releases the track, so a missing track doesn't mean no camera. */
   function hasCamera(): boolean {
-    return !chatOnly && !!get(localStream)?.getVideoTracks().length;
+    return !chatOnly && !!get(localStream) && !get(voiceOnlyMode);
   }
 
   const hold = new HoldToTalk({
@@ -82,7 +85,8 @@
         announcement = toggleAudio() ? 'Microphone on' : 'Microphone off';
         break;
       case 'toggle-camera':
-        announcement = toggleVideo() ? 'Camera on' : 'Camera off';
+        // Asynchronous now (the camera is released and re-acquired); a press while it's starting gets the same result.
+        void onToggleVideo().finally(() => (announcement = get(videoEnabled) ? 'Camera on' : 'Camera off'));
         break;
       case 'toggle-hand':
         toggleHand();

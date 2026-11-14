@@ -7,6 +7,7 @@
   import { playbackFor } from '$lib/ui/participants';
   import { raisedHands } from '$lib/collab/hands';
   import Icon from '$lib/ui/Icon.svelte';
+  import TileQuality from './TileQuality.svelte';
 
   export let peerConnection: PeerConnection;
   export let speaking = false;
@@ -14,6 +15,8 @@
   export let contain = false;
   /** This person is presenting their screen. */
   export let presenting = false;
+  /** Show their shared screen (the stage) instead of their camera. It never plays sound: the shared audio is mixed into their microphone. */
+  export let screen = false;
   /** Exposed so overlays (screen annotations) can read the video's size. */
   export let videoEl: HTMLVideoElement | null = null;
   /** End-to-end verification state of this connection. */
@@ -22,6 +25,7 @@
   export let selectable = false;
 
   const dispatch = createEventDispatcher<{ select: void }>();
+  let qualityShown = false;
 
   /** Overlays in the slot (screen annotations and their toolbar) handle their own clicks and keys. */
   let overlayEl: HTMLElement | null = null;
@@ -42,10 +46,11 @@
 
   // What the peer told us about their mic/camera (over the data channel).
   $: media = $peerMediaState.get(peerConnection.id);
-  $: showVideo = !!peerConnection.stream && (presenting || media?.video !== false);
+  $: shown = screen ? peerConnection.screenStream : peerConnection.stream;
+  $: showVideo = !!shown && (screen || media?.video !== false);
 
-  $: if (videoEl && peerConnection.stream && videoEl.srcObject !== peerConnection.stream) {
-    videoEl.srcObject = peerConnection.stream;
+  $: if (videoEl && shown && videoEl.srcObject !== shown) {
+    videoEl.srcObject = shown;
   }
 
   // Route audio to the speaker picked in Device Settings (Chrome/Edge/Firefox support setSinkId).
@@ -55,11 +60,13 @@
       .catch(() => {});
   }
 
-  // Volume and "Mute for me" from the person card: only how they play on this device.
+  // Volume and "Mute for me" from the person card: only how they play on this device. Their sound
+  // (shared-screen audio included, mixed into the microphone) plays from their camera tile; a
+  // screen tile always stays silent.
   $: playback = playbackFor($peerAudioPrefs.get(peerConnection.id));
   $: if (videoEl) {
     videoEl.volume = playback.volume;
-    videoEl.muted = playback.muted;
+    videoEl.muted = screen || playback.muted;
   }
   $: handRaised = $raisedHands.has(peerConnection.id);
 </script>
@@ -73,13 +80,14 @@
   role={asButton ? 'button' : undefined}
   tabindex={asButton ? 0 : undefined}
   aria-label={asButton ? `${peerConnection.displayName}${handRaised ? ', hand raised' : ''}${playback.muted ? ', muted for you' : ''}: message, send a file, volume or pin` : undefined}
+  aria-describedby={qualityShown ? `quality-${peerConnection.id}` : undefined}
   on:click={(e) => selectable && !fromOverlay(e) && dispatch('select')}
   on:keydown={onKey}
 >
-  {#if peerConnection.stream}
+  {#if shown}
     <!-- The video element stays mounted (it also plays the person's audio); it's hidden when their camera is off. -->
     <!-- svelte-ignore a11y-media-has-caption -->
-    <video bind:this={videoEl} autoplay playsinline class:hidden={!showVideo}></video>
+    <video bind:this={videoEl} autoplay playsinline muted={screen} class:hidden={!showVideo}></video>
   {/if}
   {#if !showVideo}
     <div class="no-video">
@@ -89,8 +97,12 @@
   {#if $$slots.default}
     <div class="tile-overlay" bind:this={overlayEl}><slot /></div>
   {/if}
-  {#if handRaised}
+  {#if handRaised && !screen}
     <span class="hand-badge" title="Hand raised"><Icon name="hand" size={15} /><span class="sr-only">hand raised</span></span>
+  {/if}
+  {#if !screen}
+    <!-- Once per person: on their own tile, not on their shared screen (ids must stay unique). -->
+    <TileQuality peerId={peerConnection.id} id="quality-{peerConnection.id}" bind:shown={qualityShown} />
   {/if}
   <span class="tile-name">
     {#if verification === 'verified'}

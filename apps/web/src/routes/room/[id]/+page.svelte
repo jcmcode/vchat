@@ -32,8 +32,13 @@
     removePeer,
     startSharingScreen,
     stopSharingScreen,
+    roomLocked,
+    callEnded,
+    roomJoined,
     type PeerConnection,
   } from '$lib/webrtc/mesh';
+  import { startWaitingAlerts } from '$lib/ui/attention';
+  import HostControls from './HostControls.svelte';
   import {
     localStream,
     screenStream,
@@ -45,6 +50,7 @@
     stopMedia,
     toggleAudio,
     toggleVideo,
+    cameraStarting,
     startScreenShare,
     stopScreenShare,
   } from '$lib/media/manager';
@@ -84,6 +90,9 @@
   import Icon from '$lib/ui/Icon.svelte';
   import VideoTile from './VideoTile.svelte';
   import { setE2EKey, verification, blockedConnections, hasRoomKey, isValidRoomKey, allowUnverified } from '$lib/webrtc/e2e';
+  import { pipMode, pipOpen, pipAvailable, togglePip } from '$lib/ui/pip';
+  import ConnectionDetails from './ConnectionDetails.svelte';
+  import ConnectionHint from './ConnectionHint.svelte';
   import ChatPanel from './ChatPanel.svelte';
   import WaitingScreen from './WaitingScreen.svelte';
   import AdmissionPanel from './AdmissionPanel.svelte';
@@ -227,17 +236,24 @@
   $: peerList = Array.from($peers.values());
 
   // ── Stage: whiteboard, a shared screen or the person you pinned takes the main area; tiles move to a strip ──
+  // A remote screen only counts once it's actually arriving (a bare claim can't take the stage);
+  // selectStage picks the latest such presenter with pickPresenter, and your pin outranks it.
   $: layout = selectStage({
     whiteboardOpen: $whiteboardOpen,
     localSharing: $isScreenSharing,
     sharingPeers: $sharingPeers,
+    hasScreen: (id) => !!$peers.get(id)?.screenStream,
     peerIds: $peers.keys(),
     pinned: $pinnedPeerId,
   });
   $: stage = layout.stage;
   $: stagePeer = layout.stagePeerId ? $peers.get(layout.stagePeerId) ?? null : null;
   $: otherSharerPeer = layout.otherSharer ? $peers.get(layout.otherSharer) ?? null : null;
-  $: stripPeers = stagePeer ? peerList.filter((p) => p.id !== stagePeer?.id) : peerList;
+  // A presenter keeps their tile (camera and sound); the stage shows only their screen. A pinned
+  // person's tile moves to the stage (one tile per person: it plays their sound).
+  $: stripPeers = stage === 'pinned' && stagePeer ? peerList.filter((p) => p.id !== stagePeer?.id) : peerList;
+  // Any other screen being shared goes in the strip, so no share is ever hidden.
+  $: stripScreens = peerList.filter((p) => p.screenStream && $sharingPeers.has(p.id) && p.id !== stagePeer?.id);
   $: gridCols = getGridCols(peerList.length + 1);
 
   function getGridCols(count: number): number {
@@ -515,6 +531,9 @@
   });
   onDestroy(stopWatchingForcedOut);
 
+  // Host: chime, flash the tab title and (opt-in) notify when someone is waiting to join.
+  onDestroy(startWaitingAlerts(admissionRequests));
+
   function handleLeave() {
     leaveRoom();
     stopMedia();
@@ -533,8 +552,16 @@
     toggleAudio();
   }
 
-  function handleToggleVideo() {
-    toggleVideo();
+  /** Why the camera didn't turn back on (busy, unplugged, blocked). */
+  let cameraError = '';
+
+  async function handleToggleVideo() {
+    try {
+      await toggleVideo();
+      cameraError = '';
+    } catch (err) {
+      cameraError = err instanceof Error ? err.message : "Couldn't turn the camera on.";
+    }
   }
 
   let meshStopCalled = false;
@@ -784,8 +811,8 @@
 {:else if $roomError}
   <div class="overlay">
     <div class="dialog card fade-in center" role="alertdialog" aria-modal="true" aria-labelledby="error-title">
-      <div class="dialog-icon danger"><Icon name="x" size={22} /></div>
-      <h2 id="error-title">Couldn't join</h2>
+      <div class="dialog-icon danger"><Icon name={$callEnded ? 'phone-off' : 'x'} size={22} /></div>
+      <h2 id="error-title">{$callEnded ? 'Call ended' : "Couldn't join"}</h2>
       <p class="dialog-sub">{$roomError}</p>
       <div class="dialog-actions">
         <button class="btn primary" on:click={handleLeave}>Back to home</button>
@@ -879,7 +906,12 @@
           <h1 class="room-id" title={roomId}>{$roomName || roomId}</h1>
         {/if}
         {#if $hostStatus}
-          <span class="chip accent">Host</span>
+          <HostControls locked={$roomLocked} connected={$roomJoined} />
+        {/if}
+        {#if $roomLocked}
+          <span class="chip warning" title="The host locked this call: nobody new can join" role="status">
+            <Icon name="lock" size={11} /> Locked
+          </span>
         {/if}
       </div>
       <div class="header-end">
@@ -927,9 +959,20 @@
       </div>
     {/if}
 
+    <ConnectionHint />
+
     {#if mediaError}
       <div class="banner danger" role="alert">
         {mediaError}
+      </div>
+    {/if}
+
+    {#if cameraError}
+      <div class="banner danger" role="alert">
+        <span>{cameraError}</span>
+        <button class="banner-dismiss" on:click={() => (cameraError = '')} aria-label="Dismiss">
+          <Icon name="x" size={14} />
+        </button>
       </div>
     {/if}
 
@@ -986,6 +1029,7 @@
                     peerConnection={stagePeer}
                     speaking={$speakingPeers.has(stagePeer.id)}
                     contain
+                    screen
                     presenting
                     verification={$verification.get(stagePeer.id)?.state}
                     bind:videoEl={stageVideoEl}
@@ -1032,6 +1076,10 @@
                 on:select={() => (selectedPeerId = pc.id)}
               />
             {/each}
+
+            {#each stripScreens as pc (pc.id)}
+              <VideoTile peerConnection={pc} contain screen presenting verification={$verification.get(pc.id)?.state} />
+            {/each}
           </div>
         </main>
 
@@ -1070,11 +1118,12 @@
               </button>
             {/if}
 
-            {#if !chatOnly && $localStream?.getVideoTracks().length}
+            {#if !chatOnly && $localStream && !$voiceOnlyMode}
               <button
                 class="ctrl-btn"
                 class:off={!$videoEnabled}
                 aria-pressed={$videoEnabled}
+                disabled={$cameraStarting}
                 on:click={handleToggleVideo}
                 title={$videoEnabled ? 'Camera off' : 'Camera on'}
               >
@@ -1106,6 +1155,20 @@
               <Icon name="whiteboard" size={22} />
               <span class="ctrl-label">Board</span>
             </button>
+
+            {#if pipMode}
+              <button
+                class="ctrl-btn"
+                class:active={$pipOpen}
+                aria-pressed={$pipOpen}
+                disabled={!$pipAvailable}
+                on:click={() => togglePip({ displayName, chatOnly, onToggleAudio: handleToggleAudio, onToggleVideo: handleToggleVideo, onLeave: handleLeave })}
+                title={$pipOpen ? 'Close the pop-out window' : $pipAvailable ? 'Pop the call out into a small window that stays on top' : 'No video to pop out yet'}
+              >
+                <Icon name="pip" size={22} />
+                <span class="ctrl-label">Pop out</span>
+              </button>
+            {/if}
 
             <button
               class="ctrl-btn"
@@ -1207,6 +1270,7 @@
                 <p>Read all of it to {selectedPeer.displayName} (by voice, or another app). If you both see the same code, nobody is in the middle of your connection.</p>
               </div>
             {/if}
+            <ConnectionDetails peerId={selectedPeer.id} />
             {#if $verification.get(selectedPeer.id)?.state === 'unverified'}
               <button class="btn secondary" on:click={() => selectedPeer && allowUnverified(selectedPeer.id)}>
                 <Icon name="shield-alert" size={16} /> Allow this unverified connection
@@ -1239,6 +1303,7 @@
   enabled={shortcutsEnabled}
   {chatOnly}
   whiteboardOpen={$whiteboardOpen}
+  onToggleVideo={handleToggleVideo}
   on:chat={() => { showChat = !showChat; }}
   on:help={() => { showShortcuts = !showShortcuts; }}
 />
@@ -1909,6 +1974,11 @@
     border-color: var(--danger);
   }
 
+  .ctrl-btn:disabled {
+    opacity: 0.6;
+    cursor: progress;
+  }
+
   .ctrl-btn.active {
     background: var(--accent-soft);
     border-color: transparent;
@@ -1917,6 +1987,11 @@
 
   .ctrl-btn.active:hover {
     border-color: var(--accent);
+  }
+
+  .ctrl-btn:disabled {
+    opacity: 0.45;
+    cursor: not-allowed;
   }
 
   .ctrl-sep {
@@ -2321,6 +2396,8 @@
     display: flex;
     flex-direction: column;
     gap: var(--space-4, 1rem);
+    max-height: calc(100dvh - 2rem);
+    overflow-y: auto;
   }
 
   .person-head {

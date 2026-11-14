@@ -1,6 +1,8 @@
 // Per-viewer participant choices: what's on the stage, and how loud each person plays.
 // Pure logic, unit-tested in participants.test.ts. Nothing here is ever sent to anyone.
 
+import { pickPresenter } from '../webrtc/media-slots.js';
+
 export type StageKind = 'whiteboard' | 'local-screen' | 'remote-screen' | 'pinned';
 
 export interface StageInput {
@@ -8,8 +10,10 @@ export interface StageInput {
   whiteboardOpen: boolean;
   /** You are sharing your screen. */
   localSharing: boolean;
-  /** Remote participants who say they're sharing their screen. */
+  /** Remote participants who say they're sharing their screen (oldest first). */
   sharingPeers: Iterable<string>;
+  /** Whether we're actually receiving that participant's screen. */
+  hasScreen: (peerId: string) => boolean;
   /** Remote participants currently in the call. */
   peerIds: Iterable<string>;
   /** The participant you pinned, if any. */
@@ -26,23 +30,24 @@ export interface StageLayout {
 
 /**
  * What takes the big stage, in order: the whiteboard (if you opened it), your own screen share,
- * the person you pinned (their screen, if they're sharing), then a remote screen share. Your pin
- * outranks other people's shares, so nobody can take your stage by announcing one; while it does,
- * `otherSharer` names a sharer you can switch to. A pin for someone who isn't in the call counts
- * for nothing. With no stage, everyone is in the grid; otherwise everyone else goes to the strip.
+ * the person you pinned (their screen, if it's arriving), then the latest remote screen that's
+ * actually arriving (pickPresenter, so a bare claim can't take the stage). Your pin outranks other
+ * people's shares; while it does, `otherSharer` names the presenter you can switch to. A pin for
+ * someone who isn't in the call counts for nothing. With no stage, everyone is in the grid.
  */
 export function selectStage(input: StageInput): StageLayout {
   const none = { stagePeerId: null, otherSharer: null };
   if (input.whiteboardOpen) return { stage: 'whiteboard', ...none };
   if (input.localSharing) return { stage: 'local-screen', ...none };
   const present = new Set(input.peerIds);
-  const sharers = [...input.sharingPeers].filter((id) => present.has(id));
+  const sharers = [...input.sharingPeers];
+  const presenter = pickPresenter(sharers, (id) => present.has(id) && input.hasScreen(id));
   const pinned = input.pinned && present.has(input.pinned) ? input.pinned : null;
   if (pinned) {
-    if (sharers.includes(pinned)) return { stage: 'remote-screen', stagePeerId: pinned, otherSharer: null };
-    return { stage: 'pinned', stagePeerId: pinned, otherSharer: sharers[0] ?? null };
+    if (sharers.includes(pinned) && input.hasScreen(pinned)) return { stage: 'remote-screen', stagePeerId: pinned, otherSharer: null };
+    return { stage: 'pinned', stagePeerId: pinned, otherSharer: presenter };
   }
-  if (sharers.length > 0) return { stage: 'remote-screen', stagePeerId: sharers[0], otherSharer: null };
+  if (presenter) return { stage: 'remote-screen', stagePeerId: presenter, otherSharer: null };
   return { stage: null, ...none };
 }
 

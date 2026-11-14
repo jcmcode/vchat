@@ -2,7 +2,16 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { clampVolume, isSilencedForMe, playbackFor, selectStage, type StageInput } from './participants.js';
 
-const base: StageInput = { whiteboardOpen: false, localSharing: false, sharingPeers: [], peerIds: ['a', 'b', 'c'], pinned: null };
+/** Screens actually arriving: everyone's except "claimer", who only says they're sharing. */
+const arriving = (id: string) => id !== 'claimer';
+const base: StageInput = {
+  whiteboardOpen: false,
+  localSharing: false,
+  sharingPeers: [],
+  hasScreen: arriving,
+  peerIds: ['a', 'b', 'c', 'claimer'],
+  pinned: null,
+};
 
 const none = { stagePeerId: null, otherSharer: null };
 
@@ -20,21 +29,26 @@ test('a pin for someone who left counts for nothing', () => {
   assert.deepEqual(selectStage({ ...base, pinned: 'gone', sharingPeers: ['c'] }), { stage: 'remote-screen', stagePeerId: 'c', otherSharer: null });
 });
 
-test('a remote screen share takes the stage when nobody is pinned (the first sharer who is present)', () => {
+test('without a pin, the latest sharer whose screen is arriving takes the stage', () => {
   assert.deepEqual(selectStage({ ...base, sharingPeers: ['c'] }), { stage: 'remote-screen', stagePeerId: 'c', otherSharer: null });
-  assert.deepEqual(selectStage({ ...base, sharingPeers: ['ghost', 'a', 'c'] }), { stage: 'remote-screen', stagePeerId: 'a', otherSharer: null });
-  assert.deepEqual(selectStage({ ...base, sharingPeers: ['ghost'] }), { stage: null, ...none });
+  assert.deepEqual(selectStage({ ...base, sharingPeers: ['a', 'c'] }), { stage: 'remote-screen', stagePeerId: 'c', otherSharer: null });
+  // A bare claim (no screen arriving) or someone who isn't in the call can't take or blank it
+  assert.deepEqual(selectStage({ ...base, sharingPeers: ['a', 'claimer'] }), { stage: 'remote-screen', stagePeerId: 'a', otherSharer: null });
+  assert.deepEqual(selectStage({ ...base, sharingPeers: ['a', 'ghost'] }), { stage: 'remote-screen', stagePeerId: 'a', otherSharer: null });
+  assert.deepEqual(selectStage({ ...base, sharingPeers: ['claimer', 'ghost'] }), { stage: null, ...none });
 });
 
 test('your pin outranks someone else sharing, and offers their share instead of taking the stage', () => {
   assert.deepEqual(selectStage({ ...base, sharingPeers: ['c'], pinned: 'b' }), { stage: 'pinned', stagePeerId: 'b', otherSharer: 'c' });
-  assert.deepEqual(selectStage({ ...base, sharingPeers: ['ghost', 'a', 'c'], pinned: 'b' }), { stage: 'pinned', stagePeerId: 'b', otherSharer: 'a' });
-  // A "sharer" who isn't in the call is never offered
-  assert.deepEqual(selectStage({ ...base, sharingPeers: ['ghost'], pinned: 'b' }), { stage: 'pinned', stagePeerId: 'b', otherSharer: null });
+  assert.deepEqual(selectStage({ ...base, sharingPeers: ['a', 'c', 'claimer'], pinned: 'b' }), { stage: 'pinned', stagePeerId: 'b', otherSharer: 'c' });
+  // Claims and absent "sharers" are never offered
+  assert.deepEqual(selectStage({ ...base, sharingPeers: ['claimer', 'ghost'], pinned: 'b' }), { stage: 'pinned', stagePeerId: 'b', otherSharer: null });
 });
 
-test('when the pinned person shares, their screen is on the stage', () => {
-  assert.deepEqual(selectStage({ ...base, sharingPeers: ['a', 'c'], pinned: 'c' }), { stage: 'remote-screen', stagePeerId: 'c', otherSharer: null });
+test('when the pinned person shares, their screen is on the stage once it arrives', () => {
+  assert.deepEqual(selectStage({ ...base, sharingPeers: ['c', 'a'], pinned: 'c' }), { stage: 'remote-screen', stagePeerId: 'c', otherSharer: null });
+  // Pinned and only claiming: their tile stays on the stage, and a real share is offered
+  assert.deepEqual(selectStage({ ...base, sharingPeers: ['a', 'claimer'], pinned: 'claimer' }), { stage: 'pinned', stagePeerId: 'claimer', otherSharer: 'a' });
 });
 
 test('your own screen share and the whiteboard come first', () => {
@@ -44,8 +58,8 @@ test('your own screen share and the whiteboard come first', () => {
 
 test('accepts sets and iterators as well as arrays', () => {
   assert.deepEqual(
-    selectStage({ ...base, sharingPeers: new Set<string>(), peerIds: new Map([['x', 1]]).keys(), pinned: 'x' }),
-    { stage: 'pinned', stagePeerId: 'x', otherSharer: null }
+    selectStage({ ...base, sharingPeers: new Set(['y']), peerIds: new Map([['x', 1], ['y', 2]]).keys(), pinned: 'x' }),
+    { stage: 'pinned', stagePeerId: 'x', otherSharer: 'y' }
   );
 });
 
