@@ -51,7 +51,7 @@
   </div>
   <p class="hint">
     {#if pinned && !onStage}
-      Pinned. They take the stage when no screen is shared and the whiteboard is closed.
+      Pinned. They take the stage when the whiteboard is closed and you aren't sharing your screen.
     {:else}
       Only on your screen, for this call. Nobody else is told.
     {/if}

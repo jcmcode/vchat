@@ -93,7 +93,7 @@
   import { selectStage } from '$lib/ui/participants';
   import PersonControls from './PersonControls.svelte';
   import HandToasts from './HandToasts.svelte';
-  import KeyboardShortcuts from './KeyboardShortcuts.svelte';
+  import KeyboardShortcuts, { endHoldToTalk } from './KeyboardShortcuts.svelte';
   import ShortcutsHelp from './ShortcutsHelp.svelte';
 
   type JoinMode = 'video' | 'audio' | 'chat';
@@ -174,6 +174,7 @@
   });
   $: stage = layout.stage;
   $: stagePeer = layout.stagePeerId ? $peers.get(layout.stagePeerId) ?? null : null;
+  $: otherSharerPeer = layout.otherSharer ? $peers.get(layout.otherSharer) ?? null : null;
   $: stripPeers = stagePeer ? peerList.filter((p) => p.id !== stagePeer?.id) : peerList;
   $: gridCols = getGridCols(peerList.length + 1);
 
@@ -463,6 +464,7 @@
       stopScreenShare();
     } else {
       meshStopCalled = false;
+      endHoldToTalk(); // the picker can swallow the Space keyup
       const stream = await startScreenShare();
       if (stream) {
         startSharingScreen();
@@ -809,9 +811,15 @@
                   on:select={() => (selectedPeerId = stagePeer?.id ?? null)}
                 />
               {/key}
-              <button class="unpin-btn" on:click={unpinPeer} title="Put {stagePeer.displayName} back with everyone else">
+              <button class="stage-btn" on:click={unpinPeer} title="Put {stagePeer.displayName} back with everyone else">
                 <Icon name="pin" size={14} /> Unpin
               </button>
+              {#if otherSharerPeer}
+                <button class="stage-sharing-btn" on:click={unpinPeer} title="Unpin {stagePeer.displayName} and show the shared screen">
+                  <Icon name="screen-share" size={14} />
+                  <span class="sharing-name">{otherSharerPeer.displayName}</span> is sharing · View
+                </button>
+              {/if}
             {:else if stagePeer}
               {#key stagePeer.id}
                 <VideoTile
@@ -821,10 +829,15 @@
                   presenting
                   verification={$verification.get(stagePeer.id)?.state}
                   bind:videoEl={stageVideoEl}
+                  selectable
+                  on:select={() => (selectedPeerId = stagePeer?.id ?? null)}
                 >
                   <AnnotationLayer videoEl={stageVideoEl} screen={stagePeer.id} />
                 </VideoTile>
               {/key}
+              <button class="stage-btn" on:click={() => (selectedPeerId = stagePeer?.id ?? null)} aria-label="Options for {stagePeer.displayName}: volume, mute for me, pin">
+                <Icon name="more-horizontal" size={14} /> Options
+              </button>
             {/if}
           </section>
         {/if}
@@ -1024,7 +1037,7 @@
           </div>
           <PersonControls
             peer={selectedPeer}
-            onStage={stage === 'pinned' && stagePeer?.id === selectedPeer.id}
+            onStage={stagePeer?.id === selectedPeer.id}
             on:pinned={() => (selectedPeerId = null)}
           />
           {#if $verification.get(selectedPeer.id)?.code}
@@ -1458,8 +1471,8 @@
     pointer-events: none;
   }
 
-  /* Unpin, over the pinned person on the stage */
-  .unpin-btn {
+  /* Unpin / Options, over whoever is on the stage */
+  .stage-btn {
     position: absolute;
     right: var(--space-2);
     bottom: var(--space-2);
@@ -1479,11 +1492,45 @@
     cursor: pointer;
   }
 
-  .unpin-btn:hover {
+  /* While your pin holds the stage: someone else is sharing (tap to unpin and view it) */
+  .stage-sharing-btn {
+    position: absolute;
+    top: var(--space-2);
+    left: 50%;
+    transform: translateX(-50%);
+    z-index: 3;
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    max-width: calc(100% - 24px);
+    padding: 4px 12px;
+    border: 0;
+    border-radius: var(--radius-pill);
+    background: var(--accent);
+    color: var(--accent-text);
+    font-size: var(--text-xs);
+    font-weight: 600;
+    white-space: nowrap;
+    cursor: pointer;
+    box-shadow: var(--shadow-md);
+  }
+
+  .stage-sharing-btn .sharing-name {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  .stage-sharing-btn:focus-visible {
+    outline: 2px solid var(--accent-ring);
+    outline-offset: 2px;
+  }
+
+  .stage-btn:hover {
     background: rgba(11, 13, 18, 0.82);
   }
 
-  .unpin-btn:focus-visible {
+  .stage-btn:focus-visible {
     outline: 2px solid var(--accent-ring);
     outline-offset: 2px;
   }

@@ -1,14 +1,18 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
+  HoldToTalk,
   isMacPlatform,
+  isSpaceKey,
   isTalkKey,
   isTypingTarget,
   letterOf,
   matchShortcut,
-  PushToTalk,
+  routeKeydown,
+  shortcutApplies,
   shortcutList,
   spaceHasNativeAction,
+  type KeyContext,
   type KeyLike,
   type TargetLike,
 } from './shortcuts.js';
@@ -53,8 +57,16 @@ test('hand and chat: Ctrl+Alt elsewhere, Ctrl+Cmd on a Mac (Option keys report o
   assert.equal(matchShortcut(key('c', { ctrlKey: true, metaKey: true }), true), 'toggle-chat');
   // Ctrl+Option is VoiceOver's modifier on a Mac: not ours
   assert.equal(matchShortcut({ ...key('˙', { ctrlKey: true, altKey: true }), code: 'KeyH' }, true), null);
-  // AltGr (reported as Ctrl+Alt) turning C into "ć" on a Polish layout still means C
+  // Real Ctrl+Alt on a layout whose C key types "ć" with them still means C…
   assert.equal(matchShortcut({ ...key('ć', { ctrlKey: true, altKey: true }), code: 'KeyC' }, false), 'toggle-chat');
+  // …but AltGr (also reported as Ctrl+Alt) is someone typing a character: never a shortcut
+  const altGr = { getModifierState: (k: string) => k === 'AltGraph' };
+  assert.equal(matchShortcut({ ...key('ć', { ctrlKey: true, altKey: true }), code: 'KeyC', ...altGr }, false), null);
+  assert.equal(matchShortcut({ ...key('h', { ctrlKey: true, altKey: true }), ...altGr }, false), null);
+  assert.equal(matchShortcut({ ...key('d', { ctrlKey: true }), ...altGr }, false), null);
+  assert.equal(matchShortcut({ ...key('?', { ctrlKey: true, altKey: true }), ...altGr }, false), 'help'); // a typed "?" is still "?"
+  // A getModifierState that throws is treated as "no AltGr"
+  assert.equal(matchShortcut({ ...key('d', { ctrlKey: true }), getModifierState: () => { throw new Error('x'); } }, false), 'toggle-mic');
   // Plain letters (the whiteboard's tools) and Ctrl/Cmd+Z (its undo) are never ours
   for (const k of ['p', 'm', 't', 'e', 'h', 'd', 'c', '+', '-', '0', '1', ' ']) {
     assert.equal(matchShortcut(key(k), false), null, `plain ${k}`);
@@ -92,6 +104,8 @@ test('hold-to-talk key is Space with no modifiers', () => {
   assert.equal(isTalkKey(key(' ', { metaKey: true })), false);
   assert.equal(isTalkKey(key(' ', { altKey: true })), false);
   assert.equal(isTalkKey(key('m')), false);
+  assert.equal(isSpaceKey(key(' ', { shiftKey: true })), true); // letting go of Space counts with any modifier
+  assert.equal(isSpaceKey(key('Enter')), false);
 });
 
 /** A tiny stand-in for a DOM element (tests run without a browser). */
@@ -169,71 +183,251 @@ test('Space keeps its normal meaning on buttons, links, tiles and form controls'
   assert.equal(spaceHasNativeAction(null), false);
 });
 
-function fakeMic(initial: { on: boolean; available?: boolean }) {
-  const state = { on: initial.on, available: initial.available ?? true, sets: [] as boolean[] };
-  return {
-    state,
-    mic: {
-      available: () => state.available,
-      isOn: () => state.on,
-      setOn: (on: boolean) => {
-        state.sets.push(on);
-        if (state.available) state.on = on;
-      },
+/** A microphone, a camera, a hand and a chat panel, driven through routeKeydown like the page does. */
+function fakeCall(opts: { on?: boolean; available?: boolean; isMac?: boolean; hasCamera?: boolean } = {}) {
+  const st = { on: opts.on ?? false, available: opts.available ?? true, sets: [] as boolean[], camera: true, hand: false, chat: false, help: false };
+  const mic = {
+    available: () => st.available,
+    isOn: () => st.on,
+    setOn: (on: boolean) => {
+      st.sets.push(on);
+      if (st.available) st.on = on;
+      hold.micChanged(); // the store notifies synchronously, as audioEnabled does
     },
   };
+  const hold = new HoldToTalk(mic);
+  const ctx = (over: Partial<KeyContext> = {}): KeyContext => ({
+    enabled: true,
+    typing: false,
+    spaceNative: false,
+    defaultPrevented: false,
+    whiteboardOpen: false,
+    isMac: opts.isMac ?? false,
+    hasMic: st.available,
+    hasCamera: opts.hasCamera ?? true,
+    ...over,
+  });
+  const prevented: boolean[] = [];
+  const down = (e: KeyLike, over: Partial<KeyContext> = {}) => {
+    const r = routeKeydown(hold, e, ctx(over));
+    prevented.push(r.preventDefault);
+    switch (r.action) {
+      case 'toggle-mic':
+        mic.setOn(!st.on);
+        break;
+      case 'toggle-camera':
+        st.camera = !st.camera;
+        break;
+      case 'toggle-hand':
+        st.hand = !st.hand;
+        break;
+      case 'toggle-chat':
+        st.chat = !st.chat;
+        break;
+      case 'help':
+        st.help = !st.help;
+        break;
+    }
+    return r;
+  };
+  const up = (e: KeyLike) => hold.keyup(isSpaceKey(e));
+  /** The Mic button, clicked (not through a hold). */
+  const clickMic = () => mic.setOn(!st.on);
+  return { st, hold, down, up, clickMic, prevented };
 }
 
-test('hold-to-talk: unmutes while held and always mutes again on release', () => {
-  const { state, mic } = fakeMic({ on: false });
-  const ptt = new PushToTalk(mic);
-  assert.equal(ptt.press(), true);
-  assert.equal(state.on, true);
-  assert.equal(ptt.active, true);
-  assert.equal(ptt.press(), true); // key repeat: no second toggle
-  assert.deepEqual(state.sets, [true]);
-  ptt.release();
-  assert.equal(state.on, false);
-  assert.equal(ptt.active, false);
-  ptt.release(); // blur after keyup etc.: harmless
-  assert.deepEqual(state.sets, [true, false]);
+const SPACE = key(' ');
+const CTRL = { ...key('Control'), ctrlKey: true };
+const ALT = { ...key('Alt'), altKey: true };
+const SHIFT = { ...key('Shift'), shiftKey: true };
+const META = { ...key('Meta'), metaKey: true };
+
+test('hold-to-talk: unmutes while held, auto-repeat is swallowed, release mutes again', () => {
+  const c = fakeCall();
+  assert.deepEqual(c.down(SPACE), { preventDefault: true, action: null });
+  assert.equal(c.st.on, true);
+  assert.equal(c.hold.state, 'holding');
+  c.down({ ...SPACE, repeat: true });
+  c.down({ ...SPACE, repeat: true });
+  assert.deepEqual(c.st.sets, [true]);
+  assert.equal(c.up(SPACE), 'swallow');
+  assert.equal(c.st.on, false);
+  assert.equal(c.hold.state, 'idle');
+  assert.deepEqual(c.st.sets, [true, false]);
 });
 
-test('hold-to-talk does nothing if you are already unmuted, or have no microphone', () => {
-  const unmuted = fakeMic({ on: true });
-  const ptt = new PushToTalk(unmuted.mic);
-  assert.equal(ptt.press(), false);
-  ptt.release();
-  assert.equal(unmuted.state.on, true); // releasing never mutes a mic the hold didn't open
-  assert.deepEqual(unmuted.state.sets, []);
-
-  const none = fakeMic({ on: false, available: false });
-  const ptt2 = new PushToTalk(none.mic);
-  assert.equal(ptt2.press(), false);
-  assert.equal(ptt2.active, false);
-  assert.deepEqual(none.state.sets, []);
+test('Space + Ctrl/Cmd+D: the mic ends up muted, whatever order things are let go in', () => {
+  for (const isMac of [false, true]) {
+    const mod = isMac ? META : CTRL;
+    const d = { ...key('d'), ctrlKey: !isMac, metaKey: isMac };
+    for (const releaseOrder of [['d', 'mod', 'space'], ['space', 'd', 'mod'], ['mod', 'd', 'space'], ['d', 'space', 'mod']]) {
+      const c = fakeCall({ isMac });
+      c.down(SPACE);
+      assert.equal(c.st.on, true);
+      c.down(mod); // ends the hold: muted, and nothing else
+      assert.equal(c.st.on, false);
+      assert.deepEqual(c.down(d), { preventDefault: true, action: null }); // ignored (and no bookmark dialog)
+      assert.equal(c.st.on, false);
+      for (const k of releaseOrder) c.up(k === 'space' ? SPACE : k === 'd' ? d : mod);
+      assert.equal(c.st.on, false, `${isMac ? 'mac' : 'pc'} ${releaseOrder}`);
+      assert.equal(c.hold.state, 'idle');
+      assert.deepEqual(c.st.sets, [true, false]);
+    }
+  }
 });
 
-test('hold-to-talk: muting by other means while held is respected; release never leaves the mic open', () => {
-  const { state, mic } = fakeMic({ on: false });
-  const ptt = new PushToTalk(mic);
-  ptt.press();
-  state.on = false; // the Mic button was pressed while holding
-  ptt.release();
-  assert.equal(state.on, false);
-  assert.deepEqual(state.sets, [true]);
-
-  ptt.press();
-  state.on = true; // toggled twice while holding: still open
-  ptt.release();
-  assert.equal(state.on, false);
+test('Space + other shortcuts during a hold: nothing runs, the mic is muted', () => {
+  const sequences: { name: string; keys: KeyLike[]; check: (c: ReturnType<typeof fakeCall>) => void }[] = [
+    { name: 'Ctrl+E', keys: [CTRL, { ...key('e'), ctrlKey: true }], check: (c) => assert.equal(c.st.camera, true) },
+    {
+      name: 'Ctrl+Alt+H',
+      keys: [CTRL, { ...ALT, ctrlKey: true }, { ...key('h'), ctrlKey: true, altKey: true }],
+      check: (c) => assert.equal(c.st.hand, false),
+    },
+    { name: 'Ctrl+Alt+C', keys: [CTRL, { ...ALT, ctrlKey: true }, { ...key('c'), ctrlKey: true, altKey: true }], check: (c) => assert.equal(c.st.chat, false) },
+    { name: '?', keys: [SHIFT, { ...key('?'), shiftKey: true }], check: (c) => assert.equal(c.st.help, false) },
+    { name: 'plain letter', keys: [key('x')], check: () => {} },
+  ];
+  for (const s of sequences) {
+    const c = fakeCall();
+    c.down(SPACE);
+    for (const k of s.keys) assert.equal(c.down(k).action, null, s.name);
+    s.check(c);
+    assert.equal(c.st.on, false, s.name);
+    c.up(SPACE);
+    assert.equal(c.st.on, false, s.name);
+  }
 });
 
-test('hold-to-talk: if unmuting fails, it is not considered held', () => {
-  const state = { on: false };
-  const ptt = new PushToTalk({ available: () => true, isOn: () => state.on, setOn: () => {} });
-  assert.equal(ptt.press(), false);
-  assert.equal(ptt.active, false);
+test('a shortcut key arriving mid-hold without its modifier keydown (missed event) still only ends the hold', () => {
+  for (const k of [
+    { ...key('d'), ctrlKey: true },
+    { ...key('e'), ctrlKey: true },
+    { ...key('h'), ctrlKey: true, altKey: true },
+    { ...key('c'), ctrlKey: true, altKey: true },
+    { ...key('?'), shiftKey: true },
+  ]) {
+    const c = fakeCall();
+    c.down(SPACE);
+    assert.deepEqual(c.down(k), { preventDefault: true, action: null });
+    assert.equal(c.st.on, false);
+    c.up(k);
+    c.up(SPACE);
+    assert.equal(c.st.on, false);
+    assert.deepEqual(c.st.sets, [true, false]);
+  }
+});
+
+test('after a hold ends early, a second Space does not start a new hold until Space is let go', () => {
+  const c = fakeCall();
+  c.down(SPACE);
+  c.down(CTRL);
+  assert.equal(c.hold.state, 'waiting');
+  c.up(CTRL);
+  assert.equal(c.down({ ...SPACE, repeat: true }).preventDefault, true);
+  assert.equal(c.down(SPACE).preventDefault, true); // a fresh keydown too
+  assert.equal(c.st.on, false);
+  assert.equal(c.up(SPACE), 'swallow');
+  assert.equal(c.hold.state, 'idle');
+  // Once let go, Space works again
+  c.down(SPACE);
+  assert.equal(c.st.on, true);
+  c.up(SPACE);
+  assert.equal(c.st.on, false);
+  // A Space released with a modifier still counts as letting go
+  c.down(SPACE);
+  c.down(SHIFT);
+  c.up({ ...SPACE, shiftKey: true });
+  assert.equal(c.hold.state, 'idle');
+  assert.equal(c.st.on, false);
+});
+
+test('letting go of another key that was down before Space ends the hold too', () => {
+  const c = fakeCall();
+  c.down(SPACE);
+  assert.equal(c.up(key('a')), 'pass');
+  assert.equal(c.st.on, false);
+  assert.equal(c.hold.state, 'waiting');
+  c.up(SPACE);
+  assert.equal(c.hold.state, 'idle');
+});
+
+test('a click or focus into a text field ends the hold, and that click must do nothing else', () => {
+  const c = fakeCall();
+  c.down(SPACE);
+  assert.equal(c.hold.interrupt(), true); // swallow the click
+  assert.equal(c.st.on, false);
+  assert.equal(c.hold.interrupt(), false); // a second click is a normal click
+  c.up(SPACE);
+  assert.equal(c.hold.interrupt(), false);
+  assert.equal(c.st.on, false);
+});
+
+test('clicking Mute then Unmute during a hold is not undone when Space is let go', () => {
+  const c = fakeCall();
+  c.down(SPACE);
+  c.clickMic(); // mute: drops the hold
+  assert.equal(c.st.on, false);
+  assert.equal(c.hold.state, 'waiting');
+  c.clickMic(); // unmute, on purpose
+  assert.equal(c.st.on, true);
+  c.up(SPACE);
+  assert.equal(c.st.on, true);
+});
+
+test('blur, a hidden tab or the screen-share picker start over with the mic muted', () => {
+  const c = fakeCall();
+  c.down(SPACE);
+  c.hold.reset();
+  assert.equal(c.st.on, false);
+  assert.equal(c.hold.state, 'idle');
+  c.down(SPACE);
+  c.down(CTRL);
+  c.hold.reset(); // from "waiting" too: keys work again without a Space keyup
+  assert.equal(c.hold.state, 'idle');
+  assert.equal(c.down({ ...key('d'), ctrlKey: true }).action, 'toggle-mic');
+});
+
+test('hold-to-talk does nothing when already unmuted, without a mic, while typing, on a button, with the whiteboard open, or outside the call', () => {
+  const unmuted = fakeCall({ on: true });
+  assert.equal(unmuted.down(SPACE).preventDefault, false);
+  unmuted.up(SPACE);
+  assert.equal(unmuted.st.on, true); // letting go never mutes a mic the hold didn't open
+  assert.deepEqual(unmuted.st.sets, []);
+
+  const noMic = fakeCall({ available: false });
+  noMic.down(SPACE);
+  assert.equal(noMic.hold.state, 'idle');
+
+  for (const over of [{ typing: true }, { spaceNative: true }, { whiteboardOpen: true }, { enabled: false }, { defaultPrevented: true }]) {
+    const c = fakeCall();
+    assert.equal(c.down(SPACE, over).preventDefault, false, JSON.stringify(over));
+    assert.equal(c.st.on, false);
+  }
+  const c = fakeCall();
+  c.down({ ...SPACE, repeat: true }); // a repeat never starts a hold (Space was held elsewhere)
+  assert.equal(c.st.on, false);
+
+  const failing = new HoldToTalk({ available: () => true, isOn: () => false, setOn: () => {} });
+  assert.equal(failing.keydown(true, true), 'pass');
+  assert.equal(failing.active, false);
+});
+
+test('shortcuts with nothing to do are left to the browser; shortcuts never run while typing or outside the call', () => {
+  const chatOnly = fakeCall({ available: false, hasCamera: false });
+  assert.deepEqual(chatOnly.down({ ...key('d'), ctrlKey: true }), { preventDefault: false, action: null });
+  assert.deepEqual(chatOnly.down({ ...key('e'), ctrlKey: true }), { preventDefault: false, action: null });
+  assert.equal(chatOnly.down({ ...key('h'), ctrlKey: true, altKey: true }).action, 'toggle-hand');
+  const audioOnly = fakeCall({ hasCamera: false });
+  assert.equal(audioOnly.down({ ...key('e'), ctrlKey: true }).preventDefault, false);
+  assert.equal(audioOnly.down({ ...key('d'), ctrlKey: true }).action, 'toggle-mic');
+  assert.equal(audioOnly.st.on, true);
+  const c = fakeCall();
+  assert.deepEqual(c.down({ ...key('d'), ctrlKey: true }, { typing: true }), { preventDefault: false, action: null });
+  assert.deepEqual(c.down({ ...key('d'), ctrlKey: true }, { enabled: false }), { preventDefault: false, action: null });
+  assert.deepEqual(c.down({ ...key('d'), ctrlKey: true, repeat: true }), { preventDefault: true, action: null });
+  assert.equal(c.st.on, false);
+  assert.equal(shortcutApplies('toggle-chat', { hasMic: false, hasCamera: false }), true);
 });
 
 test('the help sheet lists every shortcut, spelled for the platform', () => {

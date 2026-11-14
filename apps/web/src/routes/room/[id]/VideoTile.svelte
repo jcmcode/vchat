@@ -23,8 +23,18 @@
 
   const dispatch = createEventDispatcher<{ select: void }>();
 
+  /** Overlays in the slot (screen annotations and their toolbar) handle their own clicks and keys. */
+  let overlayEl: HTMLElement | null = null;
+  function fromOverlay(e: Event): boolean {
+    return !!overlayEl && e.target instanceof Node && overlayEl.contains(e.target);
+  }
+
+  // With overlays (screen annotations have their own buttons) the tile isn't a button itself:
+  // buttons can't contain buttons. A tap still opens the card; the page offers a separate button.
+  $: asButton = selectable && !$$slots.default;
+
   function onKey(e: KeyboardEvent) {
-    if (selectable && (e.key === 'Enter' || e.key === ' ')) {
+    if (asButton && (e.key === 'Enter' || e.key === ' ')) {
       e.preventDefault();
       dispatch('select');
     }
@@ -60,10 +70,10 @@
   class:speaking
   class:contain
   class:selectable
-  role={selectable ? 'button' : undefined}
-  tabindex={selectable ? 0 : undefined}
-  aria-label={selectable ? `${peerConnection.displayName}${handRaised ? ', hand raised' : ''}${playback.muted ? ', muted for you' : ''}: message, send a file, volume or pin` : undefined}
-  on:click={() => selectable && dispatch('select')}
+  role={asButton ? 'button' : undefined}
+  tabindex={asButton ? 0 : undefined}
+  aria-label={asButton ? `${peerConnection.displayName}${handRaised ? ', hand raised' : ''}${playback.muted ? ', muted for you' : ''}: message, send a file, volume or pin` : undefined}
+  on:click={(e) => selectable && !fromOverlay(e) && dispatch('select')}
   on:keydown={onKey}
 >
   {#if peerConnection.stream}
@@ -76,7 +86,9 @@
       <span class="avatar">{peerConnection.displayName.charAt(0).toUpperCase()}</span>
     </div>
   {/if}
-  <slot />
+  {#if $$slots.default}
+    <div class="tile-overlay" bind:this={overlayEl}><slot /></div>
+  {/if}
   {#if handRaised}
     <span class="hand-badge" title="Hand raised"><Icon name="hand" size={15} /><span class="sr-only">hand raised</span></span>
   {/if}
@@ -215,6 +227,10 @@
     display: inline-flex;
     flex-shrink: 0;
     color: #f87171;
+  }
+
+  .tile-overlay {
+    display: contents;
   }
 
   .silenced {

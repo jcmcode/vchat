@@ -4,40 +4,48 @@ import { clampVolume, isSilencedForMe, playbackFor, selectStage, type StageInput
 
 const base: StageInput = { whiteboardOpen: false, localSharing: false, sharingPeers: [], peerIds: ['a', 'b', 'c'], pinned: null };
 
+const none = { stagePeerId: null, otherSharer: null };
+
 test('no share, no pin: no stage (everyone in the grid)', () => {
-  assert.deepEqual(selectStage(base), { stage: null, stagePeerId: null });
+  assert.deepEqual(selectStage(base), { stage: null, ...none });
 });
 
 test('pinned person takes the stage when nobody is sharing', () => {
-  assert.deepEqual(selectStage({ ...base, pinned: 'b' }), { stage: 'pinned', stagePeerId: 'b' });
+  assert.deepEqual(selectStage({ ...base, pinned: 'b' }), { stage: 'pinned', stagePeerId: 'b', otherSharer: null });
 });
 
 test('a pin for someone who left counts for nothing', () => {
-  assert.deepEqual(selectStage({ ...base, pinned: 'gone' }), { stage: null, stagePeerId: null });
-  assert.deepEqual(selectStage({ ...base, pinned: '' }), { stage: null, stagePeerId: null });
+  assert.deepEqual(selectStage({ ...base, pinned: 'gone' }), { stage: null, ...none });
+  assert.deepEqual(selectStage({ ...base, pinned: '' }), { stage: null, ...none });
+  assert.deepEqual(selectStage({ ...base, pinned: 'gone', sharingPeers: ['c'] }), { stage: 'remote-screen', stagePeerId: 'c', otherSharer: null });
 });
 
-test('a remote screen share beats a pin', () => {
-  assert.deepEqual(selectStage({ ...base, sharingPeers: ['c'], pinned: 'b' }), { stage: 'remote-screen', stagePeerId: 'c' });
+test('a remote screen share takes the stage when nobody is pinned (the first sharer who is present)', () => {
+  assert.deepEqual(selectStage({ ...base, sharingPeers: ['c'] }), { stage: 'remote-screen', stagePeerId: 'c', otherSharer: null });
+  assert.deepEqual(selectStage({ ...base, sharingPeers: ['ghost', 'a', 'c'] }), { stage: 'remote-screen', stagePeerId: 'a', otherSharer: null });
+  assert.deepEqual(selectStage({ ...base, sharingPeers: ['ghost'] }), { stage: null, ...none });
 });
 
-test('with several sharers, the pinned sharer is shown; otherwise the first one present', () => {
-  assert.deepEqual(selectStage({ ...base, sharingPeers: ['a', 'c'], pinned: 'c' }), { stage: 'remote-screen', stagePeerId: 'c' });
-  assert.deepEqual(selectStage({ ...base, sharingPeers: ['a', 'c'], pinned: 'b' }), { stage: 'remote-screen', stagePeerId: 'a' });
-  // A "sharer" who isn't in the call is ignored
-  assert.deepEqual(selectStage({ ...base, sharingPeers: ['ghost', 'c'] }), { stage: 'remote-screen', stagePeerId: 'c' });
-  assert.deepEqual(selectStage({ ...base, sharingPeers: ['ghost'], pinned: 'b' }), { stage: 'pinned', stagePeerId: 'b' });
+test('your pin outranks someone else sharing, and offers their share instead of taking the stage', () => {
+  assert.deepEqual(selectStage({ ...base, sharingPeers: ['c'], pinned: 'b' }), { stage: 'pinned', stagePeerId: 'b', otherSharer: 'c' });
+  assert.deepEqual(selectStage({ ...base, sharingPeers: ['ghost', 'a', 'c'], pinned: 'b' }), { stage: 'pinned', stagePeerId: 'b', otherSharer: 'a' });
+  // A "sharer" who isn't in the call is never offered
+  assert.deepEqual(selectStage({ ...base, sharingPeers: ['ghost'], pinned: 'b' }), { stage: 'pinned', stagePeerId: 'b', otherSharer: null });
+});
+
+test('when the pinned person shares, their screen is on the stage', () => {
+  assert.deepEqual(selectStage({ ...base, sharingPeers: ['a', 'c'], pinned: 'c' }), { stage: 'remote-screen', stagePeerId: 'c', otherSharer: null });
 });
 
 test('your own screen share and the whiteboard come first', () => {
-  assert.deepEqual(selectStage({ ...base, localSharing: true, sharingPeers: ['c'], pinned: 'b' }), { stage: 'local-screen', stagePeerId: null });
-  assert.deepEqual(selectStage({ ...base, whiteboardOpen: true, localSharing: true, pinned: 'b' }), { stage: 'whiteboard', stagePeerId: null });
+  assert.deepEqual(selectStage({ ...base, localSharing: true, sharingPeers: ['c'], pinned: 'b' }), { stage: 'local-screen', ...none });
+  assert.deepEqual(selectStage({ ...base, whiteboardOpen: true, localSharing: true, pinned: 'b' }), { stage: 'whiteboard', ...none });
 });
 
-test('accepts sets as well as arrays', () => {
+test('accepts sets and iterators as well as arrays', () => {
   assert.deepEqual(
-    selectStage({ ...base, sharingPeers: new Set<string>(), peerIds: new Set(['x']), pinned: 'x' }),
-    { stage: 'pinned', stagePeerId: 'x' }
+    selectStage({ ...base, sharingPeers: new Set<string>(), peerIds: new Map([['x', 1]]).keys(), pinned: 'x' }),
+    { stage: 'pinned', stagePeerId: 'x', otherSharer: null }
   );
 });
 

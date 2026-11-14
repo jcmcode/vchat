@@ -20,25 +20,30 @@ export interface StageLayout {
   stage: StageKind | null;
   /** The remote participant shown on the stage (remote screen or pinned). */
   stagePeerId: string | null;
+  /** While your pin holds the stage: someone else sharing their screen (offer to view it). */
+  otherSharer: string | null;
 }
 
 /**
- * What takes the big stage, in order: the whiteboard (if you opened it), your own screen share, a
- * remote screen share (the pinned person's, if they're one of the sharers), then the person you
- * pinned. A pin for someone who isn't in the call counts for nothing. With no stage, everyone is
- * in the grid; otherwise everyone else goes to the strip.
+ * What takes the big stage, in order: the whiteboard (if you opened it), your own screen share,
+ * the person you pinned (their screen, if they're sharing), then a remote screen share. Your pin
+ * outranks other people's shares, so nobody can take your stage by announcing one; while it does,
+ * `otherSharer` names a sharer you can switch to. A pin for someone who isn't in the call counts
+ * for nothing. With no stage, everyone is in the grid; otherwise everyone else goes to the strip.
  */
 export function selectStage(input: StageInput): StageLayout {
-  if (input.whiteboardOpen) return { stage: 'whiteboard', stagePeerId: null };
-  if (input.localSharing) return { stage: 'local-screen', stagePeerId: null };
+  const none = { stagePeerId: null, otherSharer: null };
+  if (input.whiteboardOpen) return { stage: 'whiteboard', ...none };
+  if (input.localSharing) return { stage: 'local-screen', ...none };
   const present = new Set(input.peerIds);
   const sharers = [...input.sharingPeers].filter((id) => present.has(id));
-  if (sharers.length > 0) {
-    const sharer = input.pinned && sharers.includes(input.pinned) ? input.pinned : sharers[0];
-    return { stage: 'remote-screen', stagePeerId: sharer };
+  const pinned = input.pinned && present.has(input.pinned) ? input.pinned : null;
+  if (pinned) {
+    if (sharers.includes(pinned)) return { stage: 'remote-screen', stagePeerId: pinned, otherSharer: null };
+    return { stage: 'pinned', stagePeerId: pinned, otherSharer: sharers[0] ?? null };
   }
-  if (input.pinned && present.has(input.pinned)) return { stage: 'pinned', stagePeerId: input.pinned };
-  return { stage: null, stagePeerId: null };
+  if (sharers.length > 0) return { stage: 'remote-screen', stagePeerId: sharers[0], otherSharer: null };
+  return { stage: null, ...none };
 }
 
 /** How you hear one participant: volume in percent (0–100) and "Mute for me". */

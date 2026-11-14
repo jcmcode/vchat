@@ -1,16 +1,28 @@
+<script context="module" lang="ts">
+  let endHold: () => void = () => {};
+
+  /**
+   * End hold-to-talk now (mic muted) and start over. Called right before the screen-share picker
+   * opens: it can swallow the Space keyup without the window losing focus.
+   */
+  export function endHoldToTalk(): void {
+    endHold();
+  }
+</script>
+
 <script lang="ts">
   // Call-screen keyboard shortcuts (keys and rules: lib/ui/shortcuts.ts). Renders nothing visible.
   import { createEventDispatcher, onDestroy } from 'svelte';
   import { get } from 'svelte/store';
-  import { localStream, toggleAudio, toggleVideo } from '$lib/media/manager';
+  import { audioEnabled, localStream, toggleAudio, toggleVideo } from '$lib/media/manager';
   import { toggleHand, localHandRaised } from '$lib/collab/hands';
   import {
+    HoldToTalk,
     isMacPlatform,
-    isTalkKey,
+    isSpaceKey,
     isTypingTarget,
-    matchShortcut,
+    routeKeydown,
     spaceHasNativeAction,
-    PushToTalk,
     type ShortcutAction,
   } from '$lib/ui/shortcuts';
 
@@ -28,7 +40,11 @@
     return chatOnly ? undefined : get(localStream)?.getAudioTracks()[0];
   }
 
-  const ptt = new PushToTalk({
+  function hasCamera(): boolean {
+    return !chatOnly && !!get(localStream)?.getVideoTracks().length;
+  }
+
+  const hold = new HoldToTalk({
     available: () => !!micTrack(),
     isOn: () => !!micTrack()?.enabled,
     setOn: (on) => {
@@ -36,15 +52,24 @@
       if (track && track.enabled !== on) toggleAudio();
     },
   });
+  endHold = () => watch(() => hold.reset());
+
+  // The Mic button (or anything else) switching the mic during a hold drops the hold, so letting go
+  // of Space doesn't undo it. Subscribed directly: the change must be seen synchronously.
+  const stopWatchingMic = audioEnabled.subscribe(() => hold.micChanged());
 
   /** Read out what a shortcut did (the buttons change silently). */
   let announcement = '';
+  /** The click that follows a pointerdown which ended a hold does nothing else. */
+  let swallowNextClick = false;
 
-  function release() {
-    if (ptt.active) {
-      ptt.release();
-      announcement = 'Microphone off';
-    }
+  /** Run a hold transition and announce it. */
+  function watch<T>(fn: () => T): T {
+    const before = hold.active;
+    const result = fn();
+    if (!before && hold.active) announcement = 'Microphone on while you hold Space';
+    else if (before && !hold.active) announcement = 'Microphone off';
+    return result;
   }
 
   function typing(e: Event): boolean {
@@ -54,10 +79,10 @@
   function run(action: ShortcutAction) {
     switch (action) {
       case 'toggle-mic':
-        if (micTrack()) announcement = toggleAudio() ? 'Microphone on' : 'Microphone off';
+        announcement = toggleAudio() ? 'Microphone on' : 'Microphone off';
         break;
       case 'toggle-camera':
-        if (!chatOnly && get(localStream)?.getVideoTracks().length) announcement = toggleVideo() ? 'Camera on' : 'Camera off';
+        announcement = toggleVideo() ? 'Camera on' : 'Camera off';
         break;
       case 'toggle-hand':
         toggleHand();
@@ -73,56 +98,68 @@
   }
 
   function onKeydown(e: KeyboardEvent) {
-    if (ptt.active) {
-      if (isTalkKey(e)) {
-        e.preventDefault(); // key repeat while holding
-        return;
-      }
-      // Hold-to-talk lasts only while Space alone is held. Any other key ends it (the mic is muted
-      // again) and does nothing else, so a missed keyup can't leave the microphone open.
-      release();
-      return;
-    }
-    if (!enabled || e.defaultPrevented || e.isComposing || typing(e)) return;
-    if (isTalkKey(e)) {
-      if (e.repeat || whiteboardOpen || spaceHasNativeAction(e.target) || spaceHasNativeAction(document.activeElement)) return;
-      if (ptt.press()) {
-        e.preventDefault();
-        announcement = 'Microphone on while you hold Space';
-      }
-      return;
-    }
-    const action = matchShortcut(e, isMac);
-    if (!action) return;
-    e.preventDefault(); // e.g. Ctrl/Cmd+D would otherwise bookmark the page
-    if (!e.repeat) run(action);
+    swallowNextClick = false;
+    const result = watch(() =>
+      routeKeydown(hold, e, {
+        enabled,
+        typing: typing(e),
+        spaceNative: spaceHasNativeAction(e.target) || spaceHasNativeAction(document.activeElement),
+        defaultPrevented: e.defaultPrevented,
+        whiteboardOpen,
+        isMac,
+        hasMic: !!micTrack(),
+        hasCamera: hasCamera(),
+      })
+    );
+    if (result.preventDefault) e.preventDefault();
+    if (result.action) run(result.action);
   }
 
   function onKeyup(e: KeyboardEvent) {
-    if (!ptt.active) return;
-    if (isTalkKey(e)) e.preventDefault();
-    release(); // Space released (or anything else let go: only Space alone may hold the mic open)
+    if (watch(() => hold.keyup(isSpaceKey(e))) === 'swallow') e.preventDefault();
+  }
+
+  function onPointerDown() {
+    swallowNextClick = watch(() => hold.interrupt());
+  }
+
+  function onClickCapture(e: MouseEvent) {
+    if (!swallowNextClick) return;
+    swallowNextClick = false;
+    e.preventDefault();
+    e.stopPropagation();
   }
 
   function onFocusIn(e: FocusEvent) {
-    if (isTypingTarget(e.target)) release();
+    if (isTypingTarget(e.target)) watch(() => hold.interrupt());
+  }
+
+  function startOver() {
+    swallowNextClick = false;
+    watch(() => hold.reset());
   }
 
   function onVisibilityChange() {
-    if (document.visibilityState === 'hidden') release();
+    if (document.visibilityState === 'hidden') startOver();
   }
 
-  $: if (!enabled || whiteboardOpen || chatOnly) release();
-  onDestroy(() => ptt.release());
+  $: if (!enabled || whiteboardOpen || chatOnly) startOver();
+  onDestroy(() => {
+    stopWatchingMic();
+    hold.reset();
+    endHold = () => {};
+  });
 </script>
 
 <svelte:window
   on:keydown={onKeydown}
   on:keyup={onKeyup}
-  on:blur={release}
+  on:pointerdown|capture={onPointerDown}
+  on:click|capture={onClickCapture}
+  on:blur={startOver}
   on:focusin={onFocusIn}
-  on:pagehide={release}
-  on:contextmenu={release}
+  on:pagehide={startOver}
+  on:contextmenu={startOver}
 />
 <svelte:document on:visibilitychange={onVisibilityChange} />
 

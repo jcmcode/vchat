@@ -12,7 +12,8 @@
 //   ?                               this list
 //   Space, held                     talk while muted (off while the whiteboard is open: Space pans it)
 //
-// Nothing fires while focus is in a text field, select or contenteditable element.
+// Nothing fires while focus is in a text field, select or contenteditable element, or for a
+// character typed with AltGr.
 
 export type ShortcutAction = 'toggle-mic' | 'toggle-camera' | 'toggle-hand' | 'toggle-chat' | 'help';
 
@@ -26,6 +27,16 @@ export interface KeyLike {
   shiftKey: boolean;
   repeat?: boolean;
   isComposing?: boolean;
+  /** KeyboardEvent.getModifierState, to tell AltGr (a character key on many layouts) from Ctrl+Alt. */
+  getModifierState?: (key: string) => boolean;
+}
+
+function altGraph(e: KeyLike): boolean {
+  try {
+    return typeof e.getModifierState === 'function' && e.getModifierState('AltGraph') === true;
+  } catch {
+    return false;
+  }
 }
 
 /** Apple keyboards use Cmd where others use Ctrl (iPadOS Safari reports itself as a Mac). */
@@ -54,7 +65,8 @@ export function matchShortcut(e: KeyLike, isMac: boolean): ShortcutAction | null
   if (e.isComposing) return null;
   // "?" needs Shift (or AltGr) on most layouts, so only Cmd rules it out (Cmd+? is the Mac Help menu).
   if (e.key === '?' && !e.metaKey) return 'help';
-  if (e.shiftKey) return null;
+  // AltGr types characters (Polish AltGr+C is "ć"): never a shortcut, even though it reports Ctrl+Alt.
+  if (e.shiftKey || altGraph(e)) return null;
   const letter = letterOf(e);
   if (!letter) return null;
   const primary = isMac ? e.metaKey && !e.ctrlKey : e.ctrlKey && !e.metaKey;
@@ -72,9 +84,21 @@ export function matchShortcut(e: KeyLike, isMac: boolean): ShortcutAction | null
   return null;
 }
 
-/** Space with no modifiers: the hold-to-talk key. */
+/** Whether a shortcut has anything to do (if not, the key is left to the browser). */
+export function shortcutApplies(action: ShortcutAction, ctx: { hasMic: boolean; hasCamera: boolean }): boolean {
+  if (action === 'toggle-mic') return ctx.hasMic;
+  if (action === 'toggle-camera') return ctx.hasCamera;
+  return true;
+}
+
+/** The Space key, with or without modifiers (letting go of it always counts). */
+export function isSpaceKey(e: Pick<KeyLike, 'key'>): boolean {
+  return e.key === ' ' || e.key === 'Spacebar';
+}
+
+/** Space with no modifiers: the key that starts hold-to-talk. */
 export function isTalkKey(e: KeyLike): boolean {
-  return (e.key === ' ' || e.key === 'Spacebar') && !e.ctrlKey && !e.metaKey && !e.altKey && !e.shiftKey;
+  return isSpaceKey(e) && !e.ctrlKey && !e.metaKey && !e.altKey && !e.shiftKey;
 }
 
 /** What `isTypingTarget` and `spaceHasNativeAction` read from an element (a DOM Element fits). */
@@ -157,36 +181,144 @@ export interface MicControl {
 }
 
 /**
- * Hold-to-talk: while muted, holding the key unmutes until it's released. Releasing always mutes
- * again, and so does anything that could hide the release (the page calls `release` on keyup, any
- * other key, window blur, the tab being hidden, focus moving into a text field, the whiteboard
- * opening, leaving the call). If you were already unmuted, holding the key does nothing.
+ * - idle: nothing held.
+ * - holding: Space is held and it unmuted the microphone.
+ * - waiting: a hold ended early (another key, a click, focus moving into a text field, the mic
+ *   switched some other way). The mic is muted and every key press is ignored until Space is let
+ *   go (or the window loses focus), so a key combination can't turn the mic straight back on.
  */
-export class PushToTalk {
-  private holding = false;
+export type HoldState = 'idle' | 'holding' | 'waiting';
+
+/** What the page does with a key event: leave it to the shortcuts, or swallow it (preventDefault, nothing else). */
+export type HoldVerdict = 'pass' | 'swallow';
+
+/**
+ * Hold-to-talk: while muted, holding Space unmutes until it's released. Every way out mutes again,
+ * and nothing during a hold can turn "open while held" into "open": the key or click that ends a
+ * hold does nothing else, and if the mic is switched some other way the hold is dropped (what
+ * happens next is then up to the user). If you were already unmuted, holding Space does nothing.
+ */
+export class HoldToTalk {
+  private current: HoldState = 'idle';
+  /** True while this class itself is switching the mic (so micChanged can tell). */
+  private switching = false;
 
   constructor(private readonly mic: MicControl) {}
 
-  /** True while the key is held and it was this that unmuted the microphone. */
+  get state(): HoldState {
+    return this.current;
+  }
+
+  /** True while Space is held and it was this that unmuted the microphone. */
   get active(): boolean {
-    return this.holding;
+    return this.current === 'holding';
   }
 
-  /** The key went down. Returns true if it unmuted the microphone (and is now holding it open). */
-  press(): boolean {
-    if (this.holding) return true;
-    if (!this.mic.available() || this.mic.isOn()) return false;
-    this.mic.setOn(true);
-    this.holding = this.mic.isOn();
-    return this.holding;
+  /**
+   * A key went down. `talkKey`: it's Space with no modifiers. `canStart`: Space may start a hold
+   * here (in the call, not typing, not on a button, whiteboard closed, not an auto-repeat).
+   */
+  keydown(talkKey: boolean, canStart: boolean): HoldVerdict {
+    if (this.current === 'holding') {
+      if (!talkKey) this.end('waiting'); // and the key does nothing else
+      return 'swallow'; // (Space auto-repeat while holding is swallowed too)
+    }
+    if (this.current === 'waiting') return 'swallow';
+    if (!talkKey || !canStart || !this.mic.available() || this.mic.isOn()) return 'pass';
+    this.setMic(true);
+    if (!this.mic.isOn()) return 'pass';
+    this.current = 'holding';
+    return 'swallow';
   }
 
-  /** Mute again if a hold opened the microphone. Safe to call any number of times. */
-  release(): void {
-    if (!this.holding) return;
-    this.holding = false;
-    if (this.mic.isOn()) this.mic.setOn(false);
+  /** A key went up. `spaceKey`: it's Space (modifiers don't matter for letting go). */
+  keyup(spaceKey: boolean): HoldVerdict {
+    if (this.current === 'holding') {
+      // Space let go: done. Anything else let go: only Space alone may hold the mic open.
+      this.end(spaceKey ? 'idle' : 'waiting');
+      return spaceKey ? 'swallow' : 'pass';
+    }
+    if (this.current === 'waiting' && spaceKey) {
+      this.current = 'idle';
+      return 'swallow';
+    }
+    return 'pass';
   }
+
+  /**
+   * Something other than a key interrupts a hold (a click or tap, focus moving into a text field).
+   * Returns true if it ended one: then the click that caused it must do nothing else.
+   */
+  interrupt(): boolean {
+    if (this.current !== 'holding') return false;
+    this.end('waiting');
+    return true;
+  }
+
+  /** Mute if holding, and start over: the window lost focus, the tab was hidden, a system picker is about to open, the call ended. */
+  reset(): void {
+    if (this.current === 'holding') this.end('idle');
+    this.current = 'idle';
+  }
+
+  /** The microphone was switched by something else (the Mic button…): drop the hold and leave the mic alone. */
+  micChanged(): void {
+    if (!this.switching && this.current === 'holding') this.current = 'waiting';
+  }
+
+  private end(next: HoldState): void {
+    this.current = next;
+    if (this.mic.isOn()) this.setMic(false);
+  }
+
+  private setMic(on: boolean): void {
+    this.switching = true;
+    try {
+      this.mic.setOn(on);
+    } finally {
+      this.switching = false;
+    }
+  }
+}
+
+/** Where a key press happens (the page fills this in from the DOM and its own state). */
+export interface KeyContext {
+  /** In the call itself (not the pre-join, password, waiting or error screens). */
+  enabled: boolean;
+  /** Focus is in a text field (see isTypingTarget). */
+  typing: boolean;
+  /** Space already means something where focus is (see spaceHasNativeAction). */
+  spaceNative: boolean;
+  /** Another handler already acted on this key. */
+  defaultPrevented: boolean;
+  whiteboardOpen: boolean;
+  isMac: boolean;
+  hasMic: boolean;
+  hasCamera: boolean;
+}
+
+export interface KeydownResult {
+  preventDefault: boolean;
+  /** The shortcut to run now, if any. */
+  action: ShortcutAction | null;
+}
+
+/**
+ * Everything the call screen does with a keydown. Hold-to-talk sees it first: during a hold (and
+ * after one ended early, until Space is let go) no key reaches the shortcuts, so Space + Ctrl+D can
+ * never leave the microphone open.
+ */
+export function routeKeydown(hold: HoldToTalk, e: KeyLike, ctx: KeyContext): KeydownResult {
+  const talk = isTalkKey(e);
+  const canStart =
+    talk && ctx.enabled && !ctx.whiteboardOpen && !e.repeat && !e.isComposing && !ctx.typing && !ctx.spaceNative && !ctx.defaultPrevented;
+  if (hold.keydown(talk, canStart) === 'swallow') return { preventDefault: true, action: null };
+  if (!ctx.enabled || ctx.defaultPrevented || e.isComposing || ctx.typing) return { preventDefault: false, action: null };
+  const action = matchShortcut(e, ctx.isMac);
+  // A shortcut with nothing to do (Ctrl+D for someone without a mic) is left to the browser.
+  if (!action || !shortcutApplies(action, ctx)) return { preventDefault: false, action: null };
+  // Block the browser's own use of the combination (Ctrl/Cmd+D bookmarks) even on auto-repeat; act once.
+  return { preventDefault: true, action: e.repeat ? null : action };
 }
 
 export interface ShortcutHelpEntry {

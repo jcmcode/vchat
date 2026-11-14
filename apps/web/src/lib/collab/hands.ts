@@ -7,12 +7,14 @@ import {
   broadcastData,
   getPeerConnection,
   onPeerConnected,
+  onPeerCreated,
   onPeerLeft,
   onRoomLeft,
   peerDisplayName,
   registerDataHandler,
   sendData,
 } from '../webrtc/mesh.js';
+import { LatestSender } from '../webrtc/latest-sender.js';
 import { RaisedHands } from './hand-model.js';
 
 /** Your own hand. */
@@ -30,15 +32,15 @@ export const handToasts = writable<HandToast[]>([]);
 
 const TOAST_MS = 4000;
 const MAX_TOASTS = 3;
-/** Pressing the button repeatedly sends at most one update per this many ms (always the latest). */
-const MIN_SEND_INTERVAL_MS = 300;
 
 const hands = new RaisedHands();
 let toastSeq = 0;
 const toastTimers = new Set<ReturnType<typeof setTimeout>>();
-let lastSent = false;
-let lastSentAt = 0;
-let sendTimer: ReturnType<typeof setTimeout> | null = null;
+/** Pressing the button repeatedly sends at most one update per 300ms, always the latest (peers assume "lowered"). */
+const sender = new LatestSender<boolean>(
+  { intervalMs: 300, read: () => get(localHandRaised), send: (raised) => broadcastData({ type: 'hand', raised }) },
+  false
+);
 
 function publishStore(): void {
   raisedHands.set(new Set(hands.list()));
@@ -70,6 +72,11 @@ onPeerConnected((peerId) => {
   sendData(peerId, { type: 'hand', raised: get(localHandRaised) });
 });
 
+// A rebuilt connection starts from scratch: no stale badge until the new verified channel re-sends it.
+onPeerCreated((peerId) => {
+  if (hands.remove(peerId)) publishStore();
+});
+
 onPeerLeft((peerId) => {
   if (hands.remove(peerId)) publishStore();
 });
@@ -78,36 +85,15 @@ onRoomLeft(() => {
   hands.clear();
   publishStore();
   localHandRaised.set(false);
-  lastSent = false;
-  lastSentAt = 0;
-  if (sendTimer) clearTimeout(sendTimer);
-  sendTimer = null;
+  sender.reset(false);
   for (const timer of toastTimers) clearTimeout(timer);
   toastTimers.clear();
   handToasts.set([]);
 });
 
-/** Tell everyone the current state, coalescing rapid toggles so the last one is never lost. */
-function publish(): void {
-  if (sendTimer) return; // a send is already scheduled; it reads the latest state
-  const wait = lastSentAt + MIN_SEND_INTERVAL_MS - Date.now();
-  if (wait > 0) {
-    sendTimer = setTimeout(() => {
-      sendTimer = null;
-      publish();
-    }, wait);
-    return;
-  }
-  const raised = get(localHandRaised);
-  if (raised === lastSent) return;
-  lastSent = raised;
-  lastSentAt = Date.now();
-  broadcastData({ type: 'hand', raised });
-}
-
 export function setHandRaised(raised: boolean): void {
   localHandRaised.set(raised);
-  publish();
+  sender.notify();
 }
 
 export function toggleHand(): void {
