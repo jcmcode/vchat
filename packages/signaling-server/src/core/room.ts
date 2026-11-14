@@ -37,6 +37,16 @@ export interface AdmittedEntry {
   h: string;
   /** Role it was admitted with ('open' in open mode). */
   r: 'host' | 'guest' | 'open';
+  /** Emailed invites: the address the invite was sent to (so a removal bars it even if they're offline). */
+  e?: string;
+}
+
+/**
+ * Peer ids are client-chosen and used as keys here, so the map has no prototype: an id like
+ * "constructor" is just an id that isn't present.
+ */
+function admittedMap(entries: Record<string, AdmittedEntry> = {}): Record<string, AdmittedEntry> {
+  return Object.assign(Object.create(null) as Record<string, AdmittedEntry>, entries);
 }
 
 export interface BarEntry {
@@ -108,13 +118,13 @@ export const CLOSE_REMOVED = 4002;
 export const CLOSE_REPLACED = 4000;
 
 function emptyMeta(): RoomMeta {
-  return { hostPeerId: null, passwordHash: null, admitted: {}, removed: [], denied: [], createdAt: Date.now() };
+  return { hostPeerId: null, passwordHash: null, admitted: admittedMap(), removed: [], denied: [], createdAt: Date.now() };
 }
 
 /** Accept metadata restored from storage written by any version. */
 export function normalizeMeta(meta: Partial<RoomMeta> | null | undefined): RoomMeta | null {
   if (!meta || typeof meta !== 'object') return null;
-  const admitted: Record<string, AdmittedEntry> = {};
+  const admitted = admittedMap();
   for (const [id, e] of Object.entries(meta.admitted ?? {})) {
     if (e && typeof e === 'object' && typeof (e as AdmittedEntry).h === 'string') admitted[id] = e as AdmittedEntry;
   }
@@ -220,7 +230,7 @@ export class Room<C> {
       hostPeerId: args.peerId,
       passwordHash,
       ...(passwordHash ? { passwordSalt: salt } : {}),
-      admitted: { [args.peerId]: { h: secretHash, r: 'open' } },
+      admitted: admittedMap({ [args.peerId]: { h: secretHash, r: 'open' } }),
     };
     this.setMember(conn, { peerId: args.peerId, displayName: args.displayName, status: 'peer', secretHash });
     this.metaChanged();
@@ -413,7 +423,7 @@ export class Room<C> {
       return;
     }
     delete this.meta.admitted[peerId];
-    const removedEmail = entry?.[1].email;
+    const removedEmail = entry?.[1].email ?? admitted?.e;
     this.bar(
       this.meta.removed,
       { p: peerId, h: this.barHash(entry?.[1].secretHash ?? admitted?.h ?? ''), ...(removedEmail ? { e: removedEmail } : {}) },
@@ -502,7 +512,7 @@ export class Room<C> {
 
     this.setMember(conn, state);
     delete this.meta.admitted[state.peerId]; // re-insert so key order tracks recency
-    this.meta.admitted[state.peerId] = { h: state.secretHash, r: state.role ?? 'open' };
+    this.meta.admitted[state.peerId] = { h: state.secretHash, r: state.role ?? 'open', ...(state.email ? { e: state.email } : {}) };
     this.trimAdmitted();
     this.metaChanged();
 

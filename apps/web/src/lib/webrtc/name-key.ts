@@ -1,6 +1,17 @@
-// Comparison key for display names. Mirrors `nameKey` in the signaling server
-// (packages/signaling-server/src/core/protocol.ts) — keep the two in step — so the client can
-// refuse a name that reads the same as someone else's even when it didn't come from the server.
+// Comparison key for display names. Follows `nameKey` in the signaling server
+// (packages/signaling-server/src/core/protocol.ts), so the client can refuse a name that reads the
+// same as someone else's even when it didn't come from the server. Unlike the server — which
+// strips invisible characters from names before it ever compares them — the client also has to
+// cope with names that never passed through the server, so that stripping happens here too.
+
+// Characters that render as nothing (or as a blank): format controls such as zero-width and bidi
+// marks and the "tag" block, plus the blank Hangul fillers and the empty Braille cell.
+const INVISIBLE = /[\p{Cf}\u115f\u1160\u180e\u2800\u3164\uffa0]/gu;
+
+/** Remove characters that can't be seen, so two names that look alike are alike. */
+export function stripInvisible(name: string): string {
+  return name.replace(INVISIBLE, '').replace(/\s+/g, ' ').trim();
+}
 
 // A small fold for look-alike letters from other scripts (not the full Unicode confusables table).
 const CONFUSABLES: Record<string, string> = {
@@ -15,7 +26,7 @@ const CONFUSABLES: Record<string, string> = {
  * whitespace collapsed: "Ałex", "ALEX" and "Аlex" (Cyrillic А) all compare equal to "alex".
  */
 export function nameKey(name: string): string {
-  const folded = name
+  const folded = stripInvisible(name)
     .normalize('NFKD')
     .replace(/\p{M}/gu, '')
     .toLowerCase()

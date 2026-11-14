@@ -33,6 +33,19 @@ export function readImageSize(bytes: Uint8Array): { width: number; height: numbe
       const block = b[i];
       if (block === 0x3b) break; // trailer
       if (block === 0x21) {
+        // Extensions must have their standard layout. Decoders differ in how they read a
+        // malformed one, and a file they'd parse differently from us could hide a larger frame.
+        const label = b[i + 1];
+        const size = b[i + 2];
+        if (label === 0xf9) {
+          if (size !== 4 || b[i + 7] !== 0) return null; // graphic control: 4 bytes, then the terminator
+        } else if (label === 0xff) {
+          if (size !== 11) return null; // application
+        } else if (label === 0x01) {
+          if (size !== 12) return null; // plain text
+        } else if (label !== 0xfe) {
+          return null; // not a comment either: unknown extension
+        }
         i += 2; // introducer + label
         skipSubBlocks();
       } else if (block === 0x2c) {

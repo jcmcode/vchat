@@ -182,9 +182,11 @@ export function setRelayOnly(on: boolean): void {
 }
 
 /** ICE servers for a call, and how long (seconds) any TURN credentials in them stay valid. */
-export async function fetchIceServers(token?: string): Promise<{ servers: RTCIceServer[]; ttl?: number }> {
+/** `ok` is false when the server couldn't be asked or refused (the servers are then only the fallback). */
+export async function fetchIceServers(token?: string): Promise<{ servers: RTCIceServer[]; ttl?: number; ok: boolean }> {
   let servers: RTCIceServer[] = FALLBACK_STUN;
   let ttl: number | undefined;
+  let ok = false;
   try {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), 4000);
@@ -194,6 +196,7 @@ export async function fetchIceServers(token?: string): Promise<{ servers: RTCIce
     });
     clearTimeout(timer);
     if (res.ok) {
+      ok = true;
       const body = (await res.json()) as { iceServers?: RTCIceServer[]; ttl?: unknown };
       if (Array.isArray(body.iceServers) && body.iceServers.length > 0) servers = body.iceServers;
       if (typeof body.ttl === 'number' && Number.isFinite(body.ttl) && body.ttl > 0) ttl = body.ttl;
@@ -206,7 +209,7 @@ export async function fetchIceServers(token?: string): Promise<{ servers: RTCIce
   if (manual) {
     servers = [...servers, { urls: manual.url, username: manual.username, credential: manual.credential }];
   }
-  return { servers, ttl };
+  return { servers, ttl, ok };
 }
 
 // ── Server mode ─────────────────────────────────────────────────────────────

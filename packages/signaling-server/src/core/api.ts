@@ -456,17 +456,30 @@ export function parseWsProtocols(header: string | null | undefined): { protocols
   return { protocols, token: tokenEntry?.slice(WS_TOKEN_PREFIX.length) };
 }
 
-/** May this WebSocket upgrade for `roomId` proceed? (Only private mode checks anything.) */
-export async function authorizeSocket(env: ServerEnv, roomId: string, protocolHeader: string | null | undefined): Promise<boolean> {
+/**
+ * Who a WebSocket upgrade for `roomId` belongs to: the token's role in private mode, 'open' in open
+ * mode, or null if it may not proceed.
+ */
+export async function socketRole(
+  env: ServerEnv,
+  roomId: string,
+  protocolHeader: string | null | undefined
+): Promise<'host' | 'guest' | 'open' | null> {
   const config = resolveConfig(env);
-  if (config.mode === 'open') return true;
-  if (config.error) return false;
+  if (config.mode === 'open') return 'open';
+  if (config.error) return null;
   const { token } = parseWsProtocols(protocolHeader);
-  if (!token) return false;
+  if (!token) return null;
   // Recently expired but genuine invites get through here so the person sees "invite expired" when
   // joining (the socket is then closed). Long-dead ones are refused outright.
   const result = await verifyToken(env.SECRET_KEY!, token, Date.now(), { allowExpiredSeconds: EXPIRED_GRACE_SECONDS });
-  return result.ok && (result.payload.role === 'host' || result.payload.role === 'guest') && result.payload.room === roomId;
+  if (!result.ok || result.payload.room !== roomId) return null;
+  return result.payload.role === 'host' || result.payload.role === 'guest' ? result.payload.role : null;
+}
+
+/** May this WebSocket upgrade for `roomId` proceed? (Only private mode checks anything.) */
+export async function authorizeSocket(env: ServerEnv, roomId: string, protocolHeader: string | null | undefined): Promise<boolean> {
+  return (await socketRole(env, roomId, protocolHeader)) !== null;
 }
 
 // ── Router ─────────────────────────────────────────────────────────────────

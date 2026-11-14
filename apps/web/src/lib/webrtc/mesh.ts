@@ -7,7 +7,7 @@ import { fetchIceServers } from '../stores/room.js';
 import { deserialize, serialize, type AnyDataMessage, type DataChannelMessage } from './data-channel.js';
 import { createSpeakingDetector } from '../media/audio-analysis.js';
 import { readSdpIdentity } from './e2e-proof.js';
-import { nameKey } from './name-key.js';
+import { nameKey, stripInvisible } from './name-key.js';
 import {
   initFileTransfer,
   handleFileMeta,
@@ -99,11 +99,6 @@ export const sharingPeers = writable<Set<string>>(new Set());
 export const peerMediaState = writable<Map<string, { audio: boolean; video: boolean }>>(new Map());
 /** Peer id of the current host (null if nobody holds the role). */
 export const hostPeerIdStore = writable<string | null>(null);
-/**
- * Set when the server ended our part in the call (removed by the host, or replaced by another tab).
- * The call is torn down immediately; the page releases the camera and forgets the room.
- */
-export const forcedOut = writable<boolean>(false);
 /** This participant's peer id (for collaboration features). */
 export const localPeerIdStore = writable<string>('');
 
@@ -121,6 +116,7 @@ const createdHandlers = new Set<(peerId: string, sid: string | null) => void>();
 const securityFailureHandlers = new Set<(peerId: string, reason: string) => void>();
 const leaveHandlers = new Set<(peerId: string) => void>();
 const roomLeaveHandlers = new Set<() => void>();
+const forcedOutHandlers = new Set<() => void>();
 
 /** Handle every incoming message whose `type` equals `type`. */
 export function registerDataHandler(type: string, handler: DataHandler): void {
@@ -188,33 +184,40 @@ export function trustPeer(peerId: string, sid: string): void {
  * hold the room key — which every invited person does — so the name is never taken at face value:
  *  - If the server's label is that same name (possibly with the " (2)" it adds to keep names
  *    unique), the label is shown. The server can't relabel people and a peer can't drop the suffix.
- *  - Otherwise the proven name is shown, but never one that reads the same as another
- *    participant's (or ours): it gets a number, so nobody can pose as someone else with a
- *    "verified" badge.
+ *  - Otherwise the proven name is shown instead of the label.
+ * Either way no two participants are ever shown names that read the same (see resolveShownNames).
  */
 export function setVerifiedName(peerId: string, sid: string, name: string): void {
   const pc = get(peers).get(peerId);
   if (!pc || pc.sid !== sid) return;
+  const proven = stripInvisible(name);
   const label = serverNames.get(peerId);
-  if (label !== undefined && labelMatchesName(label, name)) {
-    claimedNames.delete(peerId);
-    setShownName(peerId, label);
-  } else {
-    claimedNames.set(peerId, name);
-  }
-  resolveClaimedNames();
+  // A name with nothing visible in it proves nothing: keep the server's label.
+  if (!nameKey(proven) || (label !== undefined && labelMatchesName(label, proven))) claimedNames.delete(peerId);
+  else claimedNames.set(peerId, proven);
+  resolveShownNames();
   updatePeers();
 }
 
-/** Whether the server's label is `name` itself, or `name` with the server's " (n)" uniqueness suffix. */
+const MAX_SHOWN_NAME = 30;
+
+function sliceCodePoints(value: string, end: number): string {
+  return Array.from(value).slice(0, end).join('');
+}
+
+/** `name` with a number, the way the server does it: cut to fit, then " (n)". */
+function numbered(name: string, n: number): string {
+  const suffix = ` (${n})`;
+  return sliceCodePoints(name, MAX_SHOWN_NAME - suffix.length).trimEnd() + suffix;
+}
+
+/** Whether the server's label is `name` itself, or exactly what the server makes of it to keep names unique. */
 function labelMatchesName(label: string, name: string): boolean {
   const key = nameKey(name);
   if (!key) return false;
   if (nameKey(label) === key) return true;
-  const m = label.match(/^(.*\S) \((\d{1,2})\)$/);
-  if (!m) return false;
-  const stem = nameKey(m[1]);
-  return stem.length > 0 && key.startsWith(stem);
+  const m = label.match(/ \((\d{1,2})\)$/);
+  return !!m && nameKey(numbered(name, Number(m[1]))) === nameKey(label);
 }
 
 function setShownName(peerId: string, name: string): void {
@@ -223,16 +226,23 @@ function setShownName(peerId: string, name: string): void {
   if (pc) pc.displayName = name;
 }
 
-/** Give every proven-but-unconfirmed name a display form that can't be mistaken for anyone else's. */
-function resolveClaimedNames(): void {
+/**
+ * Decide what every participant is called. Nobody is ever shown a name that reads the same as
+ * ours or as another participant's — not through a name they proved, and not through labels a
+ * misbehaving server handed out twice. Server labels come first (in a well-behaved room they are
+ * already unique and are shown untouched); names that were proven but don't match their label
+ * come after, so the one making the unusual claim is the one that gets numbered.
+ */
+function resolveShownNames(): void {
   const taken = new Set<string>([nameKey(localDisplayName)]);
-  for (const [id, pc] of get(peers)) if (!claimedNames.has(id)) taken.add(nameKey(knownNames.get(id) ?? pc.displayName));
-  for (const [id, name] of claimedNames) {
+  const place = (id: string, name: string) => {
     let shown = name;
-    for (let n = 2; taken.has(nameKey(shown)) && n < 100; n++) shown = `${name.slice(0, 26).trimEnd()} (${n})`;
+    for (let n = 2; taken.has(nameKey(shown)) && n < 100; n++) shown = numbered(name, n);
     taken.add(nameKey(shown));
     setShownName(id, shown);
-  }
+  };
+  for (const [id, label] of serverNames) if (!claimedNames.has(id)) place(id, label);
+  for (const [id, name] of claimedNames) place(id, name);
 }
 
 /** Verification messages are the only thing allowed over an untrusted connection. */
@@ -245,6 +255,15 @@ export function sendVerification(peerId: string, sid: string, msg: AnyDataMessag
 export function onPeerLeft(handler: (peerId: string) => void): () => void {
   leaveHandlers.add(handler);
   return () => leaveHandlers.delete(handler);
+}
+
+/**
+ * Called when the server ends our part in the call (removed by the host, or replaced by another
+ * tab). The call itself is torn down here; the page releases the camera and forgets the room.
+ */
+export function onForcedOut(handler: () => void): () => void {
+  forcedOutHandlers.add(handler);
+  return () => forcedOutHandlers.delete(handler);
 }
 
 /** Called when we leave the room (reset collaboration state). */
@@ -305,14 +324,20 @@ let iceRefreshTimer: ReturnType<typeof setTimeout> | null = null;
  * TURN credentials expire (the server's `ttl`). Fetch fresh ones before then and hand them to every
  * connection, so long calls that go through the relay keep working.
  */
-function scheduleIceRefresh(ttl: number | undefined, token: string | undefined, generation: number): void {
+function scheduleIceRefresh(ttl: number | undefined, token: string | undefined, generation: number, retryInMs?: number): void {
   if (iceRefreshTimer) clearTimeout(iceRefreshTimer);
   iceRefreshTimer = null;
   if (!ttl) return;
-  const delay = Math.max(30, ttl * 0.8) * 1000;
+  const delay = retryInMs ?? Math.max(30, ttl * 0.8) * 1000;
   iceRefreshTimer = setTimeout(async () => {
     const fresh = await fetchIceServers(token);
     if (generation !== joinGeneration) return;
+    if (!fresh.ok) {
+      // Refused or unreachable right now: keep the servers we have (replacing them with the
+      // fallback would drop the relay from every connection) and try again in a minute.
+      scheduleIceRefresh(ttl, token, generation, 60_000);
+      return;
+    }
     iceServers = fresh.servers;
     for (const pc of get(peers).values()) {
       const rtc = (pc.peer as unknown as { _pc?: RTCPeerConnection })._pc;
@@ -425,12 +450,14 @@ function newSid(): string {
 }
 
 /**
- * The server's label for a peer. It's what we show until (and unless) they prove a name, and a
- * newcomer's label must not make an already-shown claimed name ambiguous.
+ * The server's label for a peer: what we show until (and unless) they prove a different name.
+ * Every arrival re-settles the names, so a newcomer's label can't end up reading the same as a
+ * name someone already present is shown under.
  */
 function noteServerName(peerId: string, name: string): void {
   serverNames.set(peerId, name);
-  if (!claimedNames.has(peerId)) knownNames.set(peerId, name);
+  resolveShownNames();
+  updatePeers();
 }
 
 // Data channel helpers
@@ -488,7 +515,6 @@ export async function joinRoom(opts: JoinOptions): Promise<void> {
   knownNames.clear();
   serverNames.clear();
   claimedNames.clear();
-  forcedOut.set(false);
 
   // Chat lives only in this tab's memory: it is never written to storage, so nothing of the
   // conversation is left behind when the call ends (a page refresh starts with an empty chat).
@@ -533,10 +559,11 @@ export async function joinRoom(opts: JoinOptions): Promise<void> {
   // instead of leaving it all in the tab until "Back to home" is clicked.
   const forceOut = (message: string) => {
     roomError.set(message);
-    forcedOut.set(true);
     // After this event has been delivered to every listener.
     queueMicrotask(() => {
-      if (generation === joinGeneration) leaveRoom();
+      if (generation !== joinGeneration) return;
+      leaveRoom();
+      for (const handler of forcedOutHandlers) handler();
     });
   };
   on('removed', () => forceOut(FATAL_ERRORS['Removed by host']));
@@ -1246,7 +1273,8 @@ function createPeerConnection(
 
   const pc: PeerConnection = {
     id: remotePeerId,
-    displayName: remoteDisplayName,
+    // What this peer is currently shown as (the label may have been numbered, or a name proven).
+    displayName: knownNames.get(remotePeerId) ?? remoteDisplayName,
     peer,
     stream: null,
     sid,
@@ -1420,8 +1448,9 @@ function destroyPeerConnection(remotePeerId: string): void {
     next.delete(remotePeerId);
     return next;
   });
+  // Their name stays in knownNames (chat keeps its labels) but no longer takes part in naming.
   serverNames.delete(remotePeerId);
-  if (claimedNames.delete(remotePeerId)) resolveClaimedNames();
+  claimedNames.delete(remotePeerId);
   for (const handler of leaveHandlers) handler(remotePeerId);
 
   typingPeers.update((s) => {

@@ -49,6 +49,10 @@ function gif(screenW: number, screenH: number, frameW: number, frameH: number): 
 
 test('a GIF frame larger than its declared screen counts (no tiny-screen decompression bomb)', () => {
   assert.deepEqual(readImageSize(gif(1, 1, 20000, 20000)), { width: 20000, height: 20000 });
+  // A malformed extension (decoders disagree on how to read it): size unknown.
+  const odd = gif(1, 1, 1, 1);
+  odd[15] = 0x01; // graphic-control block size 1 instead of 4
+  assert.equal(readImageSize(odd), null);
   // No frame within the bytes we read: size unknown, so it is never previewed.
   assert.equal(readImageSize(gif(800, 600, 800, 600).subarray(0, 13)), null);
 });

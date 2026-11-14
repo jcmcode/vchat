@@ -185,7 +185,9 @@ onPeerChannelOpen(async (peerId, sid) => {
     fail(peerId, sid, 'its encryption details did not match');
     return;
   }
-  const name = getLocalDisplayName();
+  // Prove the name in exactly the form the other side will check it in (it cleans what it receives
+  // the same way), so a name with characters that get stripped still verifies.
+  const name = cleanPeerText(getLocalDisplayName()).trim().slice(0, 30);
   const mac = await createProof(keys, {
     roomId: keyRoomId,
     sid,

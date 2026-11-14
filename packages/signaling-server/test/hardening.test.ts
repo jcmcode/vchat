@@ -371,6 +371,52 @@ test('API bodies over the limit are refused without being parsed', async () => {
   assert.equal(res?.status, 401);
 });
 
+test('API bodies are read only up to the limit, even when sent in pieces without a length', async () => {
+  let pulled = 0;
+  const chunk = new TextEncoder().encode('x'.repeat(1024));
+  const body = new ReadableStream<Uint8Array>({
+    pull(controller) {
+      if (++pulled > 1000) controller.close();
+      else controller.enqueue(chunk);
+    },
+  });
+  const req = new Request('https://x.test/api/admin/login', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Origin: 'https://x.test', Host: 'x.test' },
+    body,
+    duplex: 'half',
+  } as RequestInit);
+  const res = await handleApi(req, { SECRET_KEY: SECRET, ADMIN_PASSWORD: 'correct horse battery' }, { clientIp: '203.0.113.78' });
+  assert.equal(res?.status, 401);
+  assert.ok(pulled < 20, `read ${pulled} KB of a 1000 KB body`);
+});
+
+test('remove-peer: an emailed invite is barred even if its holder was offline when removed', async () => {
+  const personal = { role: 'guest' as const, approval: false, email: 'gone@example.com' };
+  const room = new Room<Conn>('rm4', transport);
+  const h = new Conn();
+  await room.enter(h, who('h'), HOST);
+  const g = new Conn();
+  await room.enter(g, who('g'), personal);
+  room.leave(g); // their connection drops
+  room.removePeer(h, 'g');
+  const back = new Conn();
+  await room.enter(back, who('g2', 'fresh'), personal);
+  assert.equal(back.closedWith, CLOSE_REMOVED);
+});
+
+test('peer ids named like object internals are ordinary ids', async () => {
+  const room = new Room<Conn>('rm5', transport);
+  const h = new Conn();
+  await room.enter(h, who('h'), HOST);
+  room.removePeer(h, 'constructor');
+  assert.equal(h.last().message, 'Peer not found');
+  assert.equal(room.meta.removed.length, 0);
+  const g = new Conn();
+  await room.enter(g, who('toString'), GUEST);
+  assert.equal(g.inbox.some((m) => m.type === 'room-peers'), true);
+});
+
 test('deny: a denied guest cannot knock again for 5 minutes', async () => {
   const room = new Room<Conn>('deny', transport);
   const h = new Conn();
@@ -429,7 +475,7 @@ test('meta: reset when the last waiting guest times out (private-mode orphan pat
   assert.ok(Object.keys(room.meta.admitted).length > 0);
   room.expireWaiting(Date.now() + WAITING_TIMEOUT_MS + 1);
   assert.equal(changes.at(-1), null);
-  assert.deepEqual(room.meta.admitted, {});
+  assert.deepEqual(Object.keys(room.meta.admitted), []);
   assert.ok(room.isEmpty());
 
   const room2 = new Room<Conn>('orphan2', transport, { onMetaChange: (m) => changes.push(m) });

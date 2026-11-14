@@ -94,8 +94,6 @@ export interface IceOptions {
   userId?: string;
 }
 
-/** coturn usernames issued to one client stay the same within a window this long (seconds). */
-const TURN_USER_WINDOW = 10 * 60;
 
 /** Credential lifetime in seconds: TURN_TTL_SECONDS (default 4h), capped at the token's expiry. */
 export function turnTtl(env: IceEnv, opts: IceOptions = {}): number {
@@ -129,11 +127,15 @@ export async function getIceServers(env: IceEnv, opts: IceOptions = {}): Promise
   if (turnUrls.length && env.TURN_SECRET) {
     // coturn "TURN REST API" credentials: username = "<expiry>:<id>", password = HMAC(secret, username).
     // The id is per client (random when the caller is unknown), so coturn's per-user quota applies
-    // per client rather than to everyone. For a known client the expiry is rounded down to a
-    // window, so asking again and again yields the same username — and the same quota — instead of
-    // a fresh allowance each time.
+    // per client rather than to everyone. For a known client the username must also stay the same
+    // from one request to the next, or asking again would hand out a fresh allowance each time:
+    //  - capped by the invite: the expiry is the invite's own, which never changes;
+    //  - otherwise it's rounded down to a window of half the lifetime, so a client holds at most
+    //    two or three live usernames however often it asks.
     let expiry = nowSec + ttl;
-    if (opts.userId && ttl >= 2 * TURN_USER_WINDOW) expiry = Math.floor(expiry / TURN_USER_WINDOW) * TURN_USER_WINDOW;
+    const cappedByInvite = opts.expiresAt !== undefined && expiry >= Math.floor(opts.expiresAt);
+    const window = Math.floor(ttl / 2);
+    if (opts.userId && !cappedByInvite && window >= MIN_TURN_TTL) expiry = Math.floor(expiry / window) * window;
     const username = `${expiry}:${opts.userId ?? randomId()}`;
     const credential = await hmacSha1Base64(env.TURN_SECRET, username);
     iceServers.push({ urls: turnUrls, username, credential });

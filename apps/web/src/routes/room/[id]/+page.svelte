@@ -12,7 +12,7 @@
     hostPresent,
     passwordInvalid,
     roomError,
-    forcedOut,
+    onForcedOut,
     submitRoomPassword,
     admissionRequests,
     hostStatus,
@@ -400,7 +400,7 @@
       token,
       relayOnly: hideIp,
     });
-    // Messages restored from this tab's history aren't "unread".
+    // Anything already in the chat at this point isn't "unread".
     lastSeenMessageCount = $chatMessages.length;
     if (chatOnly) showChat = true;
   });
@@ -418,10 +418,11 @@
   // Removed by the host, or replaced by another tab: the call has already been torn down. Release
   // the camera and microphone and forget this call's invite, key and password right away, rather
   // than when "Back to home" is clicked (which may never happen if the tab is just closed).
-  $: if (browser && $forcedOut) {
+  const stopWatchingForcedOut = onForcedOut(() => {
     stopMedia();
     if (roomId) forgetRoom(roomId);
-  }
+  });
+  onDestroy(stopWatchingForcedOut);
 
   function handleLeave() {
     leaveRoom();

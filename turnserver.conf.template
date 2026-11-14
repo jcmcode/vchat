@@ -15,7 +15,9 @@ min-port=61000
 max-port=65535
 
 # Authentication: short-lived credentials minted by the signaling server (GET /api/ice-servers).
-# Usernames are "<expiry>:<random id>", unique per response, so user-quota applies per client.
+# Usernames are "<expiry>:<id>". The id is the same for everyone joining one room from one address
+# (and random where the server can't tell), and stays the same when asked again, so user-quota
+# can't be reset by requesting more credentials.
 realm=DOMAIN_PLACEHOLDER
 use-auth-secret
 static-auth-secret=TURN_SECRET_PLACEHOLDER
@@ -30,7 +32,9 @@ no-rfc5780
 no-stun-backward-compatibility
 # Allocations per credential / in total, bandwidth per session / in total. coturn counts
 # bandwidth in BYTES per second: 500000 is 4 Mbit/s per session, 25000000 is 200 Mbit/s in total.
-user-quota=12
+# A credential is shared by the people in one room behind one address (housemates, an office),
+# and each of them uses up to two allocations per other participant — hence 48, not 12.
+user-quota=48
 total-quota=300
 max-bps=500000
 bps-capacity=25000000

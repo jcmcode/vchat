@@ -15,7 +15,7 @@ import {
   Room,
   WS_PROTOCOL,
   authorizeJoin,
-  authorizeSocket,
+  socketRole,
   handleApi,
   ipKey,
   isValidRoomId,
@@ -76,8 +76,11 @@ const awaitingPong = new WeakSet<WebSocket>();
 const missedPong = new WeakSet<WebSocket>();
 /** Each socket's messages are handled one at a time (joins await hashing; no interleaving). */
 const queues = new WeakMap<WebSocket, Promise<void>>();
-/** Sockets that aren't in a room (never entered, or left) are closed after this long. */
-const IDLE_SOCKET_MS = 5 * 60 * 1000;
+/**
+ * Sockets that aren't in a room (never entered, or left) are closed after this long — the same as
+ * on Cloudflare. Short, so seats held by sockets that never join are freed quickly.
+ */
+const IDLE_SOCKET_MS = 60 * 1000;
 const idleTimers = new WeakMap<WebSocket, ReturnType<typeof setTimeout>>();
 /** Keys client hashes; random per process if there's no SECRET_KEY (open mode). */
 const CLIENT_KEY = env.SECRET_KEY || randomBytes(32).toString('hex');
@@ -87,12 +90,15 @@ function clientIdFor(ip: string): string {
 }
 
 // Open sockets are capped per room (as on Cloudflare), per client address and in total, so one
-// invite holder can't exhaust the server's memory or crowd everyone else out of a room.
+// invite holder can't exhaust the server's memory or crowd everyone else out of a room. A few
+// seats per room are kept for the owner, who must always be able to get into their own room.
 const MAX_SOCKETS_PER_ROOM = 40;
+const HOST_RESERVED_SOCKETS = 4;
 const MAX_SOCKETS_PER_CLIENT = 30;
 const MAX_SOCKETS_TOTAL = 5000;
 const socketsPerRoom = new Map<string, number>();
 const socketsPerClient = new Map<string, number>();
+let socketsTotal = 0;
 
 function bump(map: Map<string, number>, key: string, by: 1 | -1): void {
   const next = (map.get(key) ?? 0) + by;
@@ -160,7 +166,9 @@ async function handleHttp(req: IncomingMessage, res: ServerResponse): Promise<vo
     return;
   }
 
-  const response = await handleApi(await toFetchRequest(req), env, { clientIp: clientIp(req) });
+  // Read the address first: an oversized body ends the request, and its socket with it.
+  const ip = clientIp(req);
+  const response = await handleApi(await toFetchRequest(req), env, { clientIp: ip });
   if (!response) {
     res.writeHead(404, { 'Content-Type': 'text/plain' }).end('Not found');
     return;
@@ -217,17 +225,47 @@ const wss = new WebSocketServer({
     if (!originAllowed(origin, req)) return done(false, 403, 'Origin not allowed');
     const roomId = new URL(req.url ?? '/', 'http://localhost').searchParams.get('room') ?? '';
     if (!isValidRoomId(roomId)) return done(false, 400, 'Invalid room');
+    const clientId = clientIdFor(clientIp(req));
     if (
-      wss.clients.size >= MAX_SOCKETS_TOTAL ||
-      (socketsPerRoom.get(roomId) ?? 0) >= MAX_SOCKETS_PER_ROOM ||
-      (socketsPerClient.get(clientIdFor(clientIp(req))) ?? 0) >= MAX_SOCKETS_PER_CLIENT
+      socketsTotal >= MAX_SOCKETS_TOTAL ||
+      (socketsPerRoom.get(roomId) ?? 0) >= MAX_SOCKETS_PER_ROOM + HOST_RESERVED_SOCKETS ||
+      (socketsPerClient.get(clientId) ?? 0) >= MAX_SOCKETS_PER_CLIENT
     ) {
       return done(false, 503, 'Too many connections');
     }
+    // Take the seat now, before anything asynchronous, so a burst of simultaneous upgrades can't
+    // all pass the check above. It's given back when the underlying connection closes — whether
+    // the upgrade was refused, abandoned, or the WebSocket ended normally.
+    socketsTotal++;
+    bump(socketsPerRoom, roomId, 1);
+    bump(socketsPerClient, clientId, 1);
+    let released = false;
+    const release = () => {
+      if (released) return;
+      released = true;
+      socketsTotal--;
+      bump(socketsPerRoom, roomId, -1);
+      bump(socketsPerClient, clientId, -1);
+    };
+    req.socket.once('close', release);
     // Private mode: no valid invite/host token for this room, no socket.
-    authorizeSocket(env, roomId, req.headers['sec-websocket-protocol'])
-      .then((ok) => (ok ? done(true) : done(false, 401, 'Invite required')))
-      .catch(() => done(false, 500));
+    socketRole(env, roomId, req.headers['sec-websocket-protocol'])
+      .then((role) => {
+        if (!role) {
+          release();
+          return done(false, 401, 'Invite required');
+        }
+        // The last few seats in a room are the owner's.
+        if (role !== 'host' && (socketsPerRoom.get(roomId) ?? 0) > MAX_SOCKETS_PER_ROOM) {
+          release();
+          return done(false, 503, 'Too many connections');
+        }
+        done(true);
+      })
+      .catch(() => {
+        release();
+        done(false, 500);
+      });
   },
 });
 
@@ -329,10 +367,7 @@ wss.on('connection', (ws, req) => {
     ws.close(1008, 'Invalid room');
     return;
   }
-  const clientId = clientIdFor(clientIp(req));
-  sockets.set(ws, { roomId, clientId });
-  bump(socketsPerRoom, roomId, 1);
-  bump(socketsPerClient, clientId, 1);
+  sockets.set(ws, { roomId, clientId: clientIdFor(clientIp(req)) });
 
   // A pong only counts if we actually asked (unsolicited pongs can't keep a socket alive).
   ws.on('pong', () => {
@@ -363,8 +398,6 @@ wss.on('connection', (ws, req) => {
   ws.on('close', () => {
     clearIdle(ws);
     leaveRoom(ws);
-    bump(socketsPerRoom, roomId, -1);
-    bump(socketsPerClient, clientId, -1);
   });
   ws.on('error', () => leaveRoom(ws));
 });

@@ -208,7 +208,7 @@ Close codes (clients must not reconnect automatically after 4000, 4002 or 4003):
 | Code | Meaning |
 |---|---|
 | `4000` | Replaced: the same identity connected again elsewhere |
-| `4001` | Idle: the socket wasn't in a room for too long (5 min on Node, 60s on Cloudflare) |
+| `4001` | Idle: the socket wasn't in a room for too long (60s) |
 | `4002` | Removed by the host |
 | `4003` | The invite is invalid or expired (sent after the `error` message) |
 
