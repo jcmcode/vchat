@@ -4,7 +4,12 @@
 # it cannot decrypt, for the minority of users behind strict NATs/firewalls.
 
 # Network: plain TURN on 3478 (UDP + TCP). TLS on the relay itself is not needed for privacy
-# (media is already encrypted end to end) and is disabled to avoid certificate plumbing.
+# (media is already encrypted end to end) and is disabled to avoid certificate plumbing. For
+# networks that only allow port 443, Caddy offers TURN over TLS there (turns:, when
+# TURN_TLS_DOMAIN is set): it terminates TLS and passes the stream to this TCP listener, on the
+# same address outside clients reach, because coturn relays from the address a client connected
+# to. Those clients appear here with Caddy's address, not their own; nothing below depends on client
+# addresses (quotas are per credential and in total, and peer rules are about relay targets).
 listening-port=3478
 external-ip=EXTERNAL_IP_PLACEHOLDER
 no-tls

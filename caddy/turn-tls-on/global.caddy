@@ -1,0 +1,38 @@
+# Global options for TURN over TLS on port 443. The Caddyfile imports this file only when
+# TURN_TLS_DOMAIN is set (docker-compose.yml then sets TURN_TLS=on).
+#
+# Some networks only let traffic out to port 443, which the website already uses. A browser that
+# connects to turns:<TURN_TLS_DOMAIN>:443 sends that name as the TLS server name (SNI), so the
+# layer4 rule below can take those connections before the HTTPS site sees them. Caddy completes
+# the TLS handshake with its own certificate for the name (see site.caddy) and passes the
+# decrypted TURN stream to coturn's plain TCP listener at TURN_TLS_UPSTREAM, where the usual
+# short-lived credentials, quotas, bandwidth caps and peer rules apply.
+#
+# Every other connection on port 443 goes on to the HTTPS site unchanged, and so do ACME TLS-ALPN
+# challenges for this name (ALPN "acme-tls/1"), so Caddy can always renew the certificate.
+servers :443 {
+	listener_wrappers {
+		layer4 {
+			@turn {
+				tls sni {$TURN_TLS_DOMAIN}
+				not tls {
+					alpn acme-tls/1
+				}
+			}
+			route @turn {
+				tls {
+					connection_policy {
+						# TURN's ALPN id (RFC 7443). Browsers send no ALPN, which works too. Without this,
+						# Caddy would offer only h2 and http/1.1, and a client asking for stun.turn would
+						# fail the handshake.
+						alpn stun.turn
+					}
+					handshake_timeout 10s
+				}
+				proxy {$TURN_TLS_UPSTREAM}
+			}
+		}
+		# TLS for the website is terminated after the layer4 rule has had its look.
+		tls
+	}
+}
