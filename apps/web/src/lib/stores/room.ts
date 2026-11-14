@@ -448,6 +448,10 @@ export function recallRoomPassword(roomId: string): string | undefined {
   return session()?.getItem(`vchat_room_pw_${roomId}`) || undefined;
 }
 
+export function forgetRoomPassword(roomId: string): void {
+  session()?.removeItem(`vchat_room_pw_${roomId}`);
+}
+
 /** Remember (per tab) that we created this room, so a refresh can reopen it if we were alone. */
 export function markRoomCreated(roomId: string): void {
   session()?.setItem(`vchat_created_${roomId}`, '1');
