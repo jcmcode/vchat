@@ -12,6 +12,8 @@ Your own private, end-to-end encrypted video calls. Deploy it on your domain, si
   - **Screen sharing** (with audio), plus a **laser pointer and drawing** over the shared screen that everyone sees
   - A **shared whiteboard** (pen, highlighter, text, eraser) you can export as **PDF** or PNG
   - Group chat, **private direct messages** and **files sent straight to one person** (tap them), and reactions
+  - Clickable links in chat (shown with their real address, never previewed), and **Save chat** to download the conversation as a text file made in your browser
+  - **Installable** as an app from your browser (a web app manifest, with deliberately no service worker)
   - **Calendar and email invites**: download an `.ics` event or draft an email in your own mail app. Nothing is sent by vchat
   - Named rooms (the host can rename during a call), host approval, and automatic reconnection
 
