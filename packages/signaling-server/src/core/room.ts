@@ -351,7 +351,7 @@ export class Room<C> {
     }
 
     const displayName = this.uniqueName(args.displayName, args.peerId);
-    const host = this.currentHost();
+    const host = this.ensureHost();
     // While locked, nobody new is let in directly, even with nobody to approve them.
     if (isReturning || (!host && !this.isLocked())) {
       this.admit(conn, { peerId: args.peerId, displayName, status: 'peer', secretHash });
@@ -436,8 +436,9 @@ export class Room<C> {
       this.error(conn, 'Too many people waiting to join');
       return;
     }
+    const host = this.ensureHost();
     this.setMember(conn, { ...state, status: 'waiting', waitingSince: Date.now() });
-    this.send(conn, { type: 'waiting-for-admission', roomId: this.id, hostPresent: !!this.currentHost() });
+    this.send(conn, { type: 'waiting-for-admission', roomId: this.id, hostPresent: !!host });
     this.notifyHost(admissionRequest(state));
     this.log(`${state.displayName} (${args.peerId}) waiting for admission`);
   }
@@ -673,6 +674,9 @@ export class Room<C> {
       this.setHost(state.peerId);
     } else {
       this.send(conn, { type: 'host-changed', hostPeerId: host ? this.meta.hostPeerId : null });
+      // The host back on a new connection (a blip or refresh) while still holding the role: they
+      // start with an empty list, so hand them everyone who's waiting again.
+      if (host?.[0] === conn) for (const [, w] of this.waiting()) this.send(conn, admissionRequest(w));
     }
     this.log(`${state.displayName} (${state.peerId}) joined`);
   }
@@ -790,14 +794,33 @@ export class Room<C> {
     return name;
   }
 
-  /** Give (or clear) the host role, tell everyone, and hand the new host any pending requests. */
+  /**
+   * Give (or clear) the host role, tell everyone, hand the new host any pending requests, and let
+   * waiting guests know whether someone can now let them in.
+   */
   private setHost(peerId: string | null): void {
     this.meta.hostPeerId = peerId;
     this.metaChanged();
     this.broadcast({ type: 'host-changed', hostPeerId: peerId });
-    for (const [, w] of this.waiting()) {
+    const hostPresent = !!this.currentHost();
+    for (const [wConn, w] of this.waiting()) {
       this.notifyHost(admissionRequest(w));
+      this.send(wConn, { type: 'waiting-for-admission', roomId: this.id, hostPresent });
     }
+  }
+
+  /**
+   * The current host. If the role is unheld (or points at someone no longer here) while the owner is
+   * in the call, it goes back to the owner first: a guest must never be told nobody can let them in
+   * while the owner is sitting right there.
+   */
+  private ensureHost(): [C, MemberState] | undefined {
+    const host = this.currentHost();
+    if (host) return host;
+    const owner = this.peers().find(([, s]) => s.role === 'host');
+    if (!owner) return undefined;
+    this.setHost(owner[1].peerId);
+    return this.currentHost();
   }
 
   /**

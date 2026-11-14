@@ -22,6 +22,17 @@ test('calendar file is valid iCalendar with escaping and folding', () => {
   assert.ok(ics.replace(/\r\n /g, '').includes(invite.link));
 });
 
+test('calendar file puts the password first only when asked, otherwise says it comes separately', () => {
+  const unfold = (ics: string) => ics.replace(/\r\n /g, '');
+  const without = unfold(buildIcs(invite, Date.UTC(2026, 10, 14)));
+  assert.ok(without.includes('sent to you separately'));
+  assert.ok(!without.includes('Password:'));
+
+  const withPw = unfold(buildIcs({ ...invite, password: 'hunter-22' }, Date.UTC(2026, 10, 14)));
+  assert.ok(withPw.includes('DESCRIPTION:Password: hunter-22\\n'));
+  assert.ok(!withPw.includes('sent to you separately'));
+});
+
 test('invite text and email draft include the link (with its key) and mention the password', () => {
   const text = inviteText(invite);
   assert.ok(text.includes(invite.link));

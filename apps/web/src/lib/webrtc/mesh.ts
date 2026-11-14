@@ -726,6 +726,9 @@ export async function joinRoom(opts: JoinOptions): Promise<void> {
     reconnectPrompt.set(false);
     relockOnRejoin = get(roomLocked) && get(hostStatus);
     roomLocked.set(false); // the server follows up with lock-changed if the room is locked
+    // (Re-)entering: anyone still waiting is sent to the host again right after this, so drop
+    // requests from people who gave up while we were away.
+    admissionRequests.set([]);
     roomJoined.set(true);
     const existingPeers = event.peers as { id: string; displayName: string }[];
     // After a reconnect, drop anyone who left while we were away.

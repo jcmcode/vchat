@@ -167,6 +167,48 @@ test('enter: guest waits for an absent host, host arriving gets the request', as
   assert.ok(g.inbox.some((m) => m.type === 'room-peers'));
 });
 
+test('enter: a waiting guest is told when the host arrives and when they leave', async () => {
+  const room = new Room<Conn>('r1b', transport);
+  const g = new Conn();
+  await room.enter(g, who('g'), GUEST_APPROVAL);
+  assert.equal(g.last().hostPresent, false);
+
+  const h = new Conn();
+  await room.enter(h, who('h'), HOST);
+  assert.deepEqual(g.last(), { type: 'waiting-for-admission', roomId: 'r1b', hostPresent: true });
+
+  // Another guest in the call keeps the room open; the host stepping out is reported to the lobby.
+  const o = new Conn();
+  await room.enter(o, who('o'), GUEST_OPEN);
+  room.leave(h);
+  assert.deepEqual(g.last(), { type: 'waiting-for-admission', roomId: 'r1b', hostPresent: false });
+});
+
+test('enter: host back on a new connection while still host gets the waiting list again', async () => {
+  const room = new Room<Conn>('r1c', transport);
+  const h = new Conn();
+  await room.enter(h, who('h'), HOST);
+  const g = new Conn();
+  await room.enter(g, who('g'), GUEST_APPROVAL);
+  // A refresh: the new socket arrives before the old one is seen to close.
+  const h2 = new Conn();
+  await room.enter(h2, who('h'), HOST);
+  assert.equal(room.meta.hostPeerId, 'h');
+  assert.deepEqual(h2.last(), { type: 'admission-request', peerId: 'g', displayName: 'g' });
+});
+
+test('enter: the owner in the call always gets the knock, even if the host role went missing', async () => {
+  const room = new Room<Conn>('r1d', transport);
+  const h = new Conn();
+  await room.enter(h, who('h'), HOST);
+  room.meta.hostPeerId = null; // e.g. metadata restored from an older copy
+  const g = new Conn();
+  await room.enter(g, who('g'), GUEST_APPROVAL);
+  assert.equal(g.last().hostPresent, true);
+  assert.equal(room.meta.hostPeerId, 'h');
+  assert.equal(h.last('admission-request')?.peerId, 'g');
+});
+
 test('enter: guests without approval join directly but never become host', async () => {
   const room = new Room<Conn>('r2', transport);
   const a = new Conn();

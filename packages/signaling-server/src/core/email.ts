@@ -257,6 +257,11 @@ export function icsFold(line: string): string {
   return out.join('\r\n ');
 }
 
+/** "123 456": easier to read off a calendar entry and type in. */
+function spacedCode(code: string): string {
+  return code.length === 6 ? `${code.slice(0, 3)} ${code.slice(3)}` : code;
+}
+
 function icsDate(ms: number): string {
   return new Date(ms).toISOString().replace(/[-:]/g, '').replace(/\.\d{3}/, '');
 }
@@ -283,7 +288,14 @@ export interface CalendarInvite {
 /** A METHOD:REQUEST calendar invite for one attendee: the link, and the passcode if there is one. */
 export function buildInviteIcs(inv: CalendarInvite): string {
   const message = inv.message?.trim();
-  const description = [...(message ? [message, ''] : []), `Join: ${inv.link}`, ...(inv.passcode ? [`Passcode: ${inv.passcode}`] : [])].join('\n');
+  // The code comes first: the link is several hundred characters long, and calendar previews cut
+  // the notes off well before anything that follows it.
+  const description = [
+    ...(inv.passcode ? [`Your code: ${spacedCode(inv.passcode)}`, 'Open the link below at meeting time and enter this code.', ''] : []),
+    ...(message ? [message, ''] : []),
+    `Join: ${inv.link}`,
+  ].join('\n');
+  const reminder = inv.passcode ? `Video call starting. Your code: ${spacedCode(inv.passcode)}` : 'Video call starting';
   const organizerCn = inv.organizer.name ? `;CN=${icsParam(inv.organizer.name)}` : '';
   const lines = [
     'BEGIN:VCALENDAR',
@@ -306,7 +318,7 @@ export function buildInviteIcs(inv: CalendarInvite): string {
     'SEQUENCE:0',
     'BEGIN:VALARM',
     'ACTION:DISPLAY',
-    'DESCRIPTION:Video call starting',
+    `DESCRIPTION:${icsText(reminder)}`,
     'TRIGGER:-PT10M',
     'END:VALARM',
     'END:VEVENT',

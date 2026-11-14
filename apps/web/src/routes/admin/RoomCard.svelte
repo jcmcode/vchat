@@ -197,6 +197,15 @@
             <button class="btn ghost small" on:click={() => downloadIcs(meeting())} title="A calendar event with the link, to attach to an email or add to a calendar">
               <Icon name="calendar" size={15} /> Calendar file
             </button>
+            {#if room.password}
+              <button
+                class="btn ghost small"
+                on:click={() => downloadIcs(meeting(true))}
+                title="The password goes in the event, so it's there at meeting time, but anyone who sees the event can get in"
+              >
+                <Icon name="calendar" size={15} /> Calendar file with the password
+              </button>
+            {/if}
           </div>
           <p class="hint"><Icon name="shield" size={12} /> The link holds this room's end-to-end key. Only give it to people you're inviting.</p>
         </div>
