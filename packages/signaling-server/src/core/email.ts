@@ -164,6 +164,7 @@ export function inviteEmail(to: string, opts: InviteEmailOptions): EmailMessage 
     ? 'Open the link, enter the code, and the host will let you in.'
     : 'Open the link, enter your name, and the host will let you in.';
   const attached = opts.ics ? 'A calendar invite is attached.' : null;
+  const otherBrowser = 'Want to join from a different browser? Copy the link from this email, not the address bar after it opens.';
   const message = opts.message?.trim() || null;
   const text = [
     `You're invited to ${what}.`,
@@ -174,6 +175,7 @@ export function inviteEmail(to: string, opts: InviteEmailOptions): EmailMessage 
     '',
     ...(opts.code ? [`Your code: ${opts.code}`, ''] : []),
     instructions,
+    otherBrowser,
     '',
     ...(attached ? [attached, ''] : []),
     `This invite expires ${expires}.`,
@@ -189,6 +191,7 @@ export function inviteEmail(to: string, opts: InviteEmailOptions): EmailMessage 
       `<p><a href="${escapeHtml(opts.link)}" style="display:inline-block;background:#111;color:#fff;text-decoration:none;padding:12px 20px;border-radius:8px;font-weight:600">Join the call</a></p>` +
       (opts.code ? `<p>Your code:</p>${codeBlock(opts.code)}` : '') +
       `<p>${escapeHtml(instructions)}</p>` +
+      `<p style="color:#666;font-size:14px">${escapeHtml(otherBrowser)}</p>` +
       (attached ? `<p>${escapeHtml(attached)}</p>` : '') +
       `<p style="color:#666">This invite expires ${escapeHtml(expires)}.</p>`
   );

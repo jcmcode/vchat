@@ -30,3 +30,12 @@ test('invite text and email draft include the link (with its key) and mention th
   assert.ok(mail.startsWith('mailto:?subject='));
   assert.ok(decodeURIComponent(mail).includes(invite.link));
 });
+
+test('inviteText puts the password in only when asked, otherwise says it comes separately', () => {
+  const base = { title: 'Call', link: 'https://x.example/room/abc#invite=t', hasPassword: true };
+  assert.match(inviteText(base), /send you the room password separately/);
+  assert.doesNotMatch(inviteText(base), /Password:/);
+  const withPw = inviteText({ ...base, password: 'hunter-22' });
+  assert.match(withPw, /Password: hunter-22/);
+  assert.doesNotMatch(withPw, /separately/);
+});

@@ -297,7 +297,29 @@ export interface SavedRoom {
   expiresAt: number;
   approval: boolean;
   hasPassword: boolean;
+  /**
+   * The room password, so the owner can pass it on later. Kept only in the owner's browser, next to
+   * the host link (which already lets anyone in), and cleared on sign-out like everything here.
+   */
+  password?: string;
+  /** Personal invites emailed for this room: who, their code, and their own link's token. */
+  invites?: PersonalInvite[];
   createdAt: number;
+}
+
+export interface PersonalInvite {
+  email: string;
+  /** Their 6-digit code (absent when sent without one: the host admits them from the lobby). */
+  code?: string;
+  token: string;
+  sentAt: number;
+}
+
+/** Add newly sent personal invites to a room (a newer invite to the same address replaces the older). */
+export function withInvites(room: SavedRoom, sent: PersonalInvite[]): SavedRoom {
+  const fresh = new Set(sent.map((i) => i.email));
+  const kept = (room.invites ?? []).filter((i) => !fresh.has(i.email));
+  return { ...room, invites: [...sent, ...kept].slice(0, 100) };
 }
 
 export function getSavedRooms(): SavedRoom[] {

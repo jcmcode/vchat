@@ -9,6 +9,8 @@ export interface MeetingInvite {
   durationMinutes?: number;
   /** Room has a password (sent separately). */
   hasPassword?: boolean;
+  /** Put the password itself in the message (the owner chose convenience over sending it apart). */
+  password?: string;
 }
 
 /** RFC 5545 text escaping. */
@@ -106,7 +108,11 @@ export function inviteText(invite: MeetingInvite): string {
     '',
     formatWhen(invite) + `Join: ${invite.link}`,
     '',
-    invite.hasPassword ? "I'll send you the room password separately.\n" : '',
+    invite.password
+      ? `Password: ${invite.password}\n`
+      : invite.hasPassword
+        ? "I'll send you the room password separately.\n"
+        : '',
     'It runs in your browser — no account or app needed — and the call is end-to-end encrypted.',
   ]
     .filter((l, i, arr) => !(l === '' && arr[i - 1] === ''))
