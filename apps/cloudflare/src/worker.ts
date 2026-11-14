@@ -32,7 +32,8 @@ function isAuthorized(request: Request, env: Env): boolean {
   if (scheme !== 'Basic' || !encoded) return false;
   let decoded: string;
   try {
-    decoded = atob(encoded);
+    // Browsers send UTF-8 credentials (we advertise charset="UTF-8"); atob alone yields Latin-1.
+    decoded = new TextDecoder().decode(Uint8Array.from(atob(encoded), (c) => c.charCodeAt(0)));
   } catch {
     return false;
   }
@@ -41,13 +42,17 @@ function isAuthorized(request: Request, env: Env): boolean {
   return timingSafeEqual(password, env.SITE_PASSWORD);
 }
 
-function originAllowed(request: Request, env: Env): boolean {
-  const origin = request.headers.get('Origin');
-  if (!origin) return false;
-  const allowed = (env.ALLOWED_ORIGIN ?? '')
+function allowedOrigins(env: Env): string[] {
+  return (env.ALLOWED_ORIGIN ?? '')
     .split(',')
     .map((s) => s.trim())
     .filter(Boolean);
+}
+
+function originAllowed(request: Request, env: Env): boolean {
+  const origin = request.headers.get('Origin');
+  if (!origin) return false;
+  const allowed = allowedOrigins(env);
   if (allowed.length > 0) return allowed.includes(origin);
   try {
     return new URL(origin).host === new URL(request.url).host;
@@ -90,12 +95,18 @@ export default {
     }
 
     if (url.pathname === '/api/ice-servers') {
+      // Cross-origin clients (e.g. the desktop app) are allowed only if listed in ALLOWED_ORIGIN.
+      const origin = request.headers.get('Origin');
+      const cors: Record<string, string> =
+        origin && allowedOrigins(env).includes(origin)
+          ? { 'Access-Control-Allow-Origin': origin, Vary: 'Origin' }
+          : {};
       try {
         const body = await getIceServers(env);
-        return Response.json(body, { headers: { 'Cache-Control': 'no-store' } });
+        return Response.json(body, { headers: { 'Cache-Control': 'no-store', ...cors } });
       } catch (err) {
         console.error('Failed to build ICE servers:', err);
-        return Response.json({ error: 'TURN unavailable' }, { status: 502 });
+        return Response.json({ error: 'TURN unavailable' }, { status: 502, headers: cors });
       }
     }
 

@@ -50,7 +50,8 @@
     rememberRoomPassword,
     recallRoomPassword,
     peerId,
-    peerSecret,
+    getPeerSecret,
+    ensureUniqueTabIdentity,
   } from '$lib/stores/room';
   import VideoTile from './VideoTile.svelte';
   import ChatPanel from './ChatPanel.svelte';
@@ -115,6 +116,9 @@
     return 3;
   }
 
+  // onMount is async: the user can leave (or the page can unmount) while we await a prompt.
+  let destroyed = false;
+
   onMount(async () => {
     if (!browser) return;
 
@@ -132,8 +136,14 @@
     if (password) rememberRoomPassword(roomId, password);
     const voiceOnly = $page.url.searchParams.get('voiceOnly') === '1';
 
+    if (destroyed) return;
+
     try {
       await startMedia({ voiceOnly });
+      if (destroyed) {
+        stopMedia(); // left during the camera prompt — release the camera again
+        return;
+      }
       mediaReady = true;
     } catch (err) {
       console.error('Failed to get media:', err);
@@ -151,14 +161,19 @@
       mediaReady = true;
     }
 
+    if (destroyed) return;
+
     // Drop one-time flags from the address bar so a shared or refreshed URL is just the room.
     replaceState(`/room/${roomId}`, {});
+
+    await ensureUniqueTabIdentity();
+    if (destroyed) return;
 
     await joinRoom({
       serverUrl: signalUrlForRoom(roomId),
       roomId,
       peerId: $peerId,
-      secret: peerSecret,
+      secret: getPeerSecret(),
       displayName,
       isCreator,
       password,
@@ -166,6 +181,7 @@
   });
 
   onDestroy(() => {
+    destroyed = true;
     if (browser) {
       leaveRoom();
       stopMedia();

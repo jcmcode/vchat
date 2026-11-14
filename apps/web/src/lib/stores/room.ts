@@ -1,4 +1,4 @@
-import { writable } from 'svelte/store';
+import { get, writable } from 'svelte/store';
 import { nanoid } from 'nanoid';
 
 const SIGNAL_URL_KEY = 'vchat_signal_url';
@@ -38,7 +38,49 @@ function sessionValue(key: string, make: () => string): string {
 }
 
 export const peerId = writable<string>(sessionValue(PEER_ID_KEY, () => nanoid(12)));
-export const peerSecret = sessionValue(PEER_SECRET_KEY, () => nanoid(32));
+let peerSecret = sessionValue(PEER_SECRET_KEY, () => nanoid(32));
+
+export function getPeerSecret(): string {
+  return peerSecret;
+}
+
+// "Duplicate tab" copies sessionStorage, which would give two tabs the same identity and make
+// them kick each other off the server. Tabs answer when asked whether they own an id.
+const identityChannel =
+  typeof window !== 'undefined' && typeof BroadcastChannel !== 'undefined'
+    ? new BroadcastChannel('vchat_identity')
+    : null;
+identityChannel?.addEventListener('message', (e: MessageEvent) => {
+  if (e.data?.type === 'query' && e.data.peerId === get(peerId)) {
+    identityChannel.postMessage({ type: 'taken', peerId: e.data.peerId });
+  }
+});
+
+/** Make sure no other open tab is using this tab's peer id; pick a new one if so. */
+export async function ensureUniqueTabIdentity(): Promise<void> {
+  if (!identityChannel) return;
+  const id = get(peerId);
+  const taken = await new Promise<boolean>((resolve) => {
+    const onMessage = (e: MessageEvent) => {
+      if (e.data?.type === 'taken' && e.data.peerId === id) finish(true);
+    };
+    const finish = (result: boolean) => {
+      identityChannel.removeEventListener('message', onMessage);
+      clearTimeout(timer);
+      resolve(result);
+    };
+    const timer = setTimeout(() => finish(false), 250);
+    identityChannel.addEventListener('message', onMessage);
+    identityChannel.postMessage({ type: 'query', peerId: id });
+  });
+  if (!taken) return;
+  const store = session();
+  const newId = nanoid(12);
+  peerSecret = nanoid(32);
+  store?.setItem(PEER_ID_KEY, newId);
+  store?.setItem(PEER_SECRET_KEY, peerSecret);
+  peerId.set(newId);
+}
 
 // ── Signaling / API endpoints ───────────────────────────────────────────────
 
@@ -49,15 +91,33 @@ function defaultSignalBase(): string {
   return `${protocol}//${window.location.host}/ws`;
 }
 
-export function getSignalServerUrl(): string {
-  return local()?.getItem(SIGNAL_URL_KEY) || defaultSignalBase();
+export function isValidSignalUrl(value: string): boolean {
+  try {
+    const url = new URL(value);
+    return url.protocol === 'ws:' || url.protocol === 'wss:';
+  } catch {
+    return false;
+  }
 }
 
-/** Only persist a custom server; clearing the field (or entering the default) resets it. */
-export function setSignalServerUrl(url: string): void {
+export function getSignalServerUrl(): string {
+  const saved = local()?.getItem(SIGNAL_URL_KEY);
+  return saved && isValidSignalUrl(saved) ? saved : defaultSignalBase();
+}
+
+/**
+ * Only persist a custom server; clearing the field (or entering the default) resets it.
+ * Returns false (and saves nothing) if the URL isn't a ws:// or wss:// URL.
+ */
+export function setSignalServerUrl(url: string): boolean {
   const trimmed = url.trim();
-  if (!trimmed || trimmed === defaultSignalBase()) local()?.removeItem(SIGNAL_URL_KEY);
-  else local()?.setItem(SIGNAL_URL_KEY, trimmed);
+  if (!trimmed || trimmed === defaultSignalBase()) {
+    local()?.removeItem(SIGNAL_URL_KEY);
+    return true;
+  }
+  if (!isValidSignalUrl(trimmed)) return false;
+  local()?.setItem(SIGNAL_URL_KEY, trimmed);
+  return true;
 }
 
 export function signalUrlForRoom(roomId: string): string {
@@ -122,10 +182,7 @@ export async function fetchIceServers(): Promise<RTCIceServer[]> {
   try {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), 4000);
-    const res = await fetch(`${apiBase()}/api/ice-servers`, {
-      signal: controller.signal,
-      credentials: 'same-origin',
-    });
+    const res = await fetch(`${apiBase()}/api/ice-servers`, { signal: controller.signal });
     clearTimeout(timer);
     if (res.ok) {
       const body = (await res.json()) as { iceServers?: RTCIceServer[] };

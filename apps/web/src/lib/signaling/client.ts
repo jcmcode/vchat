@@ -13,7 +13,8 @@ export type SignalingEventType =
   | 'admission-cancelled'
   | 'admission-granted'
   | 'admission-denied'
-  | 'host-changed';
+  | 'host-changed'
+  | 'replaced';
 
 export interface SignalingEvent {
   type: SignalingEventType | string;
@@ -34,6 +35,8 @@ interface RoomIntent {
 }
 
 const PING_INTERVAL_MS = 25_000;
+/** Close code the server uses when a newer connection with the same peer id takes over. */
+const REPLACED_CLOSE_CODE = 4000;
 const PONG_TIMEOUT_MS = 10_000;
 
 export class SignalingClient {
@@ -89,11 +92,17 @@ export class SignalingClient {
       this.emit(msg);
     };
 
-    ws.onclose = () => {
+    ws.onclose = (event) => {
       if (this.ws !== ws) return;
       this.stopKeepalive();
       this.ws = null;
       this.emit({ type: 'disconnected' });
+      if (event.code === REPLACED_CLOSE_CODE) {
+        // The same identity connected from somewhere else; reconnecting would just kick it off.
+        this.shouldReconnect = false;
+        this.emit({ type: 'replaced' });
+        return;
+      }
       this.scheduleReconnect();
     };
 

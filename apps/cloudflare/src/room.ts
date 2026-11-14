@@ -37,6 +37,8 @@ const transport: Transport<WebSocket> = {
 export class SignalingRoom extends DurableObject<Env> {
   private room: Room<WebSocket> | null = null;
   private readonly limiter = new RateLimiter<WebSocket>();
+  /** Last alarm time we set (null = none); undefined = unknown, e.g. after waking from hibernation. */
+  private scheduledDeadline: number | null | undefined = undefined;
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
@@ -144,18 +146,18 @@ export class SignalingRoom extends DurableObject<Env> {
   }
 
   async alarm(): Promise<void> {
+    this.scheduledDeadline = null; // a fired alarm is cleared automatically
     this.room?.expireWaiting();
     await this.scheduleExpiry();
   }
 
+  /** Keep one alarm at the earliest waiting-room deadline. Cheap no-op when nothing changed. */
   private async scheduleExpiry(): Promise<void> {
     const deadline = this.room?.nextWaitingDeadline() ?? null;
-    if (deadline === null) {
-      await this.ctx.storage.deleteAlarm();
-      return;
-    }
-    const current = await this.ctx.storage.getAlarm();
-    if (current === null || current > deadline) await this.ctx.storage.setAlarm(deadline);
+    if (deadline === this.scheduledDeadline) return;
+    if (deadline === null) await this.ctx.storage.deleteAlarm();
+    else await this.ctx.storage.setAlarm(deadline);
+    this.scheduledDeadline = deadline;
   }
 
   private sendError(ws: WebSocket, message: string): void {

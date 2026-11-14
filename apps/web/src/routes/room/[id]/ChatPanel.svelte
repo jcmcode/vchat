@@ -84,11 +84,9 @@
       alert('File too large. Maximum size is 50MB.');
       return;
     }
-    if ($peers.size === 0) {
-      alert('Nobody else is in the call yet.');
-      return;
+    if (!sendFileToRoom(file)) {
+      alert('Nobody is connected to receive the file yet.');
     }
-    sendFileToRoom(file);
   }
 
   function downloadFile(blob: Blob, fileName: string) {

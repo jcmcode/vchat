@@ -34,6 +34,8 @@ const transport: Transport<WebSocket> = {
 
 const rooms = new Map<string, Room<WebSocket>>();
 const connRoom = new Map<WebSocket, string>();
+/** create/join calls still awaiting their password hash, per room — such rooms must not be reaped. */
+const pendingEnters = new Map<string, number>();
 const limiter = new RateLimiter<WebSocket>();
 const alive = new WeakMap<WebSocket, boolean>();
 
@@ -43,8 +45,23 @@ function originAllowed(origin: string | undefined): boolean {
 
 // ── HTTP ──────────────────────────────────────────────────────────────────
 
+/** Lets clients on another origin (desktop app, custom server setting) read /api responses. */
+function setCors(req: IncomingMessage, res: ServerResponse): void {
+  const origin = req.headers.origin;
+  if (origin && originAllowed(origin)) {
+    res.setHeader('Access-Control-Allow-Origin', origin);
+    res.setHeader('Vary', 'Origin');
+  }
+}
+
 async function handleHttp(req: IncomingMessage, res: ServerResponse): Promise<void> {
   const url = new URL(req.url ?? '/', 'http://localhost');
+  setCors(req, res);
+
+  if (req.method === 'OPTIONS') {
+    res.writeHead(204, { 'Access-Control-Allow-Methods': 'GET', 'Access-Control-Max-Age': '86400' }).end();
+    return;
+  }
 
   if (req.method === 'GET' && url.pathname === '/healthz') {
     res.writeHead(200, { 'Content-Type': 'text/plain' }).end('ok');
@@ -93,14 +110,18 @@ function getOrCreateRoom(roomId: string): Room<WebSocket> {
   return room;
 }
 
+/** Forget a room once nobody is in it and no create/join for it is still in flight. */
+function reapIfEmpty(roomId: string): void {
+  const room = rooms.get(roomId);
+  if (room && room.isEmpty() && !pendingEnters.get(roomId)) rooms.delete(roomId);
+}
+
 function leaveCurrentRoom(ws: WebSocket): void {
   const roomId = connRoom.get(ws);
   if (!roomId) return;
   connRoom.delete(ws);
-  const room = rooms.get(roomId);
-  if (!room) return;
-  room.leave(ws);
-  if (room.isEmpty()) rooms.delete(roomId);
+  rooms.get(roomId)?.leave(ws);
+  reapIfEmpty(roomId);
 }
 
 function sendError(ws: WebSocket, message: string): void {
@@ -117,12 +138,19 @@ async function handleMessage(ws: WebSocket, msg: ClientMessage): Promise<void> {
       if (connRoom.get(ws) !== msg.roomId) leaveCurrentRoom(ws);
       const room = getOrCreateRoom(msg.roomId);
       connRoom.set(ws, msg.roomId);
-      if (msg.type === 'create-room') await room.create(ws, msg);
-      else await room.join(ws, msg);
+      pendingEnters.set(msg.roomId, (pendingEnters.get(msg.roomId) ?? 0) + 1);
+      try {
+        if (msg.type === 'create-room') await room.create(ws, msg);
+        else await room.join(ws, msg);
+      } finally {
+        const left = (pendingEnters.get(msg.roomId) ?? 1) - 1;
+        if (left > 0) pendingEnters.set(msg.roomId, left);
+        else pendingEnters.delete(msg.roomId);
+      }
       // The socket may have closed while we were hashing, or been rejected.
       if (ws.readyState !== ws.OPEN) room.leave(ws);
       if (!room.has(ws) && connRoom.get(ws) === msg.roomId) connRoom.delete(ws);
-      if (room.isEmpty() && rooms.get(msg.roomId) === room) rooms.delete(msg.roomId);
+      reapIfEmpty(msg.roomId);
       return;
     }
     case 'leave':
@@ -177,7 +205,7 @@ const housekeeping = setInterval(() => {
   let peers = 0;
   for (const [id, room] of rooms) {
     room.expireWaiting();
-    if (room.isEmpty()) rooms.delete(id);
+    reapIfEmpty(id);
     peers += room.peers().length;
   }
   if (++ticks % 12 === 0 && rooms.size > 0) {

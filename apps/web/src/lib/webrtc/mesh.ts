@@ -90,6 +90,8 @@ const speakingDetectorCleanups = new Map<string, () => void>();
 /** Display names as reported by the signaling server (trusted over names sent peer-to-peer). */
 const knownNames = new Map<string, string>();
 let localSpeakingCleanup: (() => void) | null = null;
+/** Bumped by every join/leave so an in-flight joinRoom can tell it has been superseded. */
+let joinGeneration = 0;
 
 function newSid(): string {
   return Math.random().toString(36).slice(2, 10) + Date.now().toString(36);
@@ -157,6 +159,7 @@ export interface JoinOptions {
 
 export async function joinRoom(opts: JoinOptions): Promise<void> {
   const { serverUrl, roomId, peerId, secret, displayName, isCreator = false, password } = opts;
+  const generation = ++joinGeneration;
   localPeerId = peerId;
   localDisplayName = displayName;
   currentRoomId = roomId;
@@ -172,6 +175,9 @@ export async function joinRoom(opts: JoinOptions): Promise<void> {
   loadChatHistory(roomId);
   initFileTransfer(sendDataToPeer, broadcastToAllPeers);
 
+  iceServers = await fetchIceServers();
+  if (generation !== joinGeneration) return; // left (or re-joined) while we were fetching
+
   // Attach speaking detector to local stream
   const stream = get(localStream);
   if (stream && stream.getAudioTracks().length > 0) {
@@ -185,9 +191,6 @@ export async function joinRoom(opts: JoinOptions): Promise<void> {
     });
   }
 
-  iceServers = await fetchIceServers();
-  if (currentRoomId !== roomId) return; // left while we were fetching
-
   const client = new SignalingClient(serverUrl);
   signalingClient = client;
   const on = (type: string, handler: Parameters<SignalingClient['on']>[1]) =>
@@ -195,6 +198,9 @@ export async function joinRoom(opts: JoinOptions): Promise<void> {
 
   on('connected', () => connectionState.set('connected'));
   on('disconnected', () => connectionState.set('disconnected'));
+  on('replaced', () => {
+    roomError.set('You joined this call from another tab or window, so this one was disconnected.');
+  });
 
   on('room-peers', (event) => {
     admissionState.set('none');
@@ -274,6 +280,7 @@ export function submitRoomPassword(password: string): void {
 }
 
 export function leaveRoom(): void {
+  joinGeneration++;
   for (const cleanup of speakingDetectorCleanups.values()) cleanup();
   speakingDetectorCleanups.clear();
   if (localSpeakingCleanup) {
@@ -382,8 +389,10 @@ export function sendReaction(emoji: string): void {
 }
 
 export function sendFileToRoom(file: File): string | null {
-  const peerMap = get(peers);
-  const peerIds = Array.from(peerMap.keys());
+  // Only peers whose data channel is open will receive the file; waiting on others would stall it.
+  const peerIds = Array.from(get(peers).values())
+    .filter((pc) => pc.connected)
+    .map((pc) => pc.id);
   return ftSendFile(file, peerIds, localPeerId, localDisplayName);
 }
 

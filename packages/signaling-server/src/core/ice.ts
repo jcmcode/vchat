@@ -69,11 +69,14 @@ async function cloudflareTurn(env: IceEnv, ttl: number): Promise<IceServer[]> {
   if (!res.ok) throw new Error(`Cloudflare TURN API returned ${res.status}`);
   const body = (await res.json()) as { iceServers?: IceServer[] };
   const servers = body.iceServers ?? [];
-  // Browsers block port 53; drop those URLs so ICE doesn't waste time on them.
-  return servers.map((s) => ({
-    ...s,
-    urls: (Array.isArray(s.urls) ? s.urls : [s.urls]).filter((u) => !/:53(\?|$)/.test(u)),
-  }));
+  // Browsers block port 53; drop those URLs so ICE doesn't waste time on them. An entry left with
+  // no URLs must be removed entirely — RTCPeerConnection rejects an empty `urls` list.
+  return servers
+    .map((s) => ({
+      ...s,
+      urls: (Array.isArray(s.urls) ? s.urls : [s.urls]).filter((u) => !/:53(\?|$)/.test(u)),
+    }))
+    .filter((s) => s.urls.length > 0);
 }
 
 export async function getIceServers(env: IceEnv): Promise<IceResponse> {

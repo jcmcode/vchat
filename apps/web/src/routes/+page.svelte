@@ -21,6 +21,7 @@
   let turnUrl = '';
   let turnUsername = '';
   let turnCredential = '';
+  let signalingUrlInvalid = false;
 
   // Load saved TURN config
   const savedTurn = getTurnConfig();
@@ -31,7 +32,7 @@
   }
 
   function saveSettings() {
-    setSignalServerUrl(signalingUrl);
+    signalingUrlInvalid = !setSignalServerUrl(signalingUrl);
     setTurnConfig(turnUrl, turnUsername, turnCredential);
   }
 
@@ -142,6 +143,9 @@
             on:change={saveSettings}
             placeholder={defaultSignalingUrl}
           />
+          {#if signalingUrlInvalid}
+            <span class="field-error">Must be a ws:// or wss:// URL — not saved.</span>
+          {/if}
         </label>
         <label>
           <span>TURN Server URL (optional override)</span>
@@ -176,6 +180,11 @@
 </div>
 
 <style>
+  .field-error {
+    color: var(--danger);
+    font-size: 0.8rem;
+  }
+
   .landing {
     height: 100vh;
     display: flex;

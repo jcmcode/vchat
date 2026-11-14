@@ -34,7 +34,8 @@ function client(name) {
 
 const ok = (label) => console.log(`  ✔ ${label}`);
 
-const ice = await fetch(`${base}/api/ice-servers`).then((r) => r.json());
+const iceRes = await fetch(`${base}/api/ice-servers`, { headers: { Origin: origin } });
+const ice = await iceRes.json();
 if (!Array.isArray(ice.iceServers) || ice.iceServers.length === 0) throw new Error('no ICE servers');
 ok(`GET /api/ice-servers -> ${JSON.stringify(ice.iceServers[0].urls)}`);
 
@@ -72,13 +73,16 @@ if (sig.fromPeerId !== 'guestpeer' || sig.signal.sid !== 's1') throw new Error('
 ok('signal relayed');
 
 // Simulate a network blip: guest reconnects with the same secret and skips the waiting room.
+const guestClosed = new Promise((res) => guest.ws.on('close', (code) => res(code)));
 const guest2 = client('guest2');
 await guest2.opened;
 guest2.send({ type: 'join', roomId: room, peerId: 'guestpeer', displayName: 'Guest', secret: 'gs' });
 await guest2.wait('room-peers');
 await host.wait('peer-left');
 await host.wait('peer-joined');
-ok('reconnect with secret skipped admission and replaced old socket');
+const code = await guestClosed;
+if (code !== 4000) throw new Error(`old socket closed with ${code}, expected 4000`);
+ok('reconnect with secret skipped admission and replaced old socket (close 4000)');
 
 guest2.ws.close();
 await host.wait('peer-left');
