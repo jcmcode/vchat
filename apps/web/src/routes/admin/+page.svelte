@@ -29,6 +29,8 @@
   let loginPassword = '';
   let loginError = '';
   let loggingIn = false;
+  let logoutError = '';
+  let loggingOut = false;
 
   // Email sign-in: ask for a code, then enter it.
   let loginEmail = '';
@@ -109,6 +111,8 @@
       } else {
         loginError = (await res.json().catch(() => ({}))).error ?? 'Sign in failed';
       }
+    } catch {
+      loginError = 'Could not reach the server.';
     } finally {
       loggingIn = false;
     }
@@ -193,6 +197,9 @@
   }
 
   async function logout() {
+    if (loggingOut) return;
+    logoutError = '';
+    loggingOut = true;
     // Saved rooms hold host links and room keys: don't leave them in this browser.
     clearSavedRooms();
     rooms = [];
@@ -201,8 +208,15 @@
       window.location.href = '/cdn-cgi/access/logout';
       return;
     }
-    await fetch(apiUrl('/api/admin/logout'), { method: 'POST', credentials: 'same-origin' });
-    authenticated = false;
+    try {
+      const res = await fetch(apiUrl('/api/admin/logout'), { method: 'POST', credentials: 'same-origin' });
+      if (res.ok || res.status === 401) authenticated = false;
+      else logoutError = 'Sign-out failed. Try again.';
+    } catch {
+      logoutError = 'Could not reach the server to sign out. Try again.';
+    } finally {
+      loggingOut = false;
+    }
   }
 
   function generatePassword() {
@@ -258,6 +272,8 @@
       usePassword = false;
       showOptions = false;
       when = { ...when, startsAt: null };
+    } catch {
+      createError = 'Could not finish creating the room. Check your connection and try again.';
     } finally {
       creating = false;
     }
@@ -316,10 +332,11 @@
       {#if authenticated}
         <div class="who">
           {#if email}<span class="muted email">{email}</span>{/if}
-          <button class="btn ghost small" on:click={logout}><Icon name="log-out" size={16} /> Sign out</button>
+          <button class="btn ghost small" disabled={loggingOut} on:click={logout}><Icon name="log-out" size={16} /> Sign out</button>
         </div>
       {/if}
     </header>
+    {#if logoutError}<p class="error" role="alert">{logoutError}</p>{/if}
 
     {#if loading}
       <section class="panel"><p class="muted" aria-live="polite">Loading…</p></section>

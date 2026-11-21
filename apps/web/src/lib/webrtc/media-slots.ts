@@ -1,13 +1,6 @@
-// Which transceiver carries what on a peer connection: microphone, camera, shared screen.
-//
-// Every connection has the same layout, made by the side that sends the offer (createPeerConnection
-// in mesh.ts): one audio transceiver (the microphone, mixed with shared-screen audio while
-// presenting), then two video transceivers, the first for the camera and the second for a shared
-// screen. All three can send and receive from the start, so turning the camera off or on and
-// starting or stopping a share only changes the track a sender carries (replaceTrack, behind the
-// trust gate) and never needs a renegotiation. That also means someone who joined audio-only, or
-// with the camera off, can share a screen.
-//
+// The offerer reserves microphone, camera, shared video and shared audio transceivers.
+// Sharing or changing devices therefore needs only replaceTrack, behind the trust gate.
+// Older offers have only the first three slots.
 // Both sides list transceivers in m-section order: the offerer creates them in that order, and the
 // answerer gets them from the offer (the offer adopts, in order, the ones it added with addTrack
 // beforehand: its microphone and camera). So the first video transceiver is the camera on both
@@ -32,6 +25,7 @@ export interface Slots<T> {
   audio?: T;
   camera?: T;
   screen?: T;
+  screenAudio?: T;
 }
 
 function isLive(t: TransceiverLike): boolean {
@@ -45,7 +39,8 @@ function ofKind<T extends TransceiverLike>(ts: readonly T[], kind: 'audio' | 'vi
 /** The transceivers we send our microphone, camera and screen on. */
 export function localSlots<T extends TransceiverLike>(ts: readonly T[]): Slots<T> {
   const videos = ofKind(ts, 'video');
-  return { audio: ofKind(ts, 'audio')[0], camera: videos[0], screen: videos[1] };
+  const [audio, screenAudio] = ofKind(ts, 'audio');
+  return { audio, camera: videos[0], screen: videos[1], screenAudio };
 }
 
 /** A mid as browsers write them ("0", "1", …; older Firefox "sdparta_0"). Anything else is refused. */
@@ -61,17 +56,18 @@ export function isValidMid(value: unknown): value is string {
 export function remoteSlots<T extends TransceiverLike>(ts: readonly T[], screenMid: string | null): Slots<T> {
   const videos = ofKind(ts, 'video');
   const screen = isValidMid(screenMid) ? videos.find((t) => t.mid === screenMid) : undefined;
-  return { audio: ofKind(ts, 'audio')[0], camera: videos.find((t) => t !== screen), screen };
+  const [audio, screenAudio] = ofKind(ts, 'audio');
+  return { audio, camera: videos.find((t) => t !== screen), screen, screenAudio: screen ? screenAudio : undefined };
 }
 
 /**
- * Answerer: transceivers created from the remote offer start out receive-only. Let our three slots
+ * Answerer: transceivers created from the remote offer start out receive-only. Let our media slots
  * send too (they still carry nothing until the connection is verified). Returns the ones changed.
  */
 export function enableSending<T extends TransceiverLike>(ts: readonly T[]): T[] {
   const slots = localSlots(ts);
   const changed: T[] = [];
-  for (const t of [slots.audio, slots.camera, slots.screen]) {
+  for (const t of [slots.audio, slots.camera, slots.screen, slots.screenAudio]) {
     if (t && (t.direction === 'recvonly' || t.direction === 'inactive')) {
       t.direction = 'sendrecv';
       changed.push(t);
@@ -96,7 +92,7 @@ const canSend = (d: Direction | null | undefined) => d === 'sendrecv' || d === '
 /** Whether one of our slots wants to send but the last negotiation didn't allow it (needs another round). */
 export function sendingBlocked(ts: readonly TransceiverLike[]): boolean {
   const slots = localSlots(ts);
-  return [slots.audio, slots.camera, slots.screen].some(
+  return [slots.audio, slots.camera, slots.screen, slots.screenAudio].some(
     (t) => !!t && canSend(t.direction) && !!t.currentDirection && !canSend(t.currentDirection)
   );
 }

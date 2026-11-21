@@ -93,7 +93,7 @@
     apiUrl,
   } from '$lib/stores/room';
   import { whiteboardOpen, whiteboardNotice, boardKind, openWhiteboard, closeWhiteboard, type BoardKind } from '$lib/collab/whiteboard';
-  import { clearScreen, annotationTool } from '$lib/collab/annotations';
+  import { clearScreen, annotationTool, annotationToolsVisible } from '$lib/collab/annotations';
   import { gamesOpen, gameNotice, openGames, closeGames } from '$lib/games/games';
   import { GAME_NAMES } from '$lib/games/session-model';
   import { roomName, initRoomName, renameRoom, MAX_ROOM_NAME } from '$lib/collab/room-meta';
@@ -369,13 +369,16 @@
     pinned: $pinnedPeerId,
   });
   $: stage = layout.stage;
+  let theatreMode = false;
+  $: screenOnStage = stage === 'local-screen' || stage === 'remote-screen';
+  $: if (!screenOnStage) theatreMode = false;
   $: stagePeer = layout.stagePeerId ? $peers.get(layout.stagePeerId) ?? null : null;
   $: otherSharerPeer = layout.otherSharer ? $peers.get(layout.otherSharer) ?? null : null;
   // A presenter keeps their tile (camera and sound); the stage shows only their screen. A pinned
   // person's tile moves to the stage (one tile per person: it plays their sound).
   $: stripPeers = stage === 'pinned' && stagePeer ? peerList.filter((p) => p.id !== stagePeer?.id) : peerList;
   // Any other screen being shared goes in the strip, so no share is ever hidden.
-  $: stripScreens = peerList.filter((p) => p.screenStream && $sharingPeers.has(p.id) && p.id !== stagePeer?.id);
+  $: stripScreens = peerList.filter((p) => p.screenStream && $sharingPeers.has(p.id) && (stage !== 'remote-screen' || p.id !== stagePeer?.id));
   // Nobody else here yet: the empty half of the grid says so and offers the invite link.
   $: alone = peerList.length === 0 && $roomJoined && !$roomError;
   $: gridCols = getGridCols(peerList.length + 1 + (alone ? 1 : 0));
@@ -757,6 +760,7 @@
         return;
       }
       if (stream) {
+        shareSoundNoticeDismissed = false;
         startSharingScreen();
       }
     }
@@ -765,13 +769,14 @@
   // The shared screen's sound: a small button on your stage shows whether it's going out and
   // turns it off or on. Sound only comes along when the browser's picker offered it and it was
   // switched on there; without it the button is greyed out and says how to get it.
+  let shareSoundNoticeDismissed = false;
   let shareSoundOn = true;
   $: shareHasSound = !!$screenStream?.getAudioTracks().length;
   $: if (!$isScreenSharing) shareSoundOn = true; // each share starts with its sound on
 
   function toggleShareSound() {
     shareSoundOn = !shareSoundOn;
-    // A disabled track sends silence into the mix; the microphone is unaffected.
+    // Muting the captured sound leaves the call microphone alone.
     $screenStream?.getAudioTracks().forEach((t) => (t.enabled = shareSoundOn));
   }
 
@@ -1315,6 +1320,16 @@
       </div>
     {/if}
 
+    {#if $isScreenSharing && !shareHasSound && !shareSoundNoticeDismissed}
+      <div class="banner info" role="status">
+        <Icon name="volume-x" size={16} />
+        <span>Your screen is sharing without sound. To include sound, stop sharing, choose the video’s browser tab and enable tab audio in the picker if offered.</span>
+        <button class="banner-dismiss" on:click={() => (shareSoundNoticeDismissed = true)} aria-label="Dismiss sound notice">
+          <Icon name="x" size={16} />
+        </button>
+      </div>
+    {/if}
+
     {#if cameraError}
       <div class="banner danger" role="alert">
         <span>{cameraError}</span>
@@ -1351,9 +1366,9 @@
 
     <div class="room-body">
       <div class="call-col">
-        <main class="call-area" class:has-stage={!!stage}>
+        <main class="call-area" class:has-stage={!!stage} class:sharing-screen={screenOnStage} class:theatre={theatreMode}>
           {#if stage}
-            <section class="stage" bind:this={stageEl} aria-label={stage === 'whiteboard' ? 'Whiteboard' : stage === 'games' ? 'Games' : stage === 'pinned' ? 'Pinned participant' : 'Shared screen'}>
+            <section class="stage" class:screen-stage={screenOnStage} bind:this={stageEl} aria-label={stage === 'whiteboard' ? 'Whiteboard' : stage === 'games' ? 'Games' : stage === 'pinned' ? 'Pinned participant' : 'Shared screen'}>
               {#if stage === 'whiteboard'}
                 {#key $boardKind}
                   <Whiteboard kind={$boardKind} on:close={closeWhiteboard} />
@@ -1365,22 +1380,7 @@
                   <!-- svelte-ignore a11y-media-has-caption -->
                   <video bind:this={localScreenEl} autoplay muted playsinline></video>
                   <span class="tile-name"><span class="name-text">You are presenting</span></span>
-                  <button
-                    class="stage-btn sound-btn"
-                    class:off={!shareHasSound || !shareSoundOn}
-                    on:click={toggleShareSound}
-                    disabled={!shareHasSound}
-                    aria-pressed={shareHasSound && shareSoundOn}
-                    aria-label={!shareHasSound ? 'No sound is being shared' : shareSoundOn ? 'Stop sharing sound' : 'Share sound'}
-                    title={!shareHasSound
-                      ? 'No sound is being shared. To include it, share again, pick a browser tab (or your entire screen) and switch on the audio option in the picker.'
-                      : shareSoundOn
-                        ? 'Others hear the sound from what you share. Click to stop sharing sound.'
-                        : "Others can't hear the sound from what you share. Click to share it."}
-                  >
-                    <Icon name={shareHasSound && shareSoundOn ? 'volume' : 'volume-x'} size={14} />
-                  </button>
-                  {#if $localPeerIdStore}
+                  {#if $localPeerIdStore && $annotationToolsVisible && !theatreMode}
                     <AnnotationLayer videoEl={localScreenEl} screen={$localPeerIdStore} />
                   {/if}
                 </div>
@@ -1414,17 +1414,57 @@
                     presenting
                     verification={$verification.get(stagePeer.id)?.state}
                     bind:videoEl={stageVideoEl}
-                    selectable
+                    selectable={!theatreMode}
                     on:select={() => (selectedPeerId = stagePeer?.id ?? null)}
                   >
-                    <AnnotationLayer videoEl={stageVideoEl} screen={stagePeer.id} />
+                    {#if $annotationToolsVisible && !theatreMode}
+                      <AnnotationLayer videoEl={stageVideoEl} screen={stagePeer.id} />
+                    {/if}
                   </VideoTile>
                 {/key}
-                <button class="stage-btn" on:click={() => (selectedPeerId = stagePeer?.id ?? null)} aria-label="Options for {stagePeer.displayName}: volume, mute for me, pin">
-                  <Icon name="more-horizontal" size={14} /> Options
-                </button>
               {/if}
-              {#if canFullscreen && (stage === 'remote-screen' || stage === 'pinned') && stagePeer}
+              {#if screenOnStage}
+                <div class="view-controls" role="group" aria-label="Screen sharing controls">
+                  <button
+                    class="view-btn theatre-btn"
+                    aria-label="Theatre mode"
+                    aria-pressed={theatreMode}
+                    title={theatreMode ? 'Restore participant tiles' : 'Enlarge the shared screen and hide participant tiles'}
+                    on:click={() => (theatreMode = !theatreMode)}
+                  >
+                    <Icon name="theatre" size={16} />
+                    {theatreMode ? 'Exit theatre' : 'Theatre mode'}
+                  </button>
+                  {#if stage === 'local-screen'}
+                    <button
+                      class="view-btn sound-btn"
+                      class:off={!shareHasSound || !shareSoundOn}
+                      on:click={toggleShareSound}
+                      disabled={!shareHasSound}
+                      aria-pressed={shareHasSound && shareSoundOn}
+                      aria-label={!shareHasSound ? 'No sound is being shared' : shareSoundOn ? 'Stop sharing sound' : 'Share sound'}
+                      title={!shareHasSound
+                        ? 'To share sound, choose the video’s tab and enable tab audio in the browser picker.'
+                        : shareSoundOn
+                          ? 'Turn off audio from the shared screen.'
+                          : "Turn on audio from the shared screen."}
+                    >
+                      <Icon name={shareHasSound && shareSoundOn ? 'volume' : 'volume-x'} size={14} />
+                      {!shareHasSound ? 'No shared audio' : shareSoundOn ? 'Sound on' : 'Sound off'}
+                    </button>
+                  {:else if stagePeer}
+                    <button class="view-btn" on:click={() => (selectedPeerId = stagePeer?.id ?? null)} aria-label="Options for {stagePeer.displayName}: volume, mute for me, pin">
+                      <Icon name="more-horizontal" size={16} /> Options
+                    </button>
+                    {#if canFullscreen}
+                      <button class="view-btn" on:click={toggleStageFullscreen} aria-pressed={stageFullscreen}>
+                        <Icon name={stageFullscreen ? 'minimize' : 'maximize'} size={16} />
+                        {stageFullscreen ? 'Exit full screen' : 'Full screen'}
+                      </button>
+                    {/if}
+                  {/if}
+                </div>
+              {:else if canFullscreen && stage === 'pinned' && stagePeer}
                 <button
                   class="stage-btn fullscreen-btn"
                   on:click={toggleStageFullscreen}
@@ -1474,9 +1514,11 @@
               />
             {/each}
 
-            {#each stripScreens as pc (pc.id)}
-              <VideoTile peerConnection={pc} contain screen presenting verification={$verification.get(pc.id)?.state} />
-            {/each}
+            {#if !theatreMode}
+              {#each stripScreens as pc (pc.id)}
+                <VideoTile peerConnection={pc} contain screen presenting verification={$verification.get(pc.id)?.state} />
+              {/each}
+            {/if}
 
             {#if alone && !stage}
               <div class="tile invite-tile fade-in">
@@ -1514,10 +1556,12 @@
           />
         {/if}
 
-        <ReactionOverlay reactions={$reactionsStore} />
+        {#if !theatreMode}
+          <ReactionOverlay reactions={$reactionsStore} />
+        {/if}
 
         {#if showDeviceSettings}
-          <DeviceSettings on:shortcuts={() => { showDeviceSettings = false; showShortcuts = true; }} />
+          <DeviceSettings {chatOnly} {theatreMode} on:shortcuts={() => { showDeviceSettings = false; showShortcuts = true; }} />
         {/if}
 
         <HandToasts />
@@ -1644,19 +1688,17 @@
               <span class="ctrl-label">Hand</span>
             </button>
 
-            {#if !chatOnly}
-              <button
-                class="ctrl-btn"
-                class:active={showDeviceSettings}
-                aria-pressed={showDeviceSettings}
-                aria-haspopup="true"
-                on:click={() => { showDeviceSettings = !showDeviceSettings; showReactionPicker = false; }}
-                title="Settings"
-              >
-                <Icon name="settings" size={22} />
-                <span class="ctrl-label">Settings</span>
-              </button>
-            {/if}
+            <button
+              class="ctrl-btn"
+              class:active={showDeviceSettings}
+              aria-pressed={showDeviceSettings}
+              aria-haspopup="true"
+              on:click={() => { showDeviceSettings = !showDeviceSettings; showReactionPicker = false; }}
+              title="Settings"
+            >
+              <Icon name="settings" size={22} />
+              <span class="ctrl-label">Settings</span>
+            </button>
 
             <span class="ctrl-sep" aria-hidden="true"></span>
 
@@ -2280,6 +2322,69 @@
     position: relative;
   }
 
+  .screen-stage {
+    flex-direction: column;
+  }
+
+  .view-controls {
+    display: flex;
+    flex-wrap: wrap;
+    justify-content: flex-end;
+    align-items: center;
+    gap: var(--space-1);
+    padding: 4px var(--space-2);
+    background: var(--bg-surface);
+  }
+
+  .view-btn {
+    display: inline-flex;
+    justify-content: center;
+    align-items: center;
+    gap: 6px;
+    min-height: 36px;
+    padding: 4px 10px;
+    border-radius: var(--radius);
+    color: var(--text);
+    background: transparent;
+    font-size: var(--text-xs);
+    font-weight: 500;
+  }
+
+  .view-btn:hover {
+    background: var(--bg-hover);
+  }
+
+  .theatre-btn {
+    margin-right: auto;
+  }
+
+  .theatre-btn[aria-pressed='true'] {
+    background: var(--accent-soft);
+    color: var(--accent);
+  }
+
+  .call-area.has-stage.theatre {
+    background: #000;
+    gap: 0;
+    padding: 0;
+  }
+
+  /* Keep the tiles and their media elements mounted so call audio continues. */
+  .theatre .tile-strip {
+    display: none;
+  }
+
+  .theatre .stage > :global(.tile),
+  .theatre .stage-screen {
+    border: 0;
+    box-shadow: none;
+    border-radius: 0;
+  }
+
+  .theatre .stage :global(.tile-name) {
+    display: none;
+  }
+
   .stage > :global(.tile),
   .stage-screen {
     flex: 1;
@@ -2289,6 +2394,10 @@
     border-radius: var(--radius-lg);
     border: 1px solid var(--border-subtle);
     overflow: hidden;
+  }
+
+  .stage-screen {
+    min-height: 0;
   }
 
   .stage-screen video {
@@ -2525,6 +2634,7 @@
     border-radius: 0;
   }
 
+  .view-btn:focus-visible,
   .stage-btn:focus-visible {
     outline: 2px solid var(--accent-ring);
     outline-offset: 2px;
@@ -2832,6 +2942,26 @@
       padding: var(--space-5);
     }
   }
+  /* A horizontal filmstrip can leave a phone in landscape with almost no height for video. */
+  @media (orientation: landscape) and (max-width: 768px) and (max-height: 500px) {
+    .call-area.sharing-screen {
+      flex-direction: row;
+    }
+
+    .sharing-screen .tile-strip {
+      flex-direction: column;
+      width: 120px;
+      height: auto;
+      overflow-x: hidden;
+      overflow-y: auto;
+    }
+
+    .sharing-screen .tile-strip > :global(.tile) {
+      width: 100%;
+      height: auto;
+    }
+  }
+
   /* ── End-to-end badge ── */
   .e2e-badge {
     display: inline-flex;

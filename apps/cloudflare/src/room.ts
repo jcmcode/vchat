@@ -218,11 +218,12 @@ export class SignalingRoom extends DurableObject<Env> {
 
   async webSocketMessage(ws: WebSocket, message: string | ArrayBuffer): Promise<void> {
     const next = (this.queues.get(ws) ?? Promise.resolve()).then(() => this.handleMessage(ws, message));
-    this.queues.set(ws, next.catch(() => {}));
+    const tail = next.catch(() => {});
+    this.queues.set(ws, tail);
     try {
       await next;
     } finally {
-      if (this.queues.get(ws) === next) this.queues.delete(ws);
+      if (this.queues.get(ws) === tail) this.queues.delete(ws);
     }
   }
 
@@ -338,9 +339,16 @@ export class SignalingRoom extends DurableObject<Env> {
       if (deadline === null || idleDeadline < deadline) deadline = idleDeadline;
     }
     if (deadline === this.scheduledDeadline) return;
-    if (deadline === null) await this.ctx.storage.deleteAlarm();
-    else await this.ctx.storage.setAlarm(Math.max(deadline, Date.now() + 1000));
+    // Record the pending write before yielding. A concurrent membership change may immediately
+    // need to restore the old deadline while this write is still in flight.
     this.scheduledDeadline = deadline;
+    try {
+      if (deadline === null) await this.ctx.storage.deleteAlarm();
+      else await this.ctx.storage.setAlarm(Math.max(deadline, Date.now() + 1000));
+    } catch (error) {
+      if (this.scheduledDeadline === deadline) this.scheduledDeadline = undefined;
+      throw error;
+    }
   }
 
   private sendError(ws: WebSocket, message: string): void {

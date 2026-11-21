@@ -72,11 +72,9 @@ export function addDays(ms: number, offset: number): number {
 /** The next whole half hour (:00 or :30, local) strictly after `now`. */
 export function nextHalfHour(now: number): number {
   const d = new Date(now);
-  const minutes = d.getHours() * 60 + d.getMinutes() + 1; // strictly later, at least a minute away
-  const rounded = Math.ceil(minutes / 30) * 30;
-  // Built from the local date so half-hour boundaries follow the local clock (also for zones with
-  // :30 or :45 offsets); the Date constructor carries 24:00 over to the next day.
-  return new Date(d.getFullYear(), d.getMonth(), d.getDate(), 0, rounded).getTime();
+  // Advance from this instant so the second occurrence of a repeated hour stays in the future.
+  const minutesToBoundary = 30 - d.getMinutes() % 30;
+  return now + minutesToBoundary * 60_000 - d.getSeconds() * 1000 - d.getMilliseconds();
 }
 
 /**

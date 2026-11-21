@@ -54,6 +54,19 @@
   const dispatch = createEventDispatcher<{ close: void }>();
 
   let inputText = '';
+  const drafts = new Map<string, string>();
+  let draftRecipient = recipient;
+  $: if (recipient !== draftRecipient) switchDraft(recipient);
+
+  function switchDraft(next: string) {
+    if (inputText) drafts.set(draftRecipient, inputText);
+    else drafts.delete(draftRecipient);
+    stopTyping();
+    draftRecipient = next;
+    inputText = drafts.get(next) ?? '';
+    sendError = '';
+  }
+
   let inputEl: HTMLInputElement;
   let sendError = '';
   /** Names of people who have left, so their conversation keeps its title. */
@@ -107,7 +120,6 @@
   });
 
   function openConversation(id: string) {
-    if (id !== recipient && isTyping) stopTyping();
     recipient = id;
     tab = 'chat';
     pickerOpen = false;
@@ -120,7 +132,7 @@
   // (At creation, before anything is marked seen.)
   {
     const unreadNow = unreadByThread(messages, get(seenMessageIds));
-    if (tab === 'chat' && !unreadNow.get(recipient)) {
+    if (tab === 'chat' && recipient === EVERYONE && !unreadNow.get(EVERYONE)) {
       const next = privatePartners(messages).find((id) => (unreadNow.get(id) ?? 0) > 0);
       if (next) recipient = next;
     }
@@ -247,7 +259,7 @@
   }
 
   function handleKeydown(e: KeyboardEvent) {
-    if (e.key === 'Enter' && !e.shiftKey) {
+    if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) {
       e.preventDefault();
       handleSend();
     }

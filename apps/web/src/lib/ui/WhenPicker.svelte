@@ -57,8 +57,7 @@
     time = timeKey(startsAt);
   }
 
-  function commit() {
-    const startsAt = day ? combineDateTime(day, time) : null;
+  function commit(startsAt = day ? combineDateTime(day, time) : null) {
     synced = startsAt;
     value = { ...value, startsAt };
   }
@@ -73,13 +72,15 @@
 
   /** Choose a day, keeping the time unless that would be in the past (then the next half hour). */
   function pickDay(key: string | null) {
-    if (key !== null && (combineDateTime(key, time) ?? 0) < now) {
-      const next = nextHalfHour(now);
-      if (dayKey(next) === key) time = timeKey(next);
+    let startsAt = key ? combineDateTime(key, time) : null;
+    if (startsAt !== null && startsAt < now) {
+      startsAt = nextHalfHour(now);
+      key = dayKey(startsAt);
+      time = timeKey(startsAt);
     }
     day = key;
     if (key === null || !customDayKey(key)) dateOpen = false;
-    commit();
+    commit(startsAt);
   }
 
   function customDayKey(key: string): boolean {

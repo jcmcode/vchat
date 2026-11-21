@@ -31,6 +31,7 @@
     material: 'not enough pieces left to mate',
     four: 'four in a row',
     full: 'the board is full',
+    'move-limit': 'the move limit was reached',
     resign: 'by resignation',
     abandon: 'the game was called off',
     eight: 'by pocketing the 8',

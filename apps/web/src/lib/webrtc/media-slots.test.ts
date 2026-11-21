@@ -37,6 +37,18 @@ test('localSlots: answerer with mic+camera added first, then the rest from the o
   assert.equal(localSlots(before).screen, undefined);
 });
 
+test('shared audio uses a separate, bidirectional slot and follows the announced screen', () => {
+  const ts = [...layout(), t('audio', '3', 'recvonly'), t('audio', '4', 'recvonly')];
+  assert.equal(localSlots(ts).screenAudio, ts[3]);
+  assert.equal(remoteSlots(ts, null).screenAudio, undefined);
+  assert.equal(remoteSlots(ts, '2').screenAudio, ts[3]);
+  assert.equal(remoteSlots(ts, '2').audio, ts[0]);
+  assert.deepEqual(enableSending(ts), [ts[3]]);
+  ts[3].currentDirection = 'recvonly';
+  assert.equal(sendingBlocked(ts), true);
+  assert.equal(localSlots(layout()).screenAudio, undefined, 'older offer');
+});
+
 test('localSlots skips stopped transceivers', () => {
   const ts = [t('audio', '0'), t('video', '1', 'stopped'), t('video', '2'), t('video', '3')];
   const s = localSlots(ts);

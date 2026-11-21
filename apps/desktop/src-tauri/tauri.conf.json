@@ -6,11 +6,10 @@
   "build": {
     "frontendDist": "../../web/build",
     "devUrl": "http://localhost:5173",
-    "beforeDevCommand": "pnpm --filter @vchat/web dev",
+    "beforeDevCommand": "pnpm --workspace-root dev",
     "beforeBuildCommand": "pnpm --filter @vchat/web build"
   },
   "app": {
-    "title": "vchat",
     "windows": [
       {
         "title": "vchat",

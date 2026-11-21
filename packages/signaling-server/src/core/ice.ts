@@ -34,7 +34,8 @@ export interface IceResponse {
 export const DEFAULT_STUN = 'stun:stun.cloudflare.com:3478';
 /** TURN credential lifetime (seconds) unless TURN_TTL_SECONDS says otherwise; capped by the invite. */
 export const DEFAULT_TURN_TTL = 4 * 60 * 60;
-const MIN_TURN_TTL = 60;
+const MIN_QUOTA_WINDOW = 60;
+const CLOUDFLARE_MAX_TTL = 48 * 60 * 60;
 
 function splitList(value: string | undefined): string[] {
   return (value ?? '')
@@ -97,10 +98,13 @@ export interface IceOptions {
 
 /** Credential lifetime in seconds: TURN_TTL_SECONDS (default 4h), capped at the token's expiry. */
 export function turnTtl(env: IceEnv, opts: IceOptions = {}): number {
-  const configured = Number(env.TURN_TTL_SECONDS) > 0 ? Math.floor(Number(env.TURN_TTL_SECONDS)) : DEFAULT_TURN_TTL;
-  if (opts.expiresAt === undefined) return configured;
-  const left = Math.floor(opts.expiresAt - (opts.now ?? Date.now()) / 1000);
-  return Math.max(MIN_TURN_TTL, Math.min(configured, left));
+  const seconds = Math.floor(Number(env.TURN_TTL_SECONDS));
+  const configured = Number.isSafeInteger(seconds) && seconds > 0 ? seconds : DEFAULT_TURN_TTL;
+  const providerLimit = env.CF_TURN_KEY_ID && env.CF_TURN_API_TOKEN ? CLOUDFLARE_MAX_TTL : configured;
+  const lifetime = Math.min(configured, providerLimit);
+  if (opts.expiresAt === undefined) return lifetime;
+  const left = Math.floor(opts.expiresAt) - Math.floor((opts.now ?? Date.now()) / 1000);
+  return Math.max(0, Math.min(lifetime, left));
 }
 
 function randomId(): string {
@@ -114,7 +118,7 @@ export async function getIceServers(env: IceEnv, opts: IceOptions = {}): Promise
   const ttl = turnTtl(env, opts);
   const nowSec = Math.floor((opts.now ?? Date.now()) / 1000);
 
-  if (env.CF_TURN_KEY_ID && env.CF_TURN_API_TOKEN) {
+  if (ttl > 0 && env.CF_TURN_KEY_ID && env.CF_TURN_API_TOKEN) {
     // Cloudflare's response already includes its own STUN server.
     return { iceServers: await cloudflareTurn(env, ttl), ttl };
   }
@@ -123,6 +127,7 @@ export async function getIceServers(env: IceEnv, opts: IceOptions = {}): Promise
   const stun = splitList(env.STUN_URLS ?? DEFAULT_STUN);
   if (stun.length) iceServers.push({ urls: stun });
 
+  if (ttl === 0) return { iceServers };
   const turnUrls = splitList(env.TURN_URLS);
   if (turnUrls.length && env.TURN_SECRET) {
     // coturn "TURN REST API" credentials: username = "<expiry>:<id>", password = HMAC(secret, username).
@@ -135,7 +140,7 @@ export async function getIceServers(env: IceEnv, opts: IceOptions = {}): Promise
     let expiry = nowSec + ttl;
     const cappedByInvite = opts.expiresAt !== undefined && expiry >= Math.floor(opts.expiresAt);
     const window = Math.floor(ttl / 2);
-    if (opts.userId && !cappedByInvite && window >= MIN_TURN_TTL) expiry = Math.floor(expiry / window) * window;
+    if (opts.userId && !cappedByInvite && window >= MIN_QUOTA_WINDOW) expiry = Math.floor(expiry / window) * window;
     const username = `${expiry}:${opts.userId ?? randomId()}`;
     const credential = await hmacSha1Base64(env.TURN_SECRET, username);
     iceServers.push({ urls: turnUrls, username, credential });

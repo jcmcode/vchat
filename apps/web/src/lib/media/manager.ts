@@ -224,34 +224,41 @@ async function turnCameraOn(): Promise<boolean> {
   return true;
 }
 
+let microphoneSelection = 0;
+
 export async function switchAudioDevice(deviceId: string): Promise<MediaStreamTrack | null> {
   const stream = get(localStream);
   if (!stream) return null;
+  const selection = ++microphoneSelection;
+  const isCurrent = () => selection === microphoneSelection && get(localStream) === stream;
 
-  // Get the new microphone first: if it fails (busy, unplugged) the current one keeps working.
-  const oldTrack = stream.getAudioTracks()[0];
-  const newStream = await navigator.mediaDevices.getUserMedia({
-    audio: {
-      deviceId: { exact: deviceId },
-      echoCancellation: true,
-      noiseSuppression: true,
-      autoGainControl: true,
-    },
-  });
-
-  const newTrack = newStream.getAudioTracks()[0];
-  // Left the call (or a new call took over) while the new microphone was opening: release it.
-  if (get(localStream) !== stream) {
-    newStream.getTracks().forEach((t) => t.stop());
+  // Keep the current microphone working until the latest selection has opened.
+  let newStream: MediaStream;
+  try {
+    newStream = await navigator.mediaDevices.getUserMedia({
+      audio: {
+        deviceId: { exact: deviceId },
+        echoCancellation: true,
+        noiseSuppression: true,
+        autoGainControl: true,
+      },
+    });
+  } catch (error) {
+    if (isCurrent()) throw error;
     return null;
   }
-  newTrack.enabled = get(audioEnabled); // stay muted if we were muted
-  oldTrack?.stop();
-  if (oldTrack) stream.removeTrack(oldTrack);
+  const newTrack = newStream.getAudioTracks()[0];
+  if (!isCurrent() || !newTrack) {
+    newStream.getTracks().forEach((track) => track.stop());
+    return null;
+  }
+  newTrack.enabled = get(audioEnabled);
+  for (const previous of stream.getAudioTracks()) {
+    previous.stop();
+    stream.removeTrack(previous);
+  }
   stream.addTrack(newTrack);
   selectedAudioDevice.set(deviceId);
-
-  // Trigger store update
   localStream.set(stream);
   return newTrack;
 }
@@ -283,14 +290,15 @@ export function switchVideoDevice(deviceId: string): Promise<MediaStreamTrack | 
   });
 }
 
+let pendingScreenPicker: symbol | null = null;
+
 export async function startScreenShare(): Promise<MediaStream | null> {
+  if (pendingScreenPicker || get(screenStream)) return null;
+  const request = Symbol();
+  pendingScreenPicker = request;
   try {
-    // Ask for the shared tab's or screen's sound too. Whether it comes is up to the browser and
-    // the picker ("Also share tab audio"): tabs in Chrome/Edge, the whole screen on some systems,
-    // never a single window. It's sent as it is (no voice processing, which mangles music and
-    // video sound). The options TypeScript doesn't know yet are hints that browsers without them
-    // ignore: offer system sound for a whole screen, but leave this call's own sound out of it,
-    // so the people in the call don't hear themselves back.
+    // The picker controls which sources include audio. Preserve music and movie sound and
+    // ask the browser to exclude this call's own audio when capturing the entire display.
     const stream = await navigator.mediaDevices.getDisplayMedia({
       video: { frameRate: { ideal: 30 } },
       audio: {
@@ -303,24 +311,38 @@ export async function startScreenShare(): Promise<MediaStream | null> {
     } as DisplayMediaStreamOptions);
 
     const video = stream.getVideoTracks()[0];
+    if (pendingScreenPicker !== request || !video || video.readyState === 'ended') {
+      stream.getTracks().forEach((track) => track.stop());
+      return null;
+    }
+
     // Tell the encoder this is screen content: keep text sharp and let the frame rate give way.
     if ('contentHint' in video) video.contentHint = 'detail';
 
     // When user stops sharing via browser UI
     video.onended = () => {
-      stopScreenShare();
+      if (get(screenStream) === stream) stopScreenShare();
     };
+    for (const sound of stream.getAudioTracks()) {
+      if (sound.readyState === 'ended') stream.removeTrack(sound);
+      else sound.addEventListener('ended', () => {
+        stream.removeTrack(sound);
+        if (get(screenStream) === stream) screenStream.set(stream);
+      }, { once: true });
+    }
 
     screenStream.set(stream);
     isScreenSharing.set(true);
     return stream;
   } catch {
-    // User cancelled
     return null;
+  } finally {
+    if (pendingScreenPicker === request) pendingScreenPicker = null;
   }
 }
 
 export function stopScreenShare(): void {
+  pendingScreenPicker = null;
   const stream = get(screenStream);
   if (stream) {
     stream.getTracks().forEach((t) => t.stop());

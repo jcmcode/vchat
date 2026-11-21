@@ -26,6 +26,15 @@ test('earlyState also keeps what their version supports and how they show our ca
   assert.equal(earlyState({ type: 'view', w: -5, h: 360, fit: 'cover' }), null);
 });
 
+test('a viewer joining an ongoing share retains its verified audio metadata', () => {
+  const share = { type: 'screen-state', sharing: true, mid: '2', audio: true };
+  const caps = { type: 'caps', iceRestart: true, screenAudio: true };
+  assert.deepEqual(earlyState(share), share);
+  assert.deepEqual(earlyState(caps), caps);
+  assert.deepEqual(earlyState({ ...share, mid: '' }), { type: 'screen-state', sharing: true });
+  assert.deepEqual(earlyState({ ...share, audio: 'yes' }), { type: 'screen-state', sharing: true, mid: '2' });
+});
+
 test('holdEarlyState keeps only the latest of each type', () => {
   const store = new Map<EarlyState['type'], EarlyState>();
   assert.equal(holdEarlyState(store, { type: 'screen-state', sharing: true, mid: '1' }), true);

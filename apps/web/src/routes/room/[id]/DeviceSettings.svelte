@@ -16,6 +16,10 @@
   import { flipCamera, isTouchDevice, rememberCameraWhenInUse } from '$lib/media/call-camera';
   import { createEventDispatcher, onMount } from 'svelte';
   import Icon from '$lib/ui/Icon.svelte';
+  import { annotationToolsVisible, setAnnotationToolsVisible } from '$lib/collab/annotations';
+
+  export let theatreMode = false;
+  export let chatOnly = false;
 
   const dispatch = createEventDispatcher<{ shortcuts: void }>();
 
@@ -23,7 +27,8 @@
   $: canFlip = touch && $videoEnabled && $videoDevices.length > 1;
 
   onMount(() => {
-    enumerateDevices();
+    // Chat-only guests can use view settings without camera/microphone access.
+    void enumerateDevices().catch(() => {});
   });
 
   let deviceError = '';
@@ -33,8 +38,10 @@
     deviceError = '';
     try {
       const track = await switchAudioDevice(deviceId);
-      if (track) useNewMicTrack(track); // keeps shared-screen audio mixed in while presenting
-      rememberDevice('audioInput', deviceId);
+      if (track) {
+        useNewMicTrack(track);
+        rememberDevice('audioInput', deviceId);
+      }
     } catch {
       deviceError = "Couldn't switch microphone — it may be in use by another app.";
     }
@@ -73,32 +80,34 @@
   }
 </script>
 
-<div class="device-settings card fade-in" role="dialog" aria-label="Device settings">
-  <div class="settings-header">Device settings</div>
+<div class="device-settings card fade-in" role="dialog" aria-label="Call settings">
+  <div class="settings-header">Call settings</div>
   {#if deviceError}<p class="device-error" role="alert">{deviceError}</p>{/if}
 
-  <div class="field">
-    <label class="field-label" for="dev-mic">Microphone</label>
-    <select id="dev-mic" class="input" value={$selectedAudioDevice} on:change={handleAudioChange}>
-      {#each $audioDevices as device}
-        <option value={device.deviceId}>{device.label || 'Microphone'}</option>
-      {/each}
-    </select>
-  </div>
+  {#if !chatOnly}
+    <div class="field">
+      <label class="field-label" for="dev-mic">Microphone</label>
+      <select id="dev-mic" class="input" value={$selectedAudioDevice} on:change={handleAudioChange}>
+        {#each $audioDevices as device}
+          <option value={device.deviceId}>{device.label || 'Microphone'}</option>
+        {/each}
+      </select>
+    </div>
 
-  <div class="field">
-    <label class="field-label" for="dev-cam">Camera</label>
-    <select id="dev-cam" class="input" value={$selectedVideoDevice} on:change={handleVideoChange}>
-      {#each $videoDevices as device}
-        <option value={device.deviceId}>{device.label || 'Camera'}</option>
-      {/each}
-    </select>
-    {#if canFlip}
-      <button type="button" class="btn small flip" on:click={handleFlip}>
-        <Icon name="switch-camera" size={16} /> Switch front / back camera
-      </button>
-    {/if}
-  </div>
+    <div class="field">
+      <label class="field-label" for="dev-cam">Camera</label>
+      <select id="dev-cam" class="input" value={$selectedVideoDevice} on:change={handleVideoChange}>
+        {#each $videoDevices as device}
+          <option value={device.deviceId}>{device.label || 'Camera'}</option>
+        {/each}
+      </select>
+      {#if canFlip}
+        <button type="button" class="btn small flip" on:click={handleFlip}>
+          <Icon name="switch-camera" size={16} /> Switch front / back camera
+        </button>
+      {/if}
+    </div>
+  {/if}
 
   {#if $audioOutputDevices.length > 0}
     <div class="field">
@@ -110,6 +119,14 @@
       </select>
     </div>
   {/if}
+
+  <div class="field">
+    <label class="annotation-pref">
+      <input type="checkbox" checked={$annotationToolsVisible} on:change={(e) => setAnnotationToolsVisible(e.currentTarget.checked)} />
+      Show screen-share annotations and tools
+    </label>
+    {#if theatreMode}<small>Annotations are hidden in theatre mode.</small>{/if}
+  </div>
 
   <button type="button" class="shortcuts-link" on:click={() => dispatch('shortcuts')}>
     <Icon name="keyboard" size={15} /> Keyboard shortcuts <kbd>?</kbd>
@@ -125,6 +142,8 @@
     margin-inline: auto;
     z-index: 50;
     width: min(360px, calc(100% - 24px));
+    max-height: calc(100dvh - 110px);
+    overflow-y: auto;
     padding: var(--space-4);
     background: var(--bg-overlay);
     box-shadow: var(--shadow-lg);
@@ -136,6 +155,18 @@
   .settings-header {
     font-weight: 600;
     font-size: var(--text-base);
+  }
+
+  .annotation-pref {
+    display: flex;
+    align-items: center;
+    gap: var(--space-2);
+    font-size: var(--text-sm);
+    cursor: pointer;
+  }
+
+  .annotation-pref input {
+    accent-color: var(--accent);
   }
 
   select.input {

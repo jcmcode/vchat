@@ -46,6 +46,29 @@ test('creator becomes host; second create is rejected', async () => {
   assert.equal(room.peers().length, 1);
 });
 
+test('a socket closed during entry cannot create a room or replace the live connection', async () => {
+  const room = new Room<FakeConn>('interrupted', transport);
+  const dropped = new FakeConn('dropped');
+  const creating = room.create(dropped, enter('host'));
+  dropped.open = false;
+  await creating;
+  assert.ok(room.isEmpty());
+
+  const host = new FakeConn('host');
+  await room.create(host, enter('host'));
+  for (const privateRoom of [false, true]) {
+    const reconnect = new FakeConn('reconnect');
+    const joining = privateRoom
+      ? room.enter(reconnect, enter('host'), { role: 'host', approval: false })
+      : room.join(reconnect, enter('host'));
+    reconnect.open = false;
+    await joining;
+    assert.ok(host.open);
+    assert.ok(room.has(host));
+    assert.ok(!room.has(reconnect));
+  }
+});
+
 test('joining a non-existent room errors', async () => {
   const room = new Room<FakeConn>('nope', transport);
   const c = new FakeConn('c');

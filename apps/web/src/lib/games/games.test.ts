@@ -316,6 +316,18 @@ test('session: moves count only in order, from the player whose turn it is', () 
   assert.equal(s.moves.length, 2);
 });
 
+test('session: a pool game at the move limit ends for players and late joiners', () => {
+  const s = newSession('long-game', 'pool2', ['alice', 'bob']);
+  const shot = { dx: 1, dy: 0, power: 0.02, cue: { x: 100, y: 100 } };
+  for (let n = 0; n < pool.maxMoves; n++) {
+    assert.equal(tryMove(s, s.players[pool.turn(s.state as PoolState)], n, shot), 'applied');
+  }
+  const result = { winner: null, reason: 'move-limit' };
+  assert.deepEqual(resultOf(s), result);
+  assert.equal(tryMove(s, s.players[pool.turn(s.state as PoolState)], pool.maxMoves, shot), 'rejected');
+  assert.deepEqual(resultOf(fromSnapshot(toSnapshot(s))!), result);
+});
+
 test('session: a snapshot is replayed through the rules', () => {
   const s = newSession('g1', 'chess', ['alice', 'bob']);
   tryMove(s, 'alice', 0, { from: sq('e2'), to: sq('e4') });

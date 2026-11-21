@@ -263,7 +263,7 @@ export class Room<C> {
       args.password ? hashPassword(salt, args.password) : Promise.resolve(null),
     ]);
 
-    if (this.refuseEnded(conn, args, secretHash)) return;
+    if (!this.transport.isOpen(conn) || this.refuseEnded(conn, args, secretHash)) return;
     if (this.exists()) {
       this.error(conn, 'Room already exists');
       return;
@@ -308,7 +308,7 @@ export class Room<C> {
       args.password ? hashPassword(salt, args.password) : Promise.resolve(null),
     ]);
 
-    if (this.refuseEnded(conn, args, secretHash)) return;
+    if (!this.transport.isOpen(conn) || this.refuseEnded(conn, args, secretHash)) return;
     if (!this.exists()) {
       this.error(conn, 'Room does not exist');
       return;
@@ -385,7 +385,7 @@ export class Room<C> {
     const isHost = grant.role === 'host';
     // Even the owner: an owner tab that was offline when the call ended mustn't quietly re-open it.
     // Opening the room again on purpose is a fresh join with a new identity.
-    if (this.refuseEnded(conn, args, secretHash)) return;
+    if (!this.transport.isOpen(conn) || this.refuseEnded(conn, args, secretHash)) return;
     const stillWaiting = this.isWaitingAs(args.peerId, secretHash, args.secret);
     this.removeQuietly(conn);
     if (!isHost && this.refuseBarred(conn, args, secretHash, emailKey)) return;

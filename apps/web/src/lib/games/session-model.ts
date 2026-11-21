@@ -74,7 +74,8 @@ export function resultOf(session: Session): GameOver | null {
       ? { winner: (1 - session.stopped.by) as Seat, reason: 'resign' }
       : { winner: null, reason: 'abandon' };
   }
-  return RULES[session.kind].over(session.state);
+  const rules = RULES[session.kind];
+  return rules.over(session.state) ?? (session.moves.length >= rules.maxMoves ? { winner: null, reason: 'move-limit' } : null);
 }
 
 export type MoveOutcome = 'applied' | 'gap' | 'rejected';
@@ -89,7 +90,7 @@ export function tryMove(session: Session, peerId: string, n: unknown, move: unkn
   if (n > session.moves.length) return n <= RULES[session.kind].maxMoves ? 'gap' : 'rejected';
   if (n < session.moves.length || resultOf(session)) return 'rejected';
   const rules = RULES[session.kind];
-  if (session.moves.length >= rules.maxMoves || rules.turn(session.state) !== seat) return 'rejected';
+  if (rules.turn(session.state) !== seat) return 'rejected';
   const next = rules.apply(session.state, move, seat as Seat);
   if (next === null) return 'rejected';
   session.state = next;

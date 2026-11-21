@@ -8,6 +8,7 @@
     screens,
     annotationVersion,
     annotationTool,
+    setAnnotationToolsVisible,
     movePointer,
     hidePointer,
     startAnnotation,
@@ -96,6 +97,8 @@
     detachVideo?.();
     if (frame) cancelAnimationFrame(frame);
     if (sender) finishAnnotation(screen, sender);
+    if (screens.get(screen)?.pointers.has($localPeerIdStore)) hidePointer(screen);
+    annotationTool.set('none');
   });
 
   function toScreen(e: PointerEvent) {
@@ -164,6 +167,10 @@
   </button>
   <button on:click={() => clearAnnotations(screen)} title="Clear all drawings for everyone" aria-label="Clear all drawings for everyone">
     <Icon name="trash" size={18} /><span class="label">Clear</span>
+  </button>
+  <span class="sep" aria-hidden="true"></span>
+  <button on:click={() => setAnnotationToolsVisible(false)} title="Hide annotations (restore in Settings)" aria-label="Hide annotations">
+    <Icon name="x" size={18} />
   </button>
 </div>
 

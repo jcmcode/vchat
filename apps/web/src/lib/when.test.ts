@@ -69,6 +69,9 @@ test('nextHalfHour: the next :00 or :30 strictly after now', () => {
   assert.equal(nextHalfHour(local(2026, 11, 14, 14, 30)), local(2026, 11, 14, 15, 0));
   assert.equal(nextHalfHour(local(2026, 11, 14, 14, 45)), local(2026, 11, 14, 15, 0));
   assert.equal(nextHalfHour(local(2026, 11, 14, 23, 45)), local(2026, 11, 15, 0, 0));
+  // The next tick can be the second 01:00 or 01:30 on fall-back day.
+  assert.equal(nextHalfHour(Date.UTC(2026, 10, 1, 5, 55)), Date.UTC(2026, 10, 1, 6));
+  assert.equal(nextHalfHour(Date.UTC(2026, 10, 1, 6, 10)), Date.UTC(2026, 10, 1, 6, 30));
   // Into the spring-forward gap: 02:00 doesn't exist, so 03:00 EDT.
   assert.equal(timeKey(nextHalfHour(local(2026, 3, 8, 1, 50))), '03:00');
 });

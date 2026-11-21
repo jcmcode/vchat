@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>NSCameraUsageDescription</key>
+  <string>Share your camera with people in your vchat call.</string>
+  <key>NSMicrophoneUsageDescription</key>
+  <string>Speak with people in your vchat call.</string>
+</dict>
+</plist>

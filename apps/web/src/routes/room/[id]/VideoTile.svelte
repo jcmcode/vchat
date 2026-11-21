@@ -16,7 +16,7 @@
   export let contain = false;
   /** This person is presenting their screen. */
   export let presenting = false;
-  /** Show their shared screen (the stage) instead of their camera. It never plays sound: the shared audio is mixed into their microphone. */
+  /** Show their shared screen (the stage) instead of their camera. It also plays the screen's captured audio when available. */
   export let screen = false;
   /** Exposed so overlays (screen annotations) can read the video's size. */
   export let videoEl: HTMLVideoElement | null = null;
@@ -31,7 +31,9 @@
   /** Overlays in the slot (screen annotations and their toolbar) handle their own clicks and keys. */
   let overlayEl: HTMLElement | null = null;
   function fromOverlay(e: Event): boolean {
-    return !!overlayEl && e.target instanceof Node && overlayEl.contains(e.target);
+    // A control can remove itself during its click (Hide annotations). The event path
+    // still identifies the overlay after the original target has left the DOM.
+    return !!overlayEl && e.composedPath().includes(overlayEl);
   }
 
   // With overlays (screen annotations have their own buttons) the tile isn't a button itself:
@@ -50,25 +52,35 @@
   $: shown = screen ? peerConnection.screenStream : peerConnection.stream;
   $: showVideo = !!shown && (screen || media?.video !== false);
 
+  let playBlocked = false;
+  async function playScreen(el: HTMLVideoElement, stream: MediaStream) {
+    try {
+      await el.play();
+      if (el === videoEl && el.srcObject === stream) playBlocked = false;
+    } catch (error) {
+      if (el === videoEl && el.srcObject === stream && error instanceof DOMException && error.name === 'NotAllowedError') {
+        playBlocked = true;
+      }
+    }
+  }
+
   $: if (videoEl && shown && videoEl.srcObject !== shown) {
+    playBlocked = false;
     videoEl.srcObject = shown;
+    if (screen) void playScreen(videoEl, shown);
   }
 
   // Route audio to the speaker picked in Device Settings (Chrome/Edge/Firefox support setSinkId).
-  $: if (videoEl && $selectedAudioOutput && 'setSinkId' in videoEl) {
+  $: if (videoEl && 'setSinkId' in videoEl) {
     (videoEl as HTMLVideoElement & { setSinkId(id: string): Promise<void> })
       .setSinkId($selectedAudioOutput)
       .catch(() => {});
   }
 
-  // Volume and "Mute for me" from the person card: only how they play on this device. Their sound
-  // (shared-screen audio included, mixed into the microphone) plays from their camera tile; a
-  // screen tile always stays silent.
+  // Apply participant playback preferences to both their voice and their shared media.
   $: playback = playbackFor($peerAudioPrefs.get(peerConnection.id));
-  $: if (videoEl) {
-    videoEl.volume = playback.volume;
-    videoEl.muted = screen || playback.muted;
-  }
+  $: muted = playback.muted || (screen && !shown?.getAudioTracks().length);
+  $: if (videoEl) videoEl.volume = playback.volume;
   $: handRaised = $raisedHands.has(peerConnection.id);
 </script>
 
@@ -89,7 +101,13 @@
   {#if shown}
     <!-- The video element stays mounted (it also plays the person's audio); it's hidden when their camera is off. -->
     <!-- svelte-ignore a11y-media-has-caption -->
-    <video bind:this={videoEl} autoplay playsinline muted={screen} class:hidden={!showVideo}></video>
+    <video bind:this={videoEl} autoplay playsinline {muted} class:hidden={!showVideo}></video>
+  {/if}
+  {#if screen && playBlocked && videoEl && shown}
+    <button
+      class="play-screen"
+      on:click|stopPropagation={() => videoEl && shown && playScreen(videoEl, shown)}
+    >Play shared screen</button>
   {/if}
   {#if !showVideo}
     <div class="no-video">
@@ -123,6 +141,16 @@
 </div>
 
 <style>
+  .play-screen {
+    position: absolute;
+    z-index: 6;
+    padding: var(--space-2) var(--space-3);
+    color: white;
+    background: #17191e;
+    border: 1px solid var(--border-strong);
+    border-radius: var(--radius-pill);
+  }
+
   .tile.selectable {
     cursor: pointer;
   }

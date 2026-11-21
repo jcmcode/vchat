@@ -1,7 +1,7 @@
 export type DataChannelMessage =
   | { type: 'chat'; text: string; fromPeerId: string; displayName: string; timestamp: number; private?: boolean }
   /** `mid`: which of the sender's own video transceivers carries the screen (see media-slots.ts). */
-  | { type: 'screen-state'; sharing: boolean; mid?: string }
+  | { type: 'screen-state'; sharing: boolean; mid?: string; audio?: true }
   | { type: 'media-state'; audio: boolean; video: boolean }
   | { type: 'typing'; isTyping: boolean; fromPeerId: string; private?: boolean }
   | { type: 'reaction'; emoji: string; fromPeerId: string; displayName: string; timestamp: number }
@@ -10,7 +10,7 @@ export type DataChannelMessage =
   | { type: 'file-cancel'; fileId: string }
   | { type: 'file-ack'; fileId: string; chunkIndex: number }
   /** What this version supports (sent once a connection is trusted). */
-  | { type: 'caps'; iceRestart?: boolean }
+  | { type: 'caps'; iceRestart?: boolean; screenAudio?: boolean }
   /** How we show their camera: `{w, h, fit}` in device pixels, `{w: 0, h: 0}` not shown, `{full: true}` no limit. */
   | { type: 'view'; w?: number; h?: number; fit?: 'cover' | 'contain'; full?: true };
 

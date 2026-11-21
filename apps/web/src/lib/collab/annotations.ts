@@ -54,6 +54,27 @@ const POINTER_INTERVAL_MS = 33;
 export const screens = new Map<string, { board: Board; pointers: Map<string, Pointer> }>();
 export const annotationVersion = writable(0);
 export const annotationTool = writable<AnnotationTool>('none');
+const TOOLS_PREF = 'vchat_annotation_tools';
+
+function loadToolsVisible(): boolean {
+  try {
+    return typeof window === 'undefined' || window.localStorage.getItem(TOOLS_PREF) !== 'hidden';
+  } catch {
+    return true;
+  }
+}
+
+export const annotationToolsVisible = writable(loadToolsVisible());
+
+export function setAnnotationToolsVisible(visible: boolean): void {
+  annotationToolsVisible.set(visible);
+  try {
+    if (visible) window.localStorage.removeItem(TOOLS_PREF);
+    else window.localStorage.setItem(TOOLS_PREF, 'hidden');
+  } catch {
+    // Keep the in-memory choice when storage is unavailable.
+  }
+}
 
 function screenState(screen: string) {
   let s = screens.get(screen);

@@ -2,7 +2,8 @@
 import { test, beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
 import { get } from 'svelte/store';
-import { localStream, selectedVideoDevice, switchVideoDevice, toggleVideo, videoEnabled, voiceOnlyMode } from './manager.js';
+import { localStream, screenStream, selectedAudioDevice, selectedVideoDevice, startScreenShare, stopScreenShare, switchAudioDevice, switchVideoDevice, toggleVideo, videoEnabled, voiceOnlyMode } from './manager.js';
+import { deferred } from './fake-media.test-helpers.js';
 
 let nextId = 0;
 const opened: FakeTrack[] = [];
@@ -213,4 +214,56 @@ test('an unplugged camera counts as turned off', async () => {
   streamCameras()[0].unplug();
   assert.equal(get(videoEnabled), false);
   assert.equal(streamCameras().length, 0);
+});
+
+test('a dismissed call cannot publish a late picker result over a new share', async () => {
+  let finish!: (stream: FakeStream) => void;
+  let pickers = 0;
+  Object.defineProperty(navigator.mediaDevices, 'getDisplayMedia', {
+    configurable: true,
+    value: () => {
+      pickers++;
+      return new Promise<FakeStream>((resolve) => { finish = resolve; });
+    },
+  });
+  const old = startScreenShare();
+  const oldFinish = finish;
+  assert.equal(await startScreenShare(), null);
+  assert.equal(pickers, 1);
+  stopScreenShare();
+  const current = startScreenShare();
+  const audio = new FakeTrack('audio');
+  const live = new FakeStream([new FakeTrack('video'), audio]);
+  finish(live);
+  assert.equal(await current, live);
+  const abandoned = new FakeStream([new FakeTrack('video'), new FakeTrack('audio')]);
+  oldFinish(abandoned);
+  assert.equal(await old, null);
+  assert.ok(abandoned.getTracks().every((track) => track.readyState === 'ended'));
+  assert.equal(get(screenStream), live);
+  audio.unplug();
+  assert.equal(live.getAudioTracks().length, 0);
+  assert.equal(live.getVideoTracks()[0].readyState, 'live');
+  stopScreenShare();
+});
+
+test('only the latest microphone selection can supply call audio', async (t) => {
+  const first = deferred<MediaStream>();
+  const second = deferred<MediaStream>();
+  const open = t.mock.method(navigator.mediaDevices, 'getUserMedia');
+  open.mock.mockImplementationOnce(() => first.promise);
+  open.mock.mockImplementationOnce(() => second.promise, 1);
+  const oldMic = get(localStream)!.getAudioTracks()[0];
+  const slow = switchAudioDevice('first');
+  const fast = switchAudioDevice('second');
+  const chosen = new FakeTrack('audio', 'second');
+  second.resolve(new FakeStream([chosen]) as unknown as MediaStream);
+  assert.equal(await fast, chosen);
+  const stale = new FakeTrack('audio', 'first');
+  first.resolve(new FakeStream([stale]) as unknown as MediaStream);
+  assert.equal(await slow, null);
+  assert.equal(stale.readyState, 'ended');
+  assert.equal(oldMic.readyState, 'ended');
+  assert.deepEqual(get(localStream)!.getAudioTracks(), [chosen]);
+  assert.equal(get(selectedAudioDevice), 'second');
 });

@@ -55,10 +55,11 @@ export interface PeerConnection {
   screenStream: MediaStream | null;
   /** The mid they announced for their screen transceiver (only ever looked up on this connection). */
   screenMid: string | null;
+  screenHasAudio: boolean;
   /** Their latest screen/media state sent before we trusted them: applied in trustPeer (early-state.ts). */
   earlyState: Map<EarlyState['type'], EarlyState>;
   /** What their version supports (their `caps` message): ICE restarts (ice-recovery.ts). */
-  remoteCaps: { iceRestart: boolean };
+  remoteCaps: { iceRestart: boolean; screenAudio?: boolean };
   /** How they show our camera (their `view` message): sizes the camera we send them (quality.ts). */
   remoteView: RemoteView | undefined;
 }
@@ -239,7 +240,7 @@ export function trustPeer(peerId: string, sid: string): void {
   if (screenShareActive) sendIfConnected(pc, serialize(screenState(pc, true)));
   sendIfConnected(pc, serialize({ type: 'media-state', ...localMediaState() }));
   // We accept ICE restarts on this connection (an older version doesn't; see ice-recovery.ts).
-  sendIfConnected(pc, serialize({ type: 'caps', iceRestart: true }));
+  sendIfConnected(pc, serialize({ type: 'caps', iceRestart: true, screenAudio: true }));
   scheduleRetune(); // one more peer to send to
   for (const handler of connectHandlers) handler(peerId);
 }
@@ -1114,7 +1115,10 @@ function handleDataChannelMessage(fromPeerId: string, anyMsg: DataChannelMessage
   switch (msg.type) {
     case 'caps': {
       const pc = get(peers).get(fromPeerId);
-      if (pc) pc.remoteCaps = { iceRestart: msg.iceRestart === true };
+      if (pc) {
+        pc.remoteCaps = { iceRestart: msg.iceRestart === true, screenAudio: msg.screenAudio === true };
+        syncSenders(pc);
+      }
       break;
     }
     case 'view': {
@@ -1140,7 +1144,9 @@ function handleDataChannelMessage(fromPeerId: string, anyMsg: DataChannelMessage
       // connection (remoteSlots), so nobody can label anyone else's video.
       const pc = get(peers).get(fromPeerId);
       const mid = sharing && isValidMid(msg.mid) ? msg.mid : null;
-      if (pc && pc.screenMid !== mid) {
+      const hasAudio = !!mid && msg.audio === true;
+      if (pc && (pc.screenMid !== mid || pc.screenHasAudio !== hasAudio)) {
+        pc.screenHasAudio = hasAudio;
         pc.screenMid = mid;
         refreshRemoteMedia(pc);
       }
@@ -1249,27 +1255,22 @@ function handleDataChannelMessage(fromPeerId: string, anyMsg: DataChannelMessage
 }
 
 // ── Outgoing media: microphone, camera and shared screen ─────────────────────────
-// Every connection has the same three transceivers (media-slots.ts): audio, camera, screen. What
+// Connections reserve transceivers for microphone, camera, shared video and shared audio. What
 // each one should carry is worked out from the local state and applied through setSenderTrack, so
 // nothing is sent before the connection is verified. The screen goes out next to the camera.
 let screenShareActive = false;
 
-// Audio mixing for screen share audio + mic
+// Only legacy receivers need a single mixed track for microphone and shared audio.
 let mixedAudioCtx: AudioContext | null = null;
 let mixedAudioDest: MediaStreamAudioDestinationNode | null = null;
 
-/**
- * One outgoing audio track carrying the shared screen's sound, plus the microphone when there is
- * one (someone who joined without a microphone can still share sound). A muted microphone adds
- * silence, so the shared sound carries on while you're muted.
- */
-function createMixedAudioTrack(micStream: MediaStream | null, screen: MediaStream): MediaStreamTrack {
+function createMixedAudioTrack(micStream: MediaStream, screen: MediaStream): MediaStreamTrack {
   cleanupMixedAudio();
   mixedAudioCtx = new AudioContext();
   mixedAudioCtx.resume().catch(() => {});
   mixedAudioDest = mixedAudioCtx.createMediaStreamDestination();
 
-  if (micStream?.getAudioTracks().length) mixedAudioCtx.createMediaStreamSource(micStream).connect(mixedAudioDest);
+  mixedAudioCtx.createMediaStreamSource(micStream).connect(mixedAudioDest);
   mixedAudioCtx.createMediaStreamSource(screen).connect(mixedAudioDest);
 
   return mixedAudioDest.stream.getAudioTracks()[0];
@@ -1277,7 +1278,8 @@ function createMixedAudioTrack(micStream: MediaStream | null, screen: MediaStrea
 
 function cleanupMixedAudio(): void {
   if (mixedAudioCtx) {
-    mixedAudioCtx.close();
+    mixedAudioDest?.stream.getTracks().forEach((track) => track.stop());
+    void mixedAudioCtx.close().catch(() => {});
     mixedAudioCtx = null;
     mixedAudioDest = null;
   }
@@ -1295,10 +1297,21 @@ function transceiversOf(pc: PeerConnection): RTCRtpTransceiver[] {
   }
 }
 
-/** The microphone, mixed with the shared screen's sound while presenting. */
-function outgoingAudioTrack(): MediaStreamTrack | null {
-  const mixed = screenShareActive ? mixedAudioDest?.stream.getAudioTracks()[0] : undefined;
-  return mixed ?? get(localStream)?.getAudioTracks()[0] ?? null;
+function microphoneTrack(): MediaStreamTrack | null {
+  return get(localStream)?.getAudioTracks()[0] ?? null;
+}
+
+/** Older clients play all audio on the microphone slot. A microphone-free share needs no mixer. */
+function legacyAudioTrack(screen: MediaStream): MediaStreamTrack | null {
+  const mic = get(localStream);
+  if (!mic?.getAudioTracks().length) return screen.getAudioTracks()[0] ?? null;
+  try {
+    return mixedAudioDest?.stream.getAudioTracks()[0] ?? createMixedAudioTrack(mic, screen);
+  } catch (e) {
+    cleanupMixedAudio();
+    console.warn('Could not mix audio for an older client:', e);
+    return microphoneTrack();
+  }
 }
 
 /** The camera, only while it's on (turning it off stops the track and removes it). */
@@ -1315,8 +1328,13 @@ function outgoingScreenTrack(): MediaStreamTrack | null {
 /** Point each of this connection's senders at what it should carry right now (held back until trusted). */
 function syncSenders(pc: PeerConnection): void {
   const slots = localSlots(transceiversOf(pc));
+  const screen = screenShareActive ? get(screenStream) : null;
+  const sound = screen?.getAudioTracks().find((track) => track.readyState === 'live');
+  // Before capabilities arrive, a bidirectional fourth slot also identifies a modern peer.
+  const separateAudio = !!slots.screenAudio && (pc.remoteCaps.screenAudio ?? slots.screenAudio.currentDirection === 'sendrecv');
   const wanted: [RTCRtpTransceiver | undefined, MediaStreamTrack | null][] = [
-    [slots.audio, outgoingAudioTrack()],
+    [slots.audio, pc.connected && !separateAudio && screen && sound ? legacyAudioTrack(screen) : microphoneTrack()],
+    [slots.screenAudio, separateAudio ? sound ?? null : null],
     [slots.camera, outgoingCameraTrack()],
     [slots.screen, outgoingScreenTrack()],
   ];
@@ -1346,8 +1364,10 @@ function senderFor(pc: PeerConnection, kind: 'audio' | 'video'): RTCRtpSender | 
 
 /** Our screen-state for one connection, naming the transceiver that carries the screen on it. */
 function screenState(pc: PeerConnection, sharing: boolean): DataChannelMessage {
-  const mid = sharing ? localSlots(transceiversOf(pc)).screen?.mid : null;
-  return mid ? { type: 'screen-state', sharing, mid } : { type: 'screen-state', sharing };
+  const slots = localSlots(transceiversOf(pc));
+  const mid = sharing ? slots.screen?.mid : null;
+  const audio = !!slots.screenAudio && get(screenStream)?.getAudioTracks().some((track) => track.readyState === 'live');
+  return mid ? { type: 'screen-state', sharing, mid, ...(audio && { audio: true }) } : { type: 'screen-state', sharing };
 }
 
 let retuneTimer: ReturnType<typeof setTimeout> | null = null;
@@ -1408,15 +1428,11 @@ export function replaceTrackOnAllPeers(newTrack: MediaStreamTrack | null, kind: 
 
 /** Use a newly selected microphone: keeps shared-screen audio mixed in, and the speaking ring working. */
 export function useNewMicTrack(track: MediaStreamTrack): void {
-  const screen = get(screenStream);
   const mic = get(localStream);
   // A microphone that isn't the call's (it finished opening after we left) is never sent or listened to.
   if (!mic || !mic.getAudioTracks().includes(track) || track.readyState !== 'live') return;
-  if (screenShareActive && screen?.getAudioTracks().length && mic) {
-    replaceTrackOnAllPeers(createMixedAudioTrack(mic, screen), 'audio');
-  } else {
-    replaceTrackOnAllPeers(track, 'audio');
-  }
+  cleanupMixedAudio();
+  syncAllSenders();
   if (mic) {
     localSpeakingCleanup?.();
     localSpeakingCleanup = createSpeakingDetector(mic, (isSpeaking) => {
@@ -1440,19 +1456,18 @@ export function startSharingScreen(): void {
   if (!screen?.getVideoTracks()[0]) return;
   screenShareActive = true;
 
-  // Mix screen audio with mic so peers hear both voice and shared audio
-  const mic = get(localStream);
-  if (screen.getAudioTracks().length > 0) {
-    try {
-      createMixedAudioTrack(mic, screen);
-    } catch (e) {
-      cleanupMixedAudio(); // send the microphone alone
-      console.warn('Could not mix in the shared audio:', e);
-    }
+  function publishShare() {
+    syncAllSenders();
+    for (const pc of get(peers).values()) sendIfConnected(pc, serialize(screenState(pc, true)));
   }
-
-  syncAllSenders();
-  for (const pc of get(peers).values()) sendIfConnected(pc, serialize(screenState(pc, true)));
+  for (const sound of screen.getAudioTracks()) {
+    sound.addEventListener('ended', () => {
+      if (!screenShareActive || get(screenStream) !== screen) return;
+      cleanupMixedAudio();
+      publishShare(); // The surface may keep sharing after its audio source ends.
+    }, { once: true });
+  }
+  publishShare();
   scheduleRetune(); // the screen takes most of the upload now
   watchScreenSize(true);
 }
@@ -1613,26 +1628,29 @@ function createPeerConnection(
     intended: new Map(),
     screenStream: null,
     screenMid: null,
+    screenHasAudio: false,
     earlyState: new Map(),
     remoteCaps: { iceRestart: false },
     remoteView: undefined,
   };
 
-  // Media layout (media-slots.ts): audio, camera, screen. The offerer creates all three, able to
+  // The offerer reserves microphone, camera, shared video and shared audio slots, all able to
   // send and receive, so every connection has them (also for someone with no camera, audio-only or
   // chat-only) and none is ever added later. The answerer adds its microphone and camera first, so
   // the offer adopts them, and gets the rest from the offer. Microphone and camera share a stream
   // id so the other side keeps them in sync.
   const rtc = rtcOf(pc);
   const syncStream = new MediaStream();
+  const shareSyncStream = new MediaStream();
   const withStream = new WeakSet<RTCRtpSender>();
   try {
     if (initiator) {
       rtc?.addTransceiver('audio', { direction: 'sendrecv', streams: [syncStream] });
       rtc?.addTransceiver('video', { direction: 'sendrecv', streams: [syncStream] });
-      rtc?.addTransceiver('video', { direction: 'sendrecv' });
+      rtc?.addTransceiver('video', { direction: 'sendrecv', streams: [shareSyncStream] });
+      rtc?.addTransceiver('audio', { direction: 'sendrecv', streams: [shareSyncStream] });
     } else if (rtc) {
-      for (const track of [outgoingAudioTrack(), outgoingCameraTrack()]) {
+      for (const track of [microphoneTrack(), outgoingCameraTrack()]) {
         if (track) withStream.add(rtc.addTrack(track, syncStream));
       }
     }
@@ -1659,11 +1677,11 @@ function createPeerConnection(
     const ts = rtc.getTransceivers();
     enableSending(ts);
     const slots = localSlots(ts);
-    for (const t of [slots.audio, slots.camera]) {
+    for (const t of [slots.audio, slots.camera, slots.screen, slots.screenAudio]) {
       if (!t || withStream.has(t.sender) || typeof t.sender.setStreams !== 'function') continue;
       withStream.add(t.sender);
       try {
-        t.sender.setStreams(syncStream);
+        t.sender.setStreams(t === slots.screen || t === slots.screenAudio ? shareSyncStream : syncStream);
       } catch {
         // Not supported: this pair just isn't lip-synced.
       }
@@ -1804,7 +1822,8 @@ function refreshRemoteMedia(pc: PeerConnection): void {
   const slots = remoteSlots(transceiversOf(pc), pc.screenMid);
   const main = [slots.audio, slots.camera].flatMap((t) => (t ? [t.receiver.track] : []));
   if (main.length > 0 && !holdsExactly(pc.stream, main)) attachRemoteStream(pc, new MediaStream(main));
-  const screen = slots.screen ? [slots.screen.receiver.track] : [];
+  const screen = [slots.screen, pc.screenHasAudio ? slots.screenAudio : undefined]
+    .flatMap((slot) => slot ? [slot.receiver.track] : []);
   if (screen.length ? !holdsExactly(pc.screenStream, screen) : pc.screenStream !== null) {
     pc.screenStream = screen.length ? new MediaStream(screen) : null;
     updatePeers();
@@ -1945,7 +1964,7 @@ function reconnectPeer(remotePeerId: string, remoteDisplayName: string): void {
   createPeerConnection(remotePeerId, remoteDisplayName, true);
 }
 
-/** Stop everything attached to a peer's current connection, but keep its entry in the store. */
+/** Drop this connection and its media state, keeping the participant's identity and call preferences. */
 function teardownPeer(remotePeerId: string): void {
   stopRecovery(remotePeerId);
   iceRestartTimes.delete(remotePeerId);
@@ -1963,6 +1982,25 @@ function teardownPeer(remotePeerId: string): void {
       next.delete(remotePeerId);
       return next;
     });
+    // These describe the old media session. An idle peer joining the replacement
+    // connection might never send another "stopped sharing" or "stopped speaking".
+    peerMediaState.update((m) => {
+      if (!m.has(remotePeerId)) return m;
+      const next = new Map(m);
+      next.delete(remotePeerId);
+      return next;
+    });
+    sharingPeers.update((s) => {
+      if (!s.has(remotePeerId)) return s;
+      const next = new Set(s);
+      next.delete(remotePeerId);
+      return next;
+    });
+    speakingPeers.update((s) => {
+      const next = new Set(s);
+      next.delete(remotePeerId);
+      return next;
+    });
     pc.peer.destroy();
   }
 }
@@ -1972,29 +2010,12 @@ function destroyPeerConnection(remotePeerId: string): void {
   teardownPeer(remotePeerId);
   scheduleRetune(); // one peer fewer to send to
   dropRecipient(remotePeerId);
-  peerMediaState.update((m) => {
-    if (!m.has(remotePeerId)) return m;
-    const next = new Map(m);
-    next.delete(remotePeerId);
-    return next;
-  });
-  sharingPeers.update((s) => {
-    if (!s.has(remotePeerId)) return s;
-    const next = new Set(s);
-    next.delete(remotePeerId);
-    return next;
-  });
   // Their name stays in knownNames (chat keeps its labels) but no longer takes part in naming.
   serverNames.delete(remotePeerId);
   claimedNames.delete(remotePeerId);
   for (const handler of leaveHandlers) handler(remotePeerId);
 
   typingPeers.update((s) => {
-    const next = new Set(s);
-    next.delete(remotePeerId);
-    return next;
-  });
-  speakingPeers.update((s) => {
     const next = new Set(s);
     next.delete(remotePeerId);
     return next;

@@ -11,7 +11,8 @@ Your own private, end-to-end encrypted video calls. Deploy it on your domain, si
   - Video, audio-only, or **chat-only** participation. Turning your camera off really releases it (the camera light goes off)
   - A **pre-join check**: camera preview, microphone level, microphone/camera/speaker pickers and a test sound. Join muted or with your camera off. Nothing is switched on until you choose
   - On phones: **front/back camera flip**, and the screen stays on during a call
-  - **Screen sharing** (with audio) next to your camera, also when you joined audio-only, plus a **laser pointer and drawing** over the shared screen that everyone sees
+  - **Screen sharing** with tab audio. To watch together, share the tab playing the video and enable audio in the browser picker. Your microphone has its own mute control.
+  - **Theatre mode** enlarges the shared video on your device and hides participant tiles and annotations while you watch. You can also close the laser and pen toolbar on any share and restore it in **Settings → Show screen-share annotations and tools**.
   - Video quality adapts to the size of the call, so upload stays around 3.5 Mbps even with six people
   - A **shared whiteboard** (pen, highlighter, text, eraser) you can export as **PDF** or PNG
   - Group chat, **private direct messages** and **files sent straight to one person** (tap them), and reactions
@@ -50,6 +51,8 @@ Runs entirely on Cloudflare: static files are served for free, signaling runs in
 Cloudflare terminates TLS for your site, so it can see what passes through the Worker: signaling messages (room ids, display names, network addresses in ICE candidates, room passwords as they're checked) and visitors' IP addresses. It never sees call content, which is encrypted between browsers. If that's not acceptable, use the Docker deployment on a server you control.
 
 ### 1. Deploy
+
+The bundled Wrangler CLI requires Node.js 22.12 or newer.
 
 ```bash
 git clone https://github.com/jcmcode/vchat.git
